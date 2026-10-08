@@ -13,8 +13,9 @@ bazelisk test //... --test_output=errors
 bazelqueue status
 ```
 
-The first Homebrew publication is pending the repository's two release secrets.
-The implementation can already be built and installed locally:
+Version 0.1.1 is published in the Homebrew tap. Future automated release PRs
+and tap updates require the two repository secrets listed in the release guide.
+The implementation can also be built and installed locally:
 
 ```sh
 make release

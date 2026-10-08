@@ -1,7 +1,8 @@
 # Release setup
 
 The public repository is bitomule/bazelqueue. CI and all validation jobs require
-no private key. Publication needs exactly these repository Actions secrets:
+no private key. Automated release preparation and tap publication need exactly
+these repository Actions secrets:
 
 | Secret | Purpose | Minimum repository access |
 | --- | --- | --- |
@@ -12,9 +13,11 @@ No crates.io token, Apple signing credential or SSH key is required. Add both in
 GitHub repository Settings → Secrets and variables → Actions. Do not put them in
 files, source, workflow literals or command output.
 
-For the initial release, binaries are published using the built-in GITHUB_TOKEN.
-After adding the secrets, dispatch Release binaries and Homebrew with the latest stable release tag (currently `v0.1.1`)
-to publish the prepared formula from those same immutable bytes. For later versions,
+The initial binaries were published using the built-in GITHUB_TOKEN. The
+validated v0.1.1 formula was then published with the already authenticated local
+GitHub CLI. No credential was copied into Actions. After adding the secrets,
+you can dispatch Release binaries and Homebrew with the latest stable release
+tag (currently `v0.1.1`) to verify idempotent publication of those same bytes. For later versions,
 run Release preparation via workflow_dispatch and review/merge its release PR. release-plz uses tags (git_only=true)
 and does not publish crates. cargo-dist builds the production ARM64 archive on
 GitHub-hosted macOS. The release workflow verifies the existing tag's commit,
@@ -27,8 +30,8 @@ replacing them. An older tag cannot downgrade a newer formula. Prereleases are
 marked prerelease/non-latest and do not replace the stable tap formula.
 
 Missing credentials produce an explicit waiting/skipped publication step. They
-never change the result of Rust or native-contract CI. Initial tap publication is pending HOMEBREW_TAP_TOKEN; automatic future release
-PRs require RELEASE_PLZ_TOKEN. The package generator and formula template are
+never change the result of Rust or native-contract CI. The initial tap formula is live. Automatic future tap updates require
+HOMEBREW_TAP_TOKEN; automatic release PRs require RELEASE_PLZ_TOKEN. The package generator and formula template are
 validated in CI before publication.
 
 The artifacts are not claimed to be notarized. Local Apple identities are never

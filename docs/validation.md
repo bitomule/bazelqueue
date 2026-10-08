@@ -73,3 +73,12 @@ Retained-image tests delete the original frontend executable after admission,
 restart the coordinator, and require unchanged ownership and successful native
 run handoff. A targeted SIGINT test addresses the frontend PID directly and
 requires the owned backend and caller to terminate with the same signal.
+
+The published v0.1.1 archive and SHA256 were downloaded back from GitHub and
+verified before Homebrew installation. `brew test bitomule/tap/bazelqueue` passed.
+Live user activation preserved the original shim bytes/symlink and main bazelrc
+fingerprint. A fresh login shell in a temporary workspace resolved both names
+to the native shims. Two real calls reported queue positions 1 and 2, waited
+behind drain, and completed successfully after resume. Another agent's queued
+clean command also completed through the installed queue. The queue was left
+resumed; no running user build was terminated.
