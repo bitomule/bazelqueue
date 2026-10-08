@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="300" viewBox="0 0 1280 300" role="img" aria-labelledby="title description">
+  <title id="title">From a Bazel call to an admitted build</title>
+  <desc id="description">A call enters the shared user queue and waits with a position and reason. Available CPU and memory permit real Bazel execution. The caller receives the original exit code or signal.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10Z" fill="#76a7bd"/></marker>
+  </defs>
+  <rect width="1280" height="300" rx="18" fill="#101b29"/>
+  <g fill="none" stroke="#76a7bd" stroke-width="2" marker-end="url(#arrow)">
+    <path d="M270 127H336"/>
+    <path d="M590 127H676"/>
+    <path d="M930 127H996"/>
+    <path d="M545 190V216Q545 233 528 233H402Q385 233 385 216V194"/>
+  </g>
+  <g font-family="Arial, Helvetica, sans-serif" text-anchor="middle">
+    <rect x="40" y="70" width="230" height="120" rx="12" fill="#162233" stroke="#38516c"/>
+    <text x="155" y="112" font-family="Menlo, Consolas, monospace" font-size="19" fill="#edf4fc">bazel / bazelisk</text>
+    <text x="155" y="149" font-size="16" fill="#a3b9ce">Agent or terminal</text>
+    <rect x="340" y="70" width="250" height="120" rx="12" fill="#13312f" stroke="#49e2b6"/>
+    <text x="465" y="112" font-size="22" font-weight="700" fill="#dcfff2">Shared user queue</text>
+    <text x="465" y="149" font-size="16" fill="#a6d3c4">Position + waiting reason</text>
+    <text x="635" y="46" font-size="14" fill="#49e2b6">Budget available</text>
+    <rect x="680" y="70" width="250" height="120" rx="12" fill="#162233" stroke="#38516c"/>
+    <text x="805" y="112" font-size="22" font-weight="700" fill="#edf4fc">Real Bazel</text>
+    <text x="805" y="149" font-size="16" fill="#a3b9ce">Foreground input / output</text>
+    <rect x="1000" y="70" width="240" height="120" rx="12" fill="#162233" stroke="#38516c"/>
+    <text x="1120" y="112" font-size="22" font-weight="700" fill="#edf4fc">Caller result</text>
+    <text x="1120" y="149" font-size="16" fill="#a3b9ce">Original exit code / signal</text>
+    <text x="465" y="271" font-size="15" fill="#a3b9ce">Busy or memory pressure? Keep waiting.</text>
+  </g>
+</svg>

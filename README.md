@@ -74,18 +74,7 @@ INFO: Build completed successfully
 Queue notices go to **stderr**, so stdout remains available for scripts and pipes.
 The calling agent stays attached to the command while it waits.
 
-```mermaid
-flowchart LR
-    A["bazel / bazelisk<br/>Agent · terminal"] --> Q["Shared user queue<br/>Position + waiting reason"]
-    Q --> G{"Admission"}
-    G -->|Budget available| B["Real Bazel<br/>Foreground I/O"]
-    G -->|Busy or memory pressure| Q
-    B --> R["Original exit code<br/>or signal"]
-    classDef queue fill:#13312f,stroke:#35b996,color:#d9fff2;
-    classDef plain fill:#162233,stroke:#526b85,color:#e2edf9;
-    class Q,G queue;
-    class A,B,R plain;
-```
+![Queue flow: callers wait for CPU and memory capacity, then real Bazel runs and returns its original result.](docs/assets/queue-flow.svg)
 
 | Situation | Queue behavior |
 |---|---|
