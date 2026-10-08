@@ -13,7 +13,7 @@
 
 **Keep calling `bazel`. Let the queue decide when it can start.**
 
-Agents, terminals and Makefiles share one queue per user. When CPU or memory
+Calls from agents and terminals share one queue per user. When CPU or memory
 capacity is occupied, the caller sees its position and waits. Once admitted,
 the real Bazel command runs with its arguments, terminal, stdin and stdout.
 Its exit code or signal goes back to the caller.
@@ -95,7 +95,7 @@ The calling agent stays attached to the command while it waits.
 
 ```mermaid
 flowchart LR
-    A["bazel / bazelisk<br/>Agent · shell · Makefile"] --> Q["Shared user queue<br/>Position + waiting reason"]
+    A["bazel / bazelisk<br/>Agent · terminal"] --> Q["Shared user queue<br/>Position + waiting reason"]
     Q --> G{"Admission"}
     G -->|Budget available| B["Real Bazel<br/>Foreground I/O"]
     G -->|Busy or memory pressure| Q
