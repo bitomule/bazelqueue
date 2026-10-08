@@ -39,8 +39,8 @@ modify the installed configuration. Treat its result as evidence for this CPU
 workload; Swift/Rust compilers and worker-heavy builds need their own measurements.
 
 Local verification on an M3 Pro with 11 logical cores and 18 GiB RAM used
-14 unit tests, 15 process E2E tests, 17 installation tests, 3 interactive PTY
-tests, and 6 real Bazel contracts on each of 8.4.2 and 9.2.0. The native
+14 unit tests, 17 process E2E tests, 17 installation tests, 3 interactive PTY
+tests, and 7 real Bazel contracts on each of 8.4.2 and 9.2.0. The native
 contracts include simultaneous held actions in distinct workspaces and two
 queued builds completing while a run target remains alive.
 
@@ -68,3 +68,8 @@ consumed-output version must pass all busy/quarantine/idleness checks.
 `make e2e`, `make contract`, and `make terminal` use a separate Cargo target
 directory. Ordinary Cargo checks therefore cannot replace a feature-enabled
 fixture executable while an E2E suite is using it.
+
+Retained-image tests delete the original frontend executable after admission,
+restart the coordinator, and require unchanged ownership and successful native
+run handoff. A targeted SIGINT test addresses the frontend PID directly and
+requires the owned backend and caller to terminate with the same signal.

@@ -36,7 +36,7 @@ pub async fn frontend(backend: PathBuf, args: Vec<OsString>, generic: bool) -> R
         bail!("backend resolves to bazelqueue itself");
     }
     let (parent, control) = std::os::unix::net::UnixStream::pair()?;
-    let mut command = Command::new(std::env::current_exe()?.canonicalize()?);
+    let mut command = Command::new(crate::install::retained_executable(&paths)?);
     command
         .arg("_guardian")
         .arg(&backend)
@@ -59,7 +59,7 @@ pub async fn frontend(backend: PathBuf, args: Vec<OsString>, generic: bool) -> R
         tokio::select! {
             result=child.wait()=>break result?,
             _=terminate.recv()=>if let Some(pid)=child.id() {platform::signal_pid(pid,libc::SIGTERM)},
-            _=interrupt.recv()=>{},
+            _=interrupt.recv()=>if let Some(pid)=child.id() {platform::signal_pid(pid,libc::SIGINT)},
         _=hangup.recv()=>if let Some(pid)=child.id() {platform::signal_pid(pid,libc::SIGHUP)},
         _=continuation.recv()=>if let Some(pid)=child.id() {platform::signal_pid(pid,libc::SIGCONT)},
         }

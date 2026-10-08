@@ -358,13 +358,10 @@ async fn transact(paths: &Paths, mut journal: Journal) -> Result<()> {
     }
     recover(paths).await
 }
-fn stage_binary(paths: &Paths) -> Result<PathBuf> {
+pub fn retained_executable(paths: &Paths) -> Result<PathBuf> {
     let current = std::env::current_exe()?.canonicalize()?;
-    for prefix in ["/opt/homebrew", "/usr/local"] {
-        let opt = PathBuf::from(prefix).join("opt/bazelqueue/bin/bazelqueue");
-        if platform::same_executable(&current, &opt) {
-            return Ok(opt);
-        }
+    if current.starts_with(paths.root.join("executables")) {
+        return Ok(current);
     }
     let directory = paths.root.join("executables").join(digest(&current)?);
     platform::private_directory(&directory)?;
@@ -590,7 +587,7 @@ pub async fn setup(
     if preview {
         return Ok(());
     }
-    let destination = stage_binary(paths)?;
+    let destination = retained_executable(paths)?;
     changes.push(change(
         paths.config.clone(),
         Image::File {

@@ -13,7 +13,7 @@ GitHub repository Settings → Secrets and variables → Actions. Do not put the
 files, source, workflow literals or command output.
 
 For the initial release, binaries are published using the built-in GITHUB_TOKEN.
-After adding the secrets, dispatch Release binaries and Homebrew with tag `v0.1.0`
+After adding the secrets, dispatch Release binaries and Homebrew with the latest stable release tag (currently `v0.1.1`)
 to publish the prepared formula from those same immutable bytes. For later versions,
 run Release preparation via workflow_dispatch and review/merge its release PR. release-plz uses tags (git_only=true)
 and does not publish crates. cargo-dist builds the production ARM64 archive on

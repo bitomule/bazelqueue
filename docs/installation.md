@@ -16,9 +16,10 @@ Original uninstall backups remain unchanged through upgrades. Uninstall removes
 only owned links and unchanged owned PATH blocks, preserving independent user
 edits. It refuses active requests until the queue has drained.
 
-The control binary remains Homebrew-owned. User interception uses an opt-stable
-or private retained executable chain, so active guardians do not lose their image
-when another version is installed. Run bazelqueue setup after brew upgrade to
+The control binary remains Homebrew-owned. User interception uses a private retained executable chain. Every frontend,
+including explicit `bazelqueue exec`, selects a retained helper image before
+starting its guardian. Homebrew can remove an old keg without removing that
+guardian’s executable for later handoff or coordinator recovery. Run bazelqueue setup after brew upgrade to
 refresh activation. Preserve the backend's opt-stable absolute path.
 
 On this Mac, --migrate records existing shell shim process birth identities and

@@ -1039,3 +1039,98 @@ fn invalid_resume_retains_coordinator_ownership_and_drained_state() {
     admitted.write_all(b"F").unwrap();
     assert!(harness.children[0].wait().unwrap().success());
 }
+
+#[test]
+fn explicit_execution_keeps_helper_image_after_original_binary_is_removed() {
+    let mut harness = Harness::new(1);
+    let origin = harness.root.path().join("bazelqueue");
+    fs::copy(env!("CARGO_BIN_EXE_bazelqueue"), &origin).unwrap();
+    let socket = harness.root.path().join("owned.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let child = Command::new(&origin)
+        .args(["exec", "--", env!("CARGO_BIN_EXE_fixture-backend"), "hold"])
+        .arg(socket)
+        .env("BAZELQUEUE_HOME", &harness.paths.root)
+        .env("HOME", harness.root.path())
+        .current_dir(harness.root.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    harness.children.push(child);
+    let mut held = Harness::accepted(&listener);
+    let before = harness.wait(|s| s.jobs.iter().any(|job| job.state == "running"));
+    let owner = before.jobs[0].request.owner.clone();
+    fs::remove_file(origin).unwrap();
+    harness.daemon.kill().unwrap();
+    harness.daemon.wait().unwrap();
+    let after = harness.wait(|s| s.jobs.iter().any(|job| job.state == "running"));
+    assert_eq!(after.jobs[0].request.owner, owner);
+    assert_eq!(after.jobs[0].child, before.jobs[0].child);
+    held.write_all(b"F").unwrap();
+    assert!(harness.children[0].wait().unwrap().success());
+}
+
+#[test]
+#[ignore = "requires BAZELQUEUE_TEST_BAZEL; helper retention during native run handoff"]
+fn native_run_handoff_survives_original_binary_removal_and_restart() {
+    let mut harness = Harness::new(1);
+    let socket = harness.root.path().join("build.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    native_workspace(
+        &harness,
+        &format!(
+            r#"genrule(name="runner",outs=["runner.sh"],executable=True,tags=["local"],cmd="{} hold {}; echo '#!/bin/sh' > $@; echo 'printf retained-target' >> $@; chmod +x $@")"#,
+            env!("CARGO_BIN_EXE_fixture-backend"),
+            socket.display()
+        ),
+    );
+    let origin = harness.root.path().join("bazelisk");
+    fs::copy(env!("CARGO_BIN_EXE_bazelqueue"), &origin).unwrap();
+    let mut args = native_args(&harness, "run");
+    args.push("//:runner".into());
+    let child = Command::new(&origin)
+        .args(args)
+        .env("BAZELQUEUE_HOME", &harness.paths.root)
+        .env("HOME", harness.root.path())
+        .current_dir(harness.root.path().join("workspace"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(
+            fs::File::create(harness.root.path().join("native-output.log")).unwrap(),
+        ))
+        .spawn()
+        .unwrap();
+    harness.children.push(child);
+    let mut build = Harness::accepted(&listener);
+    let before = harness.wait(|s| s.jobs.iter().any(|job| job.state == "running"));
+    fs::remove_file(origin).unwrap();
+    harness.daemon.kill().unwrap();
+    harness.daemon.wait().unwrap();
+    let after = harness.wait(|s| s.jobs.iter().any(|job| job.state == "running"));
+    assert_eq!(after.jobs[0].request.owner, before.jobs[0].request.owner);
+    assert_eq!(after.jobs[0].child, before.jobs[0].child);
+    build.write_all(b"F").unwrap();
+    assert!(harness.children[0].wait().unwrap().success());
+    let mut output = Vec::new();
+    harness.children[0]
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_end(&mut output)
+        .unwrap();
+    assert_eq!(output, b"retained-target");
+}
+
+#[test]
+fn interrupt_sent_to_frontend_is_forwarded_to_owned_backend() {
+    use std::os::unix::process::ExitStatusExt;
+    let mut harness = Harness::new(1);
+    let listener = harness.spawn_hold("interrupted");
+    let _held = Harness::accepted(&listener);
+    platform::signal_pid(harness.children[0].id(), libc::SIGINT);
+    harness.wait(|s| s.jobs.iter().any(|job| job.terminal()));
+    assert_eq!(
+        harness.children[0].wait().unwrap().signal(),
+        Some(libc::SIGINT)
+    );
+}
