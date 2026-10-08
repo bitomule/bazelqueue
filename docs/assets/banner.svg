@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="420" viewBox="0 0 1280 420" role="img" aria-labelledby="title description">
+  <title id="title">bazelqueue — Your builds can wait.</title>
+  <desc id="description">A shared queue admits a Bazel build when resources are available. Other callers wait with a visible queue position.</desc>
+  <defs>
+    <linearGradient id="background" x2="1" y2="1"><stop stop-color="#101b2c"/><stop offset="1" stop-color="#080e18"/></linearGradient>
+    <radialGradient id="glow"><stop stop-color="#41dfb4" stop-opacity=".12"/><stop offset="1" stop-color="#41dfb4" stop-opacity="0"/></radialGradient>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse"><path d="M32 0H0V32" fill="none" stroke="#8fa8c0" stroke-opacity=".055"/></pattern>
+  </defs>
+  <rect width="1280" height="420" rx="24" fill="url(#background)"/>
+  <rect width="1280" height="420" rx="24" fill="url(#grid)"/>
+  <ellipse cx="1000" cy="205" rx="330" ry="260" fill="url(#glow)"/>
+  <g font-family="Arial, Helvetica, sans-serif">
+    <g transform="translate(64 64)">
+      <rect width="13" height="13" rx="3" fill="#49e2b6"/>
+      <rect x="20" width="13" height="13" rx="3" fill="#49e2b6" opacity=".55"/>
+      <rect x="40" width="13" height="13" rx="3" fill="#49e2b6" opacity=".25"/>
+      <text x="68" y="11" font-size="12" font-weight="700" letter-spacing="2.4" fill="#9cbbc5">BAZEL ADMISSION QUEUE</text>
+    </g>
+    <text x="60" y="162" font-size="76" font-weight="700" letter-spacing="-3" fill="#eef5ff">bazel<tspan fill="#49e2b6">queue</tspan></text>
+    <text x="64" y="209" font-size="27" fill="#e0e9f4">Your builds can wait.</text>
+    <text x="64" y="251" font-size="17" fill="#98adc5">Share one machine across agents and worktrees.</text>
+    <rect x="64" y="290" width="446" height="54" rx="10" fill="#080e18" stroke="#2a3b50"/>
+    <text x="85" y="323" font-family="Menlo, Consolas, monospace" font-size="16" fill="#d6e3f5"><tspan fill="#49e2b6">$</tspan> bazel build //...</text>
+    <text x="64" y="382" font-size="12" letter-spacing="1.7" fill="#7893ae">ONE RUST BINARY  /  SAME BAZEL COMMANDS</text>
+    <g transform="translate(660 58)">
+      <rect width="558" height="302" rx="16" fill="#101b29" stroke="#2a3e52"/>
+      <circle cx="24" cy="24" r="4" fill="#49e2b6"/>
+      <text x="39" y="28" font-family="Menlo, Consolas, monospace" font-size="12" fill="#a9bfd3">shared user queue</text>
+      <text x="405" y="28" font-size="11" letter-spacing="1.2" fill="#6f91ab">ILLUSTRATIVE</text>
+      <path d="M0 46H558" stroke="#263b50"/>
+      <rect x="18" y="62" width="522" height="72" rx="9" fill="#13312f" stroke="#49e2b6" stroke-opacity=".45"/>
+      <circle cx="38" cy="84" r="4" fill="#49e2b6"/>
+      <text x="51" y="88" font-size="11" font-weight="700" letter-spacing="1.5" fill="#49e2b6">RUNNING</text>
+      <text x="37" y="114" font-family="Menlo, Consolas, monospace" font-size="16" fill="#e5f7f0">bazel build //app:cli</text>
+      <text x="433" y="102" font-size="12" fill="#94c7b8">agent 01</text>
+      <rect x="18" y="147" width="522" height="58" rx="9" fill="#162233" stroke="#25374c"/>
+      <text x="37" y="182" font-family="Menlo, Consolas, monospace" font-size="15" fill="#d5e2f0">#1  bazelisk test //...</text>
+      <text x="422" y="182" font-size="12" fill="#8fa6be">waiting</text>
+      <rect x="18" y="218" width="522" height="58" rx="9" fill="#162233" stroke="#25374c"/>
+      <text x="37" y="253" font-family="Menlo, Consolas, monospace" font-size="15" fill="#d5e2f0">#2  bazel run //tools:dev</text>
+      <text x="422" y="253" font-size="12" fill="#8fa6be">waiting</text>
+      <text x="4" y="328" font-size="12" fill="#90a9bd">CPU + memory budgets</text>
+      <circle cx="194" cy="324" r="2" fill="#46657a"/>
+      <text x="208" y="328" font-size="12" fill="#90a9bd">Visible queue positions</text>
+    </g>
+  </g>
+</svg>
