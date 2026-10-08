@@ -48,25 +48,6 @@ If a fresh login shell still selects Homebrew's backend first, run
 `bazelqueue setup` from that shell to install its reversible PATH integration.
 
 <details>
-<summary><strong>Already have Bazel wrappers or a queue script?</strong></summary>
-
-Preview the replacement, then activate it explicitly:
-
-```sh
-bazelqueue setup --preview --replace --migrate
-bazelqueue setup --replace --migrate
-```
-
-Setup backs up existing user shims and tracks legacy calls during the cutover.
-Those calls finish before new work is admitted. Existing cache-sync and guard
-helpers can be preserved as local hooks. See [migration details](docs/installation.md).
-
-Homebrew owns `bin/bazelqueue` and private shim assets. User setup owns
-`~/.local/bin/bazel` and `bazelisk`; it does not replace Homebrew's shared binaries.
-
-</details>
-
-<details>
 <summary>Custom backend or installation from source</summary>
 
 ```sh
