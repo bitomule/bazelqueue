@@ -1,0 +1,14 @@
+[workspace]
+members = ["cargo:."]
+
+[dist]
+cargo-dist-version = "0.33.0"
+ci = []
+hosting = ["github"]
+installers = []
+targets = ["aarch64-apple-darwin"]
+install-updater = false
+include = ["README.md", "LICENSE-MIT", "LICENSE-APACHE"]
+
+[dist.binaries]
+aarch64-apple-darwin = ["bazelqueue"]

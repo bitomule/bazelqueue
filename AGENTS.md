@@ -4,8 +4,8 @@
   release, and Bazel-only test rules do not apply here.
 - Read `PLAN.md` before implementation. It is the product and architecture
   contract; update it when an implementation decision changes that contract.
-- The current repository contains a plan, not an implementation. Do not claim
-  commands, CI workflows, or installation paths already work.
+- The repository contains the implementation. Keep behavior and support claims
+  aligned with executed native, terminal, installation and packaging evidence.
 - Implement the milestones in order. Compatibility and recovery prototypes are
   release gates, not optional research after shipping.
 - Use Rust and native APIs for runtime behavior. Shell/Ruby/YAML glue is allowed

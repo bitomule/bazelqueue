@@ -1,0 +1,26 @@
+version: 1
+checks:
+  fmt:
+    uses: cargo/fmt
+    paths: ["src/**/*.rs", "tests/**/*.rs"]
+  clippy:
+    uses: cargo/clippy
+    paths: ["src/**", "tests/**", "Cargo.toml", "Cargo.lock"]
+  unit:
+    uses: cargo/test
+    paths: ["src/**", "tests/**", "Cargo.toml", "Cargo.lock"]
+  ownership:
+    uses: agent
+    paths: ["src/**", "tests/**"]
+    with:
+      facts:
+        - "An executing backend, preparation probe, or native Bazel transaction cannot lose its accounted reservation after frontend, guardian, or coordinator death. Validate against the durable permit barrier and real native cancellation/recovery evidence."
+        - "Managed admission preserves opaque arguments and never raises a proven stricter direct caller resource limit; reservations remain immutable after execution begins."
+        - "Installation and uninstall either commit their complete owned state or recover it idempotently; original user files and backups survive every tested interruption cut."
+  distribution:
+    uses: agent
+    paths: [".github/**", "packaging/**", "dist-workspace.toml", "release-plz.toml"]
+    with:
+      facts:
+        - "The shipped archive contains only the production bazelqueue executable and documentation/licenses; no fixture executable, credentials, or private runtime state."
+        - "The Homebrew formula does not own shared bin/bazel or bin/bazelisk, and publication uses the checksums of existing immutable release artifacts."

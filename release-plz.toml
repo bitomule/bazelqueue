@@ -1,0 +1,20 @@
+[workspace]
+changelog_update = true
+semver_check = false
+git_release_enable = false
+git_tag_enable = true
+publish = false
+git_only = true
+release_always = false
+
+[changelog]
+commit_parsers = [
+  { message = "^feat", group = "added" },
+  { message = "^fix", group = "fixed" },
+  { message = "^perf", group = "changed" },
+  { message = "^refactor", group = "changed" },
+  { message = "^docs", group = "internal" },
+  { message = "^test", group = "internal" },
+  { message = "^chore", group = "internal" },
+  { message = "^ci", group = "internal" },
+]

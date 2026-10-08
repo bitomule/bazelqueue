@@ -1,8 +1,8 @@
 # bazelqueue implementation plan
 
-Prepared: 2026-10-07. Status: proposed architecture, ready for implementation.
+Prepared: 2026-10-07. Status: implemented; current contracts and validation are documented under docs/.
 Local repository: `/Users/davidcollado/Projects/bazelqueue`.
-Proposed GitHub repository: `bitomule/bazelqueue`; visibility requires confirmation.
+Proposed GitHub repository: `bitomule/bazelqueue`; public, authorized by the user.
 
 ## 1. Product contract
 
@@ -673,15 +673,18 @@ quotas; VM/simulator pool ownership; generic command scheduling; web UI; signing
 and notarization; publishing a reusable protocol crate; and automatic mutation
 of every project's AGENTS.md or tools/bazel wrapper.
 
-## 23. Decisions needing user confirmation
+## 23. Resolved delivery scope
 
-- Whether this turn creates only this repository/plan or also implements it.
-- Public `bitomule/bazelqueue` versus another visibility; macOS ARM first versus
-  adding Linux to the initial release.
+The user authorized the complete implementation, E2E validation, public
+bitomule/bazelqueue repository, and live migration of the existing shim. Initial
+published platform is macOS Apple Silicon. Release-plz and Homebrew credentials
+will be added manually by the user; all validation, package generation, local
+installation and publication configuration are prepared independently of them.
 
-Default for the current deliverable is the local repository and complete plan.
-Creating a public remote, activating shims, adding release secrets, publishing a
-release, or updating the stable tap is not implied by saving this design.
+Current implemented contracts and precise limits are documented under docs/.
+Future incompatible wire protocols fail closed; automatic cross-protocol drain
+is deferred until an actual second protocol exists and is tested. Initial
+calibration is machine-specific and does not claim a universal maximum.
 
 ## 24. References
 

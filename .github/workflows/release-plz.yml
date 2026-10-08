@@ -1,0 +1,40 @@
+name: Release preparation
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: release-plz
+  cancel-in-progress: false
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      RELEASE_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+    steps:
+      - name: Check publication credentials
+        id: credentials
+        run: |
+          if [ -n "$RELEASE_TOKEN" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo 'Release preparation is waiting for RELEASE_PLZ_TOKEN.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        if: steps.credentials.outputs.ready == 'true'
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        if: steps.credentials.outputs.ready == 'true'
+        with:
+          toolchain: '1.96.0'
+      - uses: MarcoIeni/release-plz-action@5a3fbfd46359513590727a511a8b060786b48566 # v0.5
+        if: steps.credentials.outputs.ready == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}

@@ -3,3 +3,8 @@
 /dist/
 /.DS_Store
 *.profraw
+/publication/
+__pycache__/
+/.musts/*
+!/.musts/ledger.lock.yaml
+!/.musts/.gitattributes

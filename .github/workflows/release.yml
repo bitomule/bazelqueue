@@ -1,0 +1,115 @@
+name: Release binaries and Homebrew
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to publish or retry
+        required: true
+permissions:
+  contents: read
+concurrency:
+  group: release-publication
+  cancel-in-progress: false
+jobs:
+  artifacts:
+    runs-on: macos-15
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          toolchain: '1.96.0'
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c
+      - name: Validate immutable release identity
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$(git rev-list -n 1 "$RELEASE_TAG")"
+          case "$RELEASE_TAG" in v[0-9]*.[0-9]*.[0-9]*) ;; *) exit 1 ;; esac
+      - name: Recover published artifacts or build once
+        run: |
+          set -euo pipefail
+          mkdir -p publication
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release download "$RELEASE_TAG" --dir publication --pattern 'bazelqueue-aarch64-apple-darwin.tar.xz'
+            gh release download "$RELEASE_TAG" --dir publication --pattern '*.sha256'
+          else
+            make all
+            curl --fail --location https://github.com/axodotdev/cargo-dist/releases/download/v0.33.0/cargo-dist-aarch64-apple-darwin.tar.xz -o "$RUNNER_TEMP/dist.tar.xz"
+            curl --fail --location https://github.com/axodotdev/cargo-dist/releases/download/v0.33.0/cargo-dist-aarch64-apple-darwin.tar.xz.sha256 -o "$RUNNER_TEMP/dist.sha256"
+            test "$(cut -d ' ' -f1 "$RUNNER_TEMP/dist.sha256")" = "$(shasum -a 256 "$RUNNER_TEMP/dist.tar.xz" | cut -d ' ' -f1)"
+            tar -xJf "$RUNNER_TEMP/dist.tar.xz" -C "$RUNNER_TEMP"
+            "$RUNNER_TEMP/cargo-dist-aarch64-apple-darwin/dist" build --artifacts=local --target=aarch64-apple-darwin --tag="$RELEASE_TAG"
+            cp target/distrib/bazelqueue-aarch64-apple-darwin.tar.xz publication/
+            (cd publication && shasum -a 256 bazelqueue-aarch64-apple-darwin.tar.xz > bazelqueue-aarch64-apple-darwin.tar.xz.sha256)
+            ./packaging/smoke.sh publication/bazelqueue-aarch64-apple-darwin.tar.xz "${RELEASE_TAG#v}"
+            RELEASE_FLAGS=(--latest=true)
+            if [[ "$RELEASE_TAG" == *-* ]]; then RELEASE_FLAGS=(--prerelease --latest=false); fi
+            gh release create "$RELEASE_TAG" --verify-tag --title "bazelqueue ${RELEASE_TAG#v}" --generate-notes "${RELEASE_FLAGS[@]}" publication/*
+          fi
+          (cd publication && shasum -a 256 -c bazelqueue-aarch64-apple-darwin.tar.xz.sha256)
+          ./packaging/smoke.sh publication/bazelqueue-aarch64-apple-darwin.tar.xz "${RELEASE_TAG#v}"
+          cargo run --release --locked --bin bazelqueue -- package formula --archive publication/bazelqueue-aarch64-apple-darwin.tar.xz --release-version "${RELEASE_TAG#v}" --output publication/bazelqueue.rb
+          ruby -c publication/bazelqueue.rb
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: publication
+          path: publication/
+  homebrew:
+    needs: artifacts
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+      TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+    steps:
+      - name: Check publication credentials and stable version
+        id: credentials
+        run: |
+          if [ -n "$TAP_TOKEN" ] && [[ "$RELEASE_TAG" != *-* ]]; then
+            echo 'ready=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'ready=false' >> "$GITHUB_OUTPUT"
+            echo 'Tap publication requires HOMEBREW_TAP_TOKEN and a stable tag.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        if: steps.credentials.outputs.ready == 'true'
+        with:
+          repository: bitomule/homebrew-tap
+          ref: master
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        if: steps.credentials.outputs.ready == 'true'
+        with:
+          name: publication
+          path: publication
+      - name: Publish the isolated formula change
+        if: steps.credentials.outputs.ready == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p Formula
+          if [ -f Formula/bazelqueue.rb ]; then
+            ruby -r rubygems -e 'current=File.read(ARGV[0])[/^  version "([^"]+)"/,1]; abort "refusing to downgrade stable formula" if current && Gem::Version.new(ARGV[1]) < Gem::Version.new(current)' Formula/bazelqueue.rb "${RELEASE_TAG#v}"
+          fi
+          cp publication/bazelqueue.rb Formula/bazelqueue.rb
+          git config user.name 'bazelqueue release'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Formula/bazelqueue.rb
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m "bazelqueue ${RELEASE_TAG#v}"
+          for attempt in 1 2 3; do
+            git fetch origin master
+            CURRENT_FORMULA=$(git show origin/master:Formula/bazelqueue.rb 2>/dev/null || true)
+            printf '%s' "$CURRENT_FORMULA" > "$RUNNER_TEMP/current-formula.rb"
+            ruby -r rubygems -e 'current=File.read(ARGV[0])[/^  version "([^"]+)"/,1]; abort "refusing to downgrade stable formula" if current && Gem::Version.new(ARGV[1]) < Gem::Version.new(current)' "$RUNNER_TEMP/current-formula.rb" "${RELEASE_TAG#v}"
+            git rebase origin/master
+            if git push origin HEAD:master; then exit 0; fi
+          done
+          exit 1

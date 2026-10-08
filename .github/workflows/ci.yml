@@ -1,0 +1,67 @@
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 2
+jobs:
+  rust:
+    name: Rust validation
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: '1.96.0'
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - run: make all
+      - run: cargo build --release --locked --bin bazelqueue
+      - name: Validate the production distribution before publication
+        run: |
+          set -euo pipefail
+          curl --fail --location https://github.com/axodotdev/cargo-dist/releases/download/v0.33.0/cargo-dist-aarch64-apple-darwin.tar.xz -o "$RUNNER_TEMP/dist.tar.xz"
+          curl --fail --location https://github.com/axodotdev/cargo-dist/releases/download/v0.33.0/cargo-dist-aarch64-apple-darwin.tar.xz.sha256 -o "$RUNNER_TEMP/dist.sha256"
+          test "$(cut -d ' ' -f1 "$RUNNER_TEMP/dist.sha256")" = "$(shasum -a 256 "$RUNNER_TEMP/dist.tar.xz" | cut -d ' ' -f1)"
+          tar -xJf "$RUNNER_TEMP/dist.tar.xz" -C "$RUNNER_TEMP"
+          VERSION=$(cargo metadata --no-deps --format-version=1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+          "$RUNNER_TEMP/cargo-dist-aarch64-apple-darwin/dist" build --artifacts=local --target=aarch64-apple-darwin --tag="v$VERSION"
+          ./packaging/smoke.sh target/distrib/bazelqueue-aarch64-apple-darwin.tar.xz "$VERSION"
+  native:
+    name: Bazel ${{ matrix.bazel }} contract
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        bazel: ['8.4.2', '9.2.0']
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          toolchain: '1.96.0'
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c
+      - name: Download the official native Bazel binary
+        env:
+          BAZEL_VERSION: ${{ matrix.bazel }}
+        run: |
+          set -euo pipefail
+          ARCH=$(uname -m)
+          BAZEL_FILE="bazel-${BAZEL_VERSION}-darwin-${ARCH}"
+          URL="https://github.com/bazelbuild/bazel/releases/download/${BAZEL_VERSION}/${BAZEL_FILE}"
+          curl --fail --location "$URL" -o "$RUNNER_TEMP/bazel"
+          curl --fail --location "$URL.sha256" -o "$RUNNER_TEMP/bazel.sha256"
+          EXPECTED=$(cut -d ' ' -f1 "$RUNNER_TEMP/bazel.sha256")
+          ACTUAL=$(shasum -a 256 "$RUNNER_TEMP/bazel" | cut -d ' ' -f1)
+          test "$EXPECTED" = "$ACTUAL"
+          chmod +x "$RUNNER_TEMP/bazel"
+          echo "BAZELQUEUE_TEST_BAZEL=$RUNNER_TEMP/bazel" >> "$GITHUB_ENV"
+          echo "BAZELQUEUE_TEST_VERSION=$BAZEL_VERSION" >> "$GITHUB_ENV"
+      - run: make contract
