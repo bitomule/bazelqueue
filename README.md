@@ -79,7 +79,7 @@ The calling agent stays attached to the command while it waits.
 | Situation | Queue behavior |
 |---|---|
 | Several agents use different worktrees | CPU and memory reservations determine which calls fit. Same-server calls keep FIFO order. |
-| Memory pressure rises | New expensive work waits; healthy samples allow admission to resume. |
+| Memory pressure rises | At warning, one build at a time runs with a reduced budget; at critical, new work waits. Healthy samples restore full capacity. |
 | The caller disappears | Its owned backend is cancelled. Capacity is retained until completion or verified recovery. |
 | The coordinator restarts | Guardians reconnect without submitting the command a second time. |
 | `bazel run` finishes compiling | The target runs through Bazel's generated script. Compilation capacity is released; the target's process footprint remains tracked. |

@@ -146,6 +146,8 @@ impl Fixture {
                             daemon: platform::current_identity().unwrap(),
                             drained,
                             pressure: "healthy".into(),
+                            constrained: None,
+                            held: false,
                             cpu_capacity: 1,
                             memory_capacity_mib: 1024,
                             legacy: vec![],

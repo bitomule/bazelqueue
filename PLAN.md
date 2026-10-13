@@ -277,8 +277,11 @@ enough reservations for it instead of admitting an endless stream of small jobs.
 One workspace's native lock waiter must not consume an expensive global slot.
 Administrative maintenance must have a bounded way to run without starvation.
 
-Memory warning/critical pressure stops new expensive admissions. Resume only
-after recovery hysteresis. CPU samples inform profile choice; CPU utilization
+Memory warning keeps the queue moving in a constrained mode: one build at a
+time, with a reduced budget (`constrained_divisor`, default a quarter of CPU and
+memory capacity, at least 1 CPU and 1024 MiB) that the build keeps for its whole
+run. Critical pressure, or unavailable telemetry after critical, stops new
+admissions. Full capacity returns only after recovery hysteresis. CPU samples inform profile choice; CPU utilization
 alone does not determine memory safety. If telemetry is unavailable, report it
 and use a configured conservative/exclusive path or remain waiting; do not
 treat missing values as zero usage.

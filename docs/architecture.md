@@ -32,8 +32,8 @@ must agree. Unknown work keeps its reservation until evidence is available.
 The scheduler reserves CPU tokens and invocation memory, including overhead.
 Reservations stay immutable while executing. Profiles can broaden only before
 execution; lowering settings drains active work. Native memory-pressure warning
-or unavailable telemetry stops new expensive admission; healthy samples provide
-recovery hysteresis. Historical swap usage does not permanently block builds.
+admits one build at a time with a reduced budget; critical pressure stops new
+admission; healthy samples provide recovery hysteresis before full capacity. Historical swap usage does not permanently block builds.
 
 Native info discovers actual output-base lanes before execution. Busy native
 servers yield preparation capacity rather than monopolizing the queue. Opaque

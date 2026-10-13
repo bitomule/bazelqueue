@@ -343,15 +343,46 @@ fn stdout_stdin_and_non_utf8_arguments_are_preserved() {
 }
 
 #[test]
-fn memory_pressure_blocks_and_recovery_resumes_the_queue() {
+fn critical_memory_pressure_blocks_and_recovery_resumes_the_queue() {
     let mut harness = Harness::new(1);
-    fs::write(harness.paths.root.join("pressure"), "2").unwrap();
-    harness.wait(|s| s.pressure == "warning");
+    fs::write(harness.paths.root.join("pressure"), "4").unwrap();
+    harness.wait(|s| s.pressure == "critical" && s.held);
     let listener = harness.spawn_hold("a");
     harness.wait(|s| s.jobs.iter().any(|job| job.state == "queued"));
     fs::write(harness.paths.root.join("pressure"), "1").unwrap();
     let mut running = Harness::accepted(&listener);
     running.write_all(b"F").unwrap();
+}
+
+#[test]
+fn warning_runs_one_job_with_the_reduced_budget_and_recovery_restores_parallelism() {
+    let mut harness = Harness::new(2);
+    fs::write(harness.paths.root.join("pressure"), "2").unwrap();
+    harness.wait(|s| s.pressure == "warning" && s.constrained.is_some());
+    let first = harness.spawn_hold("first");
+    let mut running = Harness::accepted(&first);
+    let second = harness.spawn_hold("second");
+    let snapshot = harness.wait(|s| s.jobs.iter().any(|job| job.state == "queued"));
+    let active: Vec<_> = snapshot
+        .jobs
+        .iter()
+        .filter(|job| job.holds_capacity())
+        .collect();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].request.budget.cpu, 2);
+    assert_eq!(active[0].request.budget.memory_mib, 1024);
+    fs::write(harness.paths.root.join("pressure"), "1").unwrap();
+    let mut parallel = Harness::accepted(&second);
+    let snapshot = harness.wait(|s| s.jobs.iter().filter(|job| job.holds_capacity()).count() == 2);
+    let restored = snapshot
+        .jobs
+        .iter()
+        .find(|job| job.holds_capacity() && job.request.budget.cpu != 2)
+        .unwrap();
+    assert_eq!(restored.request.budget.cpu, 4);
+    assert_eq!(restored.request.budget.memory_mib, 2048);
+    running.write_all(b"F").unwrap();
+    parallel.write_all(b"F").unwrap();
 }
 
 #[test]

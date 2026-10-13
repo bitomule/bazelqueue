@@ -3,7 +3,7 @@ use crate::{
     config::{Config, Paths},
     platform,
     protocol::{self, Event, Message, Snapshot},
-    scheduler::{self, Capacity},
+    scheduler::{self, Capacity, Pressure},
     store::Store,
 };
 use anyhow::{Result, bail};
@@ -179,7 +179,8 @@ pub async fn run(paths: Paths) -> Result<()> {
     let daemon = platform::current_identity()?;
     let mut healthy_samples = 0_u32;
     let mut pressure = sample_pressure(&paths);
-    let mut healthy = false;
+    let mut last_known = pressure;
+    let mut mode = Pressure::from_samples(pressure, None, 0, config.pressure_recovery_samples);
     let mut tick = 0;
     let mut probing = std::collections::HashSet::new();
     let mut deferred: HashMap<String, tokio::time::Instant> = HashMap::new();
@@ -212,7 +213,7 @@ pub async fn run(paths: Paths) -> Result<()> {
                                 Err(error)=>{notify(&reply,Event::Error {message:error.to_string()});continue;},
                             }
                         }
-                        let result=handle(&paths,&store,&config,&daemon,pressure,connection,message,&reply,&mut sessions,&mut connection_ids);
+                        let result=handle(&paths,&store,&config,&daemon,pressure,mode,connection,message,&reply,&mut sessions,&mut connection_ids);
                         if let Err(error)=result {notify(&reply,Event::Error {message:error.to_string()});}
                     }
                     None=>break,
@@ -225,7 +226,8 @@ pub async fn run(paths: Paths) -> Result<()> {
                     if let Ok(updated)=Config::load(&paths) {config=updated;}
                     pressure=sample_pressure(&paths);
                     if pressure==Some(1) {healthy_samples=healthy_samples.saturating_add(1);} else {healthy_samples=0;}
-                    healthy=healthy_samples>=config.pressure_recovery_samples;
+                    mode=Pressure::from_samples(pressure,last_known,healthy_samples,config.pressure_recovery_samples);
+                    if pressure.is_some() {last_known=pressure;}
                 }
 
             }
@@ -242,6 +244,11 @@ pub async fn run(paths: Paths) -> Result<()> {
                         || job.request.budget.memory_mib > config.memory_capacity_mib)
                 {
                     job.request.budget = config.budget(!job.request.budget.exclusive);
+                    store.save(job)?;
+                }
+                if job.state == "queued"
+                    && scheduler::fit_queued(&mut job.request.budget, &config, mode)
+                {
                     store.save(job)?;
                 }
                 let receipt = paths.root.join(format!("receipt-{}", job.request.id));
@@ -320,15 +327,14 @@ pub async fn run(paths: Paths) -> Result<()> {
                 .filter_map(|job| job.child.clone())
                 .collect();
             let capacity = Capacity {
-                healthy,
+                pressure: mode,
                 legacy_active: jobs.iter().any(|job| job.state == "queued")
                     && legacy_owners(&store, &config).map_or(true, |owners| !owners.is_empty()),
                 drained: store.drained()?,
                 run_memory_mib: platform::process_memory(&run_owners),
             };
-            let remaining_memory = config
-                .memory_capacity_mib
-                .saturating_sub(capacity.run_memory_mib);
+            let limit = scheduler::admission_budget(&config, mode);
+            let remaining_memory = limit.memory_mib.saturating_sub(capacity.run_memory_mib);
             if remaining_memory >= 256 && !jobs.iter().any(|job| job.holds_capacity()) {
                 for job in jobs.iter_mut().filter(|job| {
                     job.state == "queued"
@@ -351,32 +357,9 @@ pub async fn run(paths: Paths) -> Result<()> {
                 })
                 .cloned()
                 .collect();
-            let eligible_count = candidates
-                .iter()
-                .filter(|job| {
-                    job.state == "queued"
-                        && job.request.prepared
-                        && !job.request.budget.exclusive
-                        && job.request.command != "exec"
-                })
-                .count();
-            if eligible_count == 1
-                && remaining_memory >= 256
-                && jobs
-                    .iter()
-                    .filter(|job| job.state == "queued" && !job.cancel)
-                    .count()
-                    == 1
-                && !candidates.iter().any(|job| job.holds_capacity())
-                && let Some(job) = jobs.iter_mut().find(|job| {
-                    job.state == "queued"
-                        && job.request.prepared
-                        && !job.request.budget.exclusive
-                        && job.request.command != "exec"
-                })
+            if let Some(job) =
+                scheduler::raise_lone_job(&candidates, &mut jobs, &limit, remaining_memory)
             {
-                job.request.budget.cpu = config.cpu_capacity;
-                job.request.budget.memory_mib = remaining_memory;
                 store.save(job)?;
             }
             let candidates: Vec<_> = jobs
@@ -454,6 +437,7 @@ fn handle(
     config: &Config,
     daemon: &platform::Identity,
     pressure: Option<u32>,
+    mode: Pressure,
     connection: u64,
     message: Message,
     reply: &mpsc::Sender<Event>,
@@ -528,6 +512,9 @@ fn handle(
                             }
                             .into()
                         }),
+                        constrained: (mode == Pressure::Constrained)
+                            .then(|| config.constrained_budget()),
+                        held: mode == Pressure::Held,
                         cpu_capacity: config.cpu_capacity,
                         memory_capacity_mib: config.memory_capacity_mib,
                         legacy: legacy_owners(store, config)?,
