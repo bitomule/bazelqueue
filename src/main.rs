@@ -222,8 +222,9 @@ fn show(event: Event, json: bool) -> Result<()> {
         println!("{}", serde_json::to_string(&snapshot)?);
     } else {
         println!(
-            "Coordinator {} | pressure {}{} | capacity {} CPU / {} MiB | {}",
+            "Coordinator {} | bazelqueue {} | pressure {}{} | capacity {} CPU / {} MiB | {}",
             snapshot.daemon.pid,
+            coordinator::describe_version(&snapshot),
             snapshot.pressure,
             match (&snapshot.constrained, snapshot.held) {
                 (_, true) => " | holding new builds".to_owned(),
@@ -241,6 +242,9 @@ fn show(event: Event, json: bool) -> Result<()> {
                 "accepting"
             }
         );
+        if let Some(skew) = coordinator::skew(&snapshot) {
+            println!("warning: {skew}");
+        }
         for owner in snapshot.legacy {
             println!("legacy {} draining", owner.pid);
         }

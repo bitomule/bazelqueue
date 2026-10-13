@@ -10,6 +10,7 @@ use anyhow::{Result, bail};
 use std::{
     collections::{BTreeMap, HashMap},
     fs,
+    path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
 };
@@ -82,11 +83,16 @@ async fn connection(stream: UnixStream, number: u64, send: mpsc::Sender<Input>) 
 }
 
 pub async fn connect(paths: &Paths) -> Result<protocol::Framed<UnixStream>> {
+    Ok(connect_peer(paths).await?.0)
+}
+
+async fn connect_peer(paths: &Paths) -> Result<(protocol::Framed<UnixStream>, u32)> {
     let stream = UnixStream::connect(&paths.socket).await?;
     let standard = stream.into_std()?;
     if platform::peer_uid(&standard)? != platform::uid() {
         bail!("coordinator belongs to another user");
     }
+    let peer = platform::peer_pid(&standard)?;
     let mut stream = protocol::Framed::new(UnixStream::from_std(standard)?);
     protocol::send(
         &mut stream,
@@ -103,16 +109,24 @@ pub async fn connect(paths: &Paths) -> Result<protocol::Framed<UnixStream>> {
     ) {
         bail!("incompatible coordinator protocol");
     }
-    Ok(stream)
+    Ok((stream, peer))
 }
 
 pub async fn ensure(paths: &Paths) -> Result<protocol::Framed<UnixStream>> {
-    if let Ok(stream) = connect(paths).await {
-        return Ok(stream);
+    Ok(
+        ensure_from(paths, &std::env::current_exe()?.canonicalize()?)
+            .await?
+            .0,
+    )
+}
+
+async fn ensure_from(paths: &Paths, program: &Path) -> Result<(protocol::Framed<UnixStream>, u32)> {
+    if let Ok(connection) = connect_peer(paths).await {
+        return Ok(connection);
     }
     let log = platform::private_file(&paths.root.join("daemon.log"))?;
     use std::os::unix::process::CommandExt;
-    let mut command = std::process::Command::new(std::env::current_exe()?.canonicalize()?);
+    let mut command = std::process::Command::new(program);
     command.process_group(0);
     command
         .args(["daemon", "run"])
@@ -122,8 +136,8 @@ pub async fn ensure(paths: &Paths) -> Result<protocol::Framed<UnixStream>> {
         .stderr(log);
     let mut child = command.spawn()?;
     for _ in 0..100 {
-        if let Ok(stream) = connect(paths).await {
-            return Ok(stream);
+        if let Ok(connection) = connect_peer(paths).await {
+            return Ok(connection);
         }
         if let Some(status) = child.try_wait()?
             && !status.success()
@@ -155,6 +169,184 @@ pub async fn control(paths: &Paths, operation: &str, id: Option<String>) -> Resu
     Ok(event)
 }
 
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+pub fn runs(snapshot: &Snapshot, executable: &Path) -> bool {
+    snapshot.version == VERSION
+        && snapshot
+            .executable
+            .as_deref()
+            .is_some_and(|running| platform::same_image(running, executable))
+}
+
+pub fn describe_version(snapshot: &Snapshot) -> &str {
+    if snapshot.version.is_empty() {
+        "unreported (older)"
+    } else {
+        &snapshot.version
+    }
+}
+
+pub fn skew(snapshot: &Snapshot) -> Option<String> {
+    (snapshot.version != VERSION).then(|| {
+        format!(
+            "coordinator {} runs bazelqueue {}, but this bazelqueue is {VERSION}; run `bazelqueue setup` to finish the upgrade",
+            snapshot.daemon.pid,
+            describe_version(snapshot)
+        )
+    })
+}
+
+pub struct Replaced {
+    pub previous: Snapshot,
+    pub current: Snapshot,
+}
+
+/// Replaces a running coordinator that is not `executable` at this version.
+/// The caller must have drained the queue; only queued requests may exist,
+/// and their guardians reconnect to the successor.
+pub async fn hand_over(paths: &Paths, executable: &Path) -> Result<Option<Replaced>> {
+    let mut previous = None;
+    for _ in 0..3 {
+        let (mut stream, peer) = ensure_from(paths, executable).await?;
+        let snapshot = request_status(&mut stream).await?;
+        if runs(&snapshot, executable) {
+            return Ok(previous.map(|previous| Replaced {
+                previous,
+                current: snapshot,
+            }));
+        }
+        if snapshot
+            .jobs
+            .iter()
+            .any(|job| !job.terminal() && job.state != "queued")
+        {
+            bail!(
+                "coordinator {} (bazelqueue {}) is executing requests and cannot be replaced yet",
+                snapshot.daemon.pid,
+                describe_version(&snapshot)
+            );
+        }
+        protocol::send(
+            &mut stream,
+            &Message::Control {
+                operation: "retire".into(),
+                id: None,
+            },
+        )
+        .await?;
+        let interrupt = match protocol::receive::<_, Event>(&mut stream).await {
+            Ok(Event::Error { message }) if message == "unknown control operation" => true,
+            Ok(Event::Error { message }) => bail!("{message}"),
+            Ok(_) | Err(_) => false,
+        };
+        if interrupt && (peer != snapshot.daemon.pid || !platform::alive(&snapshot.daemon)) {
+            bail!(
+                "cannot verify that process {} is the coordinator; refusing to signal it",
+                snapshot.daemon.pid
+            );
+        }
+        drop(stream);
+        retired(paths, &snapshot, interrupt).await?;
+        previous.get_or_insert(snapshot);
+    }
+    bail!("an older coordinator kept replacing the installed one")
+}
+
+async fn request_status(stream: &mut protocol::Framed<UnixStream>) -> Result<Snapshot> {
+    protocol::send(
+        stream,
+        &Message::Control {
+            operation: "status".into(),
+            id: None,
+        },
+    )
+    .await?;
+    match protocol::receive(stream).await? {
+        Event::Snapshot { snapshot } => Ok(snapshot),
+        Event::Error { message } => bail!("{message}"),
+        _ => bail!("coordinator returned no snapshot"),
+    }
+}
+
+async fn retired(paths: &Paths, snapshot: &Snapshot, interrupt: bool) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut signal_at = tokio::time::Instant::now();
+    loop {
+        if !platform::alive(&snapshot.daemon)
+            || platform::lock(&paths.root.join("daemon.lock")).is_ok()
+        {
+            return Ok(());
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            bail!(
+                "coordinator {} (bazelqueue {}) did not exit",
+                snapshot.daemon.pid,
+                describe_version(snapshot)
+            );
+        }
+        if interrupt && now >= signal_at {
+            platform::signal_pid(snapshot.daemon.pid, libc::SIGINT);
+            signal_at = now + Duration::from_millis(250);
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
+struct Daemon {
+    identity: platform::Identity,
+    version: String,
+    executable: Option<PathBuf>,
+    #[cfg(feature = "test-fixtures")]
+    legacy: bool,
+}
+
+impl Daemon {
+    fn current() -> Result<Self> {
+        #[allow(unused_mut)]
+        let mut daemon = Self {
+            identity: platform::current_identity()?,
+            version: VERSION.into(),
+            executable: std::env::current_exe()
+                .and_then(|path| path.canonicalize())
+                .ok(),
+            #[cfg(feature = "test-fixtures")]
+            legacy: false,
+        };
+        #[cfg(feature = "test-fixtures")]
+        match std::env::var("BAZELQUEUE_FIXTURE_COORDINATOR").as_deref() {
+            Ok("legacy") => {
+                daemon.version.clear();
+                daemon.executable = None;
+                daemon.legacy = true;
+            }
+            Ok(version) => daemon.version = version.into(),
+            Err(_) => {}
+        }
+        Ok(daemon)
+    }
+    fn retires(&self) -> bool {
+        #[cfg(feature = "test-fixtures")]
+        if self.legacy {
+            return false;
+        }
+        true
+    }
+    fn reload(&self, paths: &Paths) -> Result<Config> {
+        #[cfg(feature = "test-fixtures")]
+        if self.legacy
+            && fs::read_to_string(&paths.config)
+                .is_ok_and(|text| text.contains("constrained_divisor"))
+        {
+            bail!(
+                "invalid bazelqueue configuration: TOML parse error: unknown field `constrained_divisor`"
+            );
+        }
+        Config::load(paths)
+    }
+}
+
 fn notify(reply: &mpsc::Sender<Event>, event: Event) {
     let _ = reply.try_send(event);
 }
@@ -176,7 +368,7 @@ pub async fn run(paths: Paths) -> Result<()> {
     let mut connection_ids: HashMap<u64, String> = HashMap::new();
     let mut notices: BTreeMap<String, (usize, String)> = BTreeMap::new();
     let mut count = 0_u64;
-    let daemon = platform::current_identity()?;
+    let daemon = Daemon::current()?;
     let mut healthy_samples = 0_u32;
     let mut pressure = sample_pressure(&paths);
     let mut last_known = pressure;
@@ -207,8 +399,16 @@ pub async fn run(paths: Paths) -> Result<()> {
                         if let Some(id)=connection_ids.get(&connection).filter(|id|sessions.get(*id).is_some_and(|(current,_)|*current==connection))&& let Some(mut job)=store.jobs()?.into_iter().find(|job|&job.request.id==id && job.state=="preparing") {job.state="queued".into();store.save(&job)?;deferred.insert(id.clone(),tokio::time::Instant::now()+Duration::from_secs(1));notify(&reply,Event::Queued {position:store.jobs()?.iter().filter(|other|other.state=="queued" && other.sequence<=job.sequence).count(),reason:"native server is busy".into()});}
                     }
                     Some(Input::Message {connection,message,reply})=> {
+                        if matches!(&message, Message::Control {operation,..} if operation=="retire") && daemon.retires() {
+                            if store.jobs()?.iter().any(|job|!job.terminal() && job.state!="queued") {
+                                notify(&reply,Event::Error {message:"requests are executing; the coordinator can be replaced once they finish".into()});
+                                continue;
+                            }
+                            notify(&reply,Event::Ack);
+                            break;
+                        }
                         if matches!(&message, Message::Control {operation,..} if operation=="resume") {
-                            match Config::load(&paths) {
+                            match daemon.reload(&paths) {
                                 Ok(updated)=>config=updated,
                                 Err(error)=>{notify(&reply,Event::Error {message:error.to_string()});continue;},
                             }
@@ -435,7 +635,7 @@ fn handle(
     paths: &Paths,
     store: &Store,
     config: &Config,
-    daemon: &platform::Identity,
+    daemon: &Daemon,
     pressure: Option<u32>,
     mode: Pressure,
     connection: u64,
@@ -502,7 +702,9 @@ fn handle(
                 reply,
                 Event::Snapshot {
                     snapshot: Snapshot {
-                        daemon: daemon.clone(),
+                        daemon: daemon.identity.clone(),
+                        version: daemon.version.clone(),
+                        executable: daemon.executable.clone(),
                         drained: store.drained()?,
                         pressure: pressure.map_or("unavailable".into(), |value| {
                             match value {

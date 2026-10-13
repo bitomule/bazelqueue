@@ -19,8 +19,21 @@ edits. It refuses active requests until the queue has drained.
 The control binary remains Homebrew-owned. User interception uses a private retained executable chain. Every frontend,
 including explicit `bazelqueue exec`, selects a retained helper image before
 starting its guardian. Homebrew can remove an old keg without removing that
-guardian’s executable for later handoff or coordinator recovery. Run bazelqueue setup after brew upgrade to
-refresh activation. Preserve the backend's opt-stable absolute path.
+guardian’s executable for later handoff or coordinator recovery. `bazelqueue setup` is the upgrade step after
+`brew upgrade`: until it runs, the old coordinator keeps running the old
+retained executable, and `status`/`doctor` report the version difference.
+
+After the transaction commits, setup compares the running coordinator's
+reported version and executable with the installed `current` executable. A
+different coordinator is asked to retire (it refuses while any request holds
+capacity), and a coordinator too old to know that operation receives SIGINT
+only after the control socket's peer uid and pid and the process birth identity
+match its status snapshot. Setup waits for it to exit, starts the successor
+from `current`, and resumes the queue there. Queued requests keep their place
+and their guardians reconnect. If the replacement fails, setup resumes the old
+coordinator when it accepts the configuration; otherwise it names the process
+to stop and the command to run, and leaves the transaction pending so the next
+setup retries the replacement. Preserve the backend's opt-stable absolute path.
 
 On this Mac, --migrate records existing shell shim process birth identities and
 adds the existing cache guard and bounded external-rc synchronization as optional

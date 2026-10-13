@@ -108,12 +108,19 @@ bazelqueue status --json     # Inspect it from a script or agent
 <details>
 <summary>Upgrades and removal</summary>
 
-After a Homebrew upgrade, refresh activation when the queue has no active requests:
+`brew upgrade` only replaces the Homebrew binary; the running coordinator and
+the shims keep using the previous retained executable. `bazelqueue setup` is the
+upgrade step. Run it when the queue has no active requests:
 
 ```sh
 brew upgrade bazelqueue
 bazelqueue setup
 ```
+
+Setup activates the new executable and replaces an older coordinator with one
+started from it before resuming the queue. `bazelqueue status` and
+`bazelqueue doctor` warn while the running coordinator is a different version
+than the command you run.
 
 Each caller uses a retained helper image, so removing an old Homebrew keg does
 not remove the executable needed by an active guardian.

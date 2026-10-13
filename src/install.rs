@@ -327,9 +327,56 @@ async fn recover(paths: &Paths) -> Result<()> {
     let journal: Journal = serde_json::from_slice(&fs::read(&pending)?)
         .context("invalid installation journal; refusing to mutate installation")?;
     apply(&journal, journal.committed, paths, true)?;
-    coordinator::control(paths, "resume", None).await?;
+    resume(paths).await?;
     fs::remove_file(&pending)?;
     sync_parent(&pending)
+}
+async fn resume(paths: &Paths) -> Result<()> {
+    let installed = paths.root.join("current");
+    let handover = match installed.canonicalize() {
+        Ok(executable) => coordinator::hand_over(paths, &executable).await,
+        Err(_) => Ok(None),
+    };
+    match handover {
+        Ok(Some(replaced)) => println!(
+            "bazelqueue: replaced coordinator {} (bazelqueue {}) with coordinator {} (bazelqueue {})",
+            replaced.previous.daemon.pid,
+            coordinator::describe_version(&replaced.previous),
+            replaced.current.daemon.pid,
+            coordinator::describe_version(&replaced.current)
+        ),
+        Ok(None) => {}
+        Err(error) => {
+            let running = match coordinator::control(paths, "status", None).await {
+                Ok(Event::Snapshot { snapshot }) => Some(snapshot),
+                _ => None,
+            };
+            let stop = running.as_ref().map_or_else(
+                || "stop any running `bazelqueue daemon run` process".to_owned(),
+                |snapshot| {
+                    format!(
+                        "stop the old coordinator with `kill -INT {}`",
+                        snapshot.daemon.pid
+                    )
+                },
+            );
+            if let Err(resume) = coordinator::control(paths, "resume", None).await {
+                bail!(
+                    "the installation is consistent, but builds stay paused: the coordinator could not be replaced ({error:#}) and refused to resume ({resume:#}). To recover, {stop}, then run `bazelqueue setup` again (or `bazelqueue resume`)"
+                );
+            }
+            eprintln!(
+                "bazelqueue: warning: builds resumed on the old coordinator because it could not be replaced ({error:#}). To finish the upgrade once no build is running, run `bazelqueue setup` again"
+            );
+            return Ok(());
+        }
+    }
+    if let Err(error) = coordinator::control(paths, "resume", None).await {
+        bail!(
+            "the installation is consistent, but builds stay paused: {error:#}. To recover, run `bazelqueue resume`; if it fails the same way, stop the coordinator shown by `bazelqueue status` with `kill -INT <pid>` and run `bazelqueue setup` again"
+        );
+    }
+    Ok(())
 }
 async fn transact(paths: &Paths, mut journal: Journal) -> Result<()> {
     save_journal(paths, &journal)?;
@@ -719,7 +766,14 @@ pub async fn doctor(paths: &Paths) -> Result<()> {
     println!("Pressure sensor: {:?}", platform::pressure());
     println!("Configured concurrency: {}", config.max_builds);
     if let Event::Snapshot { snapshot } = coordinator::control(paths, "status", None).await? {
-        println!("Coordinator: {}", snapshot.daemon.pid);
+        println!(
+            "Coordinator: {} (bazelqueue {})",
+            snapshot.daemon.pid,
+            coordinator::describe_version(&snapshot)
+        );
+        if let Some(skew) = coordinator::skew(&snapshot) {
+            bail!("{skew}");
+        }
         let count = snapshot
             .jobs
             .iter()

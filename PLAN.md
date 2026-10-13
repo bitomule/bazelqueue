@@ -516,6 +516,10 @@ Use an opt-stable invocation path and version-aware protocol handshake. A new
 binary may connect to a compatible old coordinator. For an incompatible upgrade,
 drain pending execution ownership and restart safely; clients wait and reconnect.
 Do not run independent old/new coordinators against the same reservation ledger.
+The coordinator reports its version and executable; setup hands a drained,
+non-executing old coordinator over to one started from the installed
+executable before resuming, because an older coordinator may reject the
+configuration the new release writes.
 Old guardians need a documented compatibility window or must finish before the
 new coordinator admits work.
 
