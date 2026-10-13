@@ -5,7 +5,7 @@ VERSION=$2
 STAGING=$(mktemp -d)
 trap 'rm -rf "$STAGING"' EXIT
 PREFIX=bazelqueue-aarch64-apple-darwin
-printf '%s\n' "$PREFIX/" "$PREFIX/LICENSE-APACHE" "$PREFIX/LICENSE-MIT" "$PREFIX/README.md" "$PREFIX/bazelqueue" | LC_ALL=C sort > "$STAGING/expected"
+printf '%s\n' "$PREFIX/" "$PREFIX/CHANGELOG.md" "$PREFIX/LICENSE-APACHE" "$PREFIX/LICENSE-MIT" "$PREFIX/README.md" "$PREFIX/bazelqueue" | LC_ALL=C sort > "$STAGING/expected"
 tar -tJf "$ARCHIVE" | LC_ALL=C sort > "$STAGING/actual"
 diff -u "$STAGING/expected" "$STAGING/actual"
 tar -xJf "$ARCHIVE" -C "$STAGING"
