@@ -20,6 +20,7 @@ pub struct Config {
     pub worker_instances: u32,
     pub managed: bool,
     pub pressure_recovery_samples: u32,
+    pub constrained_divisor: u32,
     pub hooks: Vec<Hook>,
     pub legacy: Vec<platform::Identity>,
 }
@@ -49,6 +50,7 @@ impl Default for Config {
             worker_instances: 2,
             managed: true,
             pressure_recovery_samples: 3,
+            constrained_divisor: 4,
             hooks: Vec::new(),
             legacy: Vec::new(),
         }
@@ -83,6 +85,7 @@ impl Config {
             || self.jobs == 0
             || self.worker_instances == 0
             || self.pressure_recovery_samples == 0
+            || self.constrained_divisor == 0
         {
             bail!("resource capacities and concurrency must be positive");
         }
@@ -109,6 +112,17 @@ impl Config {
                 self.memory_capacity_mib
             },
             exclusive: !managed,
+        }
+    }
+    /// One build under memory-pressure warning: a quarter of the default capacity is an
+    /// eighth of RAM, which fits inside XNU's gap between warning (50 %) and critical (35 %).
+    pub fn constrained_budget(&self) -> Budget {
+        Budget {
+            cpu: (self.cpu_capacity / self.constrained_divisor).max(1),
+            memory_mib: (self.memory_capacity_mib / u64::from(self.constrained_divisor))
+                .max(1024)
+                .min(self.memory_capacity_mib),
+            exclusive: false,
         }
     }
     pub fn save(&self, paths: &Paths) -> Result<()> {
@@ -185,6 +199,38 @@ mod tests {
         assert_eq!(config.budget(true).cpu, 5);
         assert!(config.budget(true).cpu * 2 <= config.cpu_capacity);
         assert_eq!(config.budget(false).cpu, 11);
+    }
+    #[test]
+    fn constrained_budget_is_a_quarter_with_floors() {
+        let config = Config {
+            cpu_capacity: 8,
+            memory_capacity_mib: 9216,
+            ..Config::default()
+        };
+        assert_eq!(
+            config.constrained_budget(),
+            Budget {
+                cpu: 2,
+                memory_mib: 2304,
+                exclusive: false
+            }
+        );
+        let small = Config {
+            cpu_capacity: 2,
+            memory_capacity_mib: 768,
+            action_memory_mib: 512,
+            ..Config::default()
+        };
+        assert_eq!(small.constrained_budget().cpu, 1);
+        assert_eq!(small.constrained_budget().memory_mib, 768);
+        assert!(
+            Config {
+                constrained_divisor: 0,
+                ..Config::default()
+            }
+            .validate()
+            .is_err()
+        );
     }
     #[test]
     fn unsafe_backend_names_and_zero_share_configurations_are_rejected() {

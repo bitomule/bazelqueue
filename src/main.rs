@@ -101,7 +101,7 @@ async fn entry() -> Result<()> {
             .read_exact(&mut permit)
             .await
             .context("guardian disappeared before execution was authorized")?;
-        if permit != [b'G'] {
+        if permit != *b"G" {
             bail!("invalid execution permit");
         }
         drop(control);
@@ -222,9 +222,17 @@ fn show(event: Event, json: bool) -> Result<()> {
         println!("{}", serde_json::to_string(&snapshot)?);
     } else {
         println!(
-            "Coordinator {} | pressure {} | capacity {} CPU / {} MiB | {}",
+            "Coordinator {} | pressure {}{} | capacity {} CPU / {} MiB | {}",
             snapshot.daemon.pid,
             snapshot.pressure,
+            match (&snapshot.constrained, snapshot.held) {
+                (_, true) => " | holding new builds".to_owned(),
+                (Some(budget), false) => format!(
+                    " | constrained {} CPU / {} MiB",
+                    budget.cpu, budget.memory_mib
+                ),
+                (None, false) => String::new(),
+            },
             snapshot.cpu_capacity,
             snapshot.memory_capacity_mib,
             if snapshot.drained {

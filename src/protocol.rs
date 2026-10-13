@@ -130,6 +130,10 @@ pub struct Snapshot {
     pub daemon: Identity,
     pub drained: bool,
     pub pressure: String,
+    #[serde(default)]
+    pub constrained: Option<Budget>,
+    #[serde(default)]
+    pub held: bool,
     pub cpu_capacity: u32,
     pub memory_capacity_mib: u64,
     pub legacy: Vec<Identity>,

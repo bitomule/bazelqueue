@@ -241,12 +241,12 @@ pub fn arguments(
         workers = numeric_limit(
             invocation,
             "--worker_max_instances",
-            u64::from(config.worker_instances)
+            u64::from(config.worker_instances.min(budget.cpu))
         )
         .min(numeric_limit(
             invocation,
             "--worker_max_multiplex_instances",
-            u64::from(config.worker_instances)
+            u64::from(config.worker_instances.min(budget.cpu))
         )),
         tests = numeric_limit(
             invocation,
