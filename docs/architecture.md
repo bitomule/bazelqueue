@@ -46,5 +46,7 @@ third-party queue daemon is needed. The only TCP connection created by the queue
 is a local authenticated Bazel-server recovery probe.
 
 Compatible protocol upgrades reuse the existing coordinator and owned executable
-chain. Incompatible future protocols fail closed; automatic cross-protocol drain
+chain until `setup` commits; it then replaces a coordinator whose version or
+executable differs from the installed one, so the configuration it wrote is
+loaded by the matching release. Incompatible future protocols fail closed; automatic cross-protocol drain
 and restart is not claimed by this release.

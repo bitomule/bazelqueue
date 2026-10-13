@@ -26,6 +26,9 @@ struct Harness {
 }
 impl Harness {
     fn new(parallel: usize) -> Self {
+        Self::with_coordinator(parallel, None)
+    }
+    fn with_coordinator(parallel: usize, fixture: Option<&str>) -> Self {
         let root = tempfile::Builder::new()
             .prefix("bqe-")
             .tempdir_in("/private/tmp")
@@ -50,14 +53,17 @@ impl Harness {
         }
         .save(&paths)
         .unwrap();
-        let daemon = Command::new(env!("CARGO_BIN_EXE_bazelqueue"))
+        let mut daemon = Command::new(env!("CARGO_BIN_EXE_bazelqueue"));
+        daemon
             .args(["daemon", "run"])
             .env("BAZELQUEUE_HOME", &state)
             .env("HOME", root.path())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::piped());
+        if let Some(fixture) = fixture {
+            daemon.env("BAZELQUEUE_FIXTURE_COORDINATOR", fixture);
+        }
+        let daemon = daemon.spawn().unwrap();
         let mut harness = Self {
             root,
             paths,
@@ -537,6 +543,107 @@ fn setup_is_reversible_and_does_not_overwrite_foreign_files_implicitly() {
     );
     assert_eq!(fs::read(bin.join("bazelisk")).unwrap(), b"original");
     assert!(!bin.join("bazel").exists());
+}
+
+fn upgrade_setup(harness: &Harness) -> std::process::Output {
+    let bin = harness.root.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    harness
+        .command()
+        .args([
+            "setup",
+            "--backend",
+            env!("CARGO_BIN_EXE_fixture-backend"),
+            "--bin-dir",
+        ])
+        .arg(&bin)
+        .env("SHELL", "/bin/zsh")
+        .env_remove("ZDOTDIR")
+        .output()
+        .unwrap()
+}
+
+fn assert_upgraded(mut harness: Harness, previous: Snapshot) {
+    let output = upgrade_setup(&harness);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains(&format!("replaced coordinator {}", previous.daemon.pid)),
+        "{stdout}"
+    );
+    assert!(harness.daemon.wait().unwrap().success());
+    let current = harness.snapshot().expect("no coordinator after upgrade");
+    assert_ne!(current.daemon, previous.daemon);
+    assert_eq!(current.version, coordinator::VERSION);
+    assert_eq!(
+        current.executable.unwrap(),
+        harness.paths.root.join("current").canonicalize().unwrap()
+    );
+    assert!(!current.drained);
+    let status = harness.command().arg("status").output().unwrap();
+    let text = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        text.contains(&format!("bazelqueue {} |", coordinator::VERSION)),
+        "{text}"
+    );
+    assert!(!text.contains("warning"), "{text}");
+    let build = harness.spawn_hold("after-upgrade");
+    let mut admitted = Harness::accepted(&build);
+    admitted.write_all(b"F").unwrap();
+    assert!(harness.children[0].wait().unwrap().success());
+}
+
+#[test]
+fn upgrade_replaces_a_coordinator_that_rejects_the_new_configuration() {
+    let harness = Harness::with_coordinator(1, Some("legacy"));
+    let previous = harness.snapshot().unwrap();
+    assert_eq!(previous.version, "");
+    let status = harness.command().arg("status").output().unwrap();
+    let text = String::from_utf8_lossy(&status.stdout);
+    assert!(text.contains("bazelqueue unreported (older) |"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "warning: coordinator {} runs bazelqueue unreported (older), but this bazelqueue is {}; run `bazelqueue setup`",
+            previous.daemon.pid,
+            coordinator::VERSION
+        )),
+        "{text}"
+    );
+    let doctor = harness.command().arg("doctor").output().unwrap();
+    assert!(!doctor.status.success());
+    assert!(
+        String::from_utf8_lossy(&doctor.stderr).contains("run `bazelqueue setup`"),
+        "{doctor:?}"
+    );
+    assert_upgraded(harness, previous);
+}
+
+#[test]
+fn upgrade_retires_a_coordinator_of_another_version() {
+    let harness = Harness::with_coordinator(1, Some("0.0.1"));
+    let previous = harness.snapshot().unwrap();
+    assert_eq!(previous.version, "0.0.1");
+    assert_upgraded(harness, previous);
+}
+
+#[test]
+fn setup_keeps_a_current_coordinator() {
+    let mut harness = Harness::new(1);
+    let previous = harness.snapshot().unwrap();
+    assert_eq!(previous.version, coordinator::VERSION);
+    let output = upgrade_setup(&harness);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("replaced coordinator"));
+    assert!(harness.daemon.try_wait().unwrap().is_none());
+    assert_eq!(harness.snapshot().unwrap().daemon, previous.daemon);
 }
 
 fn native_backend() -> PathBuf {

@@ -128,6 +128,10 @@ impl Job {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Snapshot {
     pub daemon: Identity,
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub executable: Option<std::path::PathBuf>,
     pub drained: bool,
     pub pressure: String,
     #[serde(default)]
@@ -202,6 +206,16 @@ pub async fn receive<R: AsyncRead + Unpin, T: DeserializeOwned>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn snapshots_from_coordinators_without_a_version_still_decode() {
+        let snapshot: Snapshot = serde_json::from_str(
+            r#"{"daemon":{"pid":7,"birth":"b"},"drained":true,"pressure":"normal","cpu_capacity":1,"memory_capacity_mib":1024,"legacy":[],"jobs":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(snapshot.version, "");
+        assert_eq!(snapshot.executable, None);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn selected_reads_retain_partial_headers_and_bodies() {
         for cut in [2, 7] {

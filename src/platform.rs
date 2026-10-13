@@ -440,6 +440,14 @@ impl Drop for Terminal {
 }
 
 pub fn peer_uid(stream: &std::os::unix::net::UnixStream) -> Result<u32> {
+    Ok(peer(stream)?.0)
+}
+
+pub fn peer_pid(stream: &std::os::unix::net::UnixStream) -> Result<u32> {
+    Ok(peer(stream)?.1)
+}
+
+fn peer(stream: &std::os::unix::net::UnixStream) -> Result<(u32, u32)> {
     #[cfg(target_os = "macos")]
     {
         let mut uid = 0;
@@ -448,7 +456,21 @@ pub fn peer_uid(stream: &std::os::unix::net::UnixStream) -> Result<u32> {
         if result != 0 {
             return Err(io::Error::last_os_error().into());
         }
-        Ok(uid)
+        let mut pid: libc::pid_t = 0;
+        let mut len = std::mem::size_of_val(&pid) as libc::socklen_t;
+        let result = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_LOCAL,
+                libc::LOCAL_PEERPID,
+                (&mut pid as *mut libc::pid_t).cast(),
+                &mut len,
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        Ok((uid, pid as u32))
     }
     #[cfg(target_os = "linux")]
     {
@@ -466,13 +488,17 @@ pub fn peer_uid(stream: &std::os::unix::net::UnixStream) -> Result<u32> {
         if result != 0 {
             return Err(io::Error::last_os_error().into());
         }
-        Ok(credentials.uid)
+        Ok((credentials.uid, credentials.pid as u32))
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = stream;
         bail!("unsupported platform")
     }
+}
+
+pub fn same_image(a: &Path, b: &Path) -> bool {
+    same_executable(a, b) || matches!((fs::read(a), fs::read(b)), (Ok(x), Ok(y)) if x == y)
 }
 
 pub fn signal_exit(signal: i32) -> ! {
