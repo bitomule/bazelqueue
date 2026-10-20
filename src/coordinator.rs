@@ -113,11 +113,20 @@ async fn connect_peer(paths: &Paths) -> Result<(protocol::Framed<UnixStream>, u3
 }
 
 pub async fn ensure(paths: &Paths) -> Result<protocol::Framed<UnixStream>> {
-    Ok(
-        ensure_from(paths, &std::env::current_exe()?.canonicalize()?)
-            .await?
-            .0,
-    )
+    Ok(ensure_from(paths, &launcher(paths)?).await?.0)
+}
+
+/// Guardians outlive upgrades, so they start the installed coordinator rather
+/// than their own retained image.
+fn launcher(paths: &Paths) -> Result<PathBuf> {
+    #[cfg(feature = "test-fixtures")]
+    if std::env::var_os("BAZELQUEUE_FIXTURE_COORDINATOR").is_some() {
+        return Ok(std::env::current_exe()?.canonicalize()?);
+    }
+    match paths.root.join("current").canonicalize() {
+        Ok(installed) => Ok(installed),
+        Err(_) => Ok(std::env::current_exe()?.canonicalize()?),
+    }
 }
 
 async fn ensure_from(paths: &Paths, program: &Path) -> Result<(protocol::Framed<UnixStream>, u32)> {
@@ -202,9 +211,16 @@ pub struct Replaced {
     pub current: Snapshot,
 }
 
+/// What released coordinators answer to `retire` while requests execute.
+pub const BUSY_REFUSAL: &str =
+    "requests are executing; the coordinator can be replaced once they finish";
+const SUCCESSOR: &str = "BAZELQUEUE_SUCCESSOR";
+
 /// Replaces a running coordinator that is not `executable` at this version.
-/// The caller must have drained the queue; only queued requests may exist,
-/// and their guardians reconnect to the successor.
+/// A successor started from `executable` already waits on the coordinator lock
+/// when the old one exits, so guardians that relaunch their own older image
+/// find the lock taken and reconnect to the successor, which recovers queued
+/// and executing requests from the durable store.
 pub async fn hand_over(paths: &Paths, executable: &Path) -> Result<Option<Replaced>> {
     let mut previous = None;
     for _ in 0..3 {
@@ -216,41 +232,87 @@ pub async fn hand_over(paths: &Paths, executable: &Path) -> Result<Option<Replac
                 current: snapshot,
             }));
         }
-        if snapshot
-            .jobs
-            .iter()
-            .any(|job| !job.terminal() && job.state != "queued")
-        {
-            bail!(
-                "coordinator {} (bazelqueue {}) is executing requests and cannot be replaced yet",
-                snapshot.daemon.pid,
-                describe_version(&snapshot)
-            );
-        }
-        protocol::send(
-            &mut stream,
-            &Message::Control {
-                operation: "retire".into(),
-                id: None,
-            },
-        )
-        .await?;
-        let interrupt = match protocol::receive::<_, Event>(&mut stream).await {
-            Ok(Event::Error { message }) if message == "unknown control operation" => true,
-            Ok(Event::Error { message }) => bail!("{message}"),
-            Ok(_) | Err(_) => false,
+        let mut successor = successor(paths, executable).await?;
+        let outcome = match retire(&mut stream, peer, &snapshot).await {
+            Ok(interrupt) => {
+                drop(stream);
+                retired(paths, &snapshot, interrupt, &mut successor).await
+            }
+            Err(error) => Err(error),
         };
-        if interrupt && (peer != snapshot.daemon.pid || !platform::alive(&snapshot.daemon)) {
-            bail!(
-                "cannot verify that process {} is the coordinator; refusing to signal it",
-                snapshot.daemon.pid
-            );
+        if let Err(error) = outcome {
+            let _ = successor.start_kill();
+            return Err(error);
         }
-        drop(stream);
-        retired(paths, &snapshot, interrupt).await?;
         previous.get_or_insert(snapshot);
     }
     bail!("an older coordinator kept replacing the installed one")
+}
+
+async fn successor(paths: &Paths, program: &Path) -> Result<tokio::process::Child> {
+    use std::os::unix::process::CommandExt;
+    use tokio::io::AsyncBufReadExt;
+    let log = platform::private_file(&paths.root.join("daemon.log"))?;
+    let mut command = tokio::process::Command::new(program);
+    command.as_std_mut().process_group(0);
+    command
+        .args(["daemon", "run"])
+        .env("BAZELQUEUE_HOME", &paths.root)
+        .env(SUCCESSOR, "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(log);
+    let mut child = command.spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("successor stdout missing"))?;
+    let mut line = String::new();
+    let announced = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::io::BufReader::new(stdout).read_line(&mut line),
+    )
+    .await;
+    if !matches!(announced, Ok(Ok(_))) || line.trim() != "waiting" {
+        let _ = child.start_kill();
+        bail!(
+            "the installed coordinator did not start; inspect {}",
+            paths.root.join("daemon.log").display()
+        );
+    }
+    Ok(child)
+}
+
+/// Returns whether the coordinator has to be interrupted instead.
+async fn retire(
+    stream: &mut protocol::Framed<UnixStream>,
+    peer: u32,
+    snapshot: &Snapshot,
+) -> Result<bool> {
+    protocol::send(
+        stream,
+        &Message::Control {
+            operation: "retire".into(),
+            id: None,
+        },
+    )
+    .await?;
+    let interrupt = match protocol::receive::<_, Event>(stream).await {
+        Ok(Event::Error { message })
+            if message == "unknown control operation" || message == BUSY_REFUSAL =>
+        {
+            true
+        }
+        Ok(Event::Error { message }) => bail!("{message}"),
+        Ok(_) | Err(_) => false,
+    };
+    if interrupt && (peer != snapshot.daemon.pid || !platform::alive(&snapshot.daemon)) {
+        bail!(
+            "cannot verify that process {} is the coordinator; refusing to signal it",
+            snapshot.daemon.pid
+        );
+    }
+    Ok(interrupt)
 }
 
 async fn request_status(stream: &mut protocol::Framed<UnixStream>) -> Result<Snapshot> {
@@ -269,13 +331,22 @@ async fn request_status(stream: &mut protocol::Framed<UnixStream>) -> Result<Sna
     }
 }
 
-async fn retired(paths: &Paths, snapshot: &Snapshot, interrupt: bool) -> Result<()> {
+async fn retired(
+    paths: &Paths,
+    snapshot: &Snapshot,
+    interrupt: bool,
+    successor: &mut tokio::process::Child,
+) -> Result<()> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let mut signal_at = tokio::time::Instant::now();
     loop {
-        if !platform::alive(&snapshot.daemon)
-            || platform::lock(&paths.root.join("daemon.lock")).is_ok()
+        if let Ok(Ok((_, peer))) =
+            tokio::time::timeout(Duration::from_millis(500), connect_peer(paths)).await
+            && peer != snapshot.daemon.pid
         {
+            return Ok(());
+        }
+        if successor.try_wait()?.is_some() {
             return Ok(());
         }
         let now = tokio::time::Instant::now();
@@ -300,6 +371,8 @@ struct Daemon {
     executable: Option<PathBuf>,
     #[cfg(feature = "test-fixtures")]
     legacy: bool,
+    #[cfg(feature = "test-fixtures")]
+    released: bool,
 }
 
 impl Daemon {
@@ -313,6 +386,8 @@ impl Daemon {
                 .ok(),
             #[cfg(feature = "test-fixtures")]
             legacy: false,
+            #[cfg(feature = "test-fixtures")]
+            released: false,
         };
         #[cfg(feature = "test-fixtures")]
         match std::env::var("BAZELQUEUE_FIXTURE_COORDINATOR").as_deref() {
@@ -321,7 +396,10 @@ impl Daemon {
                 daemon.executable = None;
                 daemon.legacy = true;
             }
-            Ok(version) => daemon.version = version.into(),
+            Ok(version) => {
+                daemon.version = version.into();
+                daemon.released = true;
+            }
             Err(_) => {}
         }
         Ok(daemon)
@@ -332,6 +410,13 @@ impl Daemon {
             return false;
         }
         true
+    }
+    fn refuses_busy_retire(&self) -> bool {
+        #[cfg(feature = "test-fixtures")]
+        if self.released {
+            return true;
+        }
+        false
     }
     fn reload(&self, paths: &Paths) -> Result<Config> {
         #[cfg(feature = "test-fixtures")]
@@ -351,9 +436,39 @@ fn notify(reply: &mpsc::Sender<Event>, event: Event) {
     let _ = reply.try_send(event);
 }
 
+fn announce() -> Result<()> {
+    use std::io::Write;
+    let mut stdout = std::io::stdout();
+    writeln!(stdout, "waiting")?;
+    stdout.flush()?;
+    Ok(())
+}
+
+/// Waits for the coordinator being retired to release the lock. The successor
+/// is already blocked in the kernel when that happens, so it takes the lock
+/// before any process started afterwards can.
+async fn succeed(paths: &Paths) -> Result<fs::File> {
+    let path = paths.root.join("daemon.lock");
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(platform::wait_lock(&path));
+    });
+    announce()?;
+    match tokio::time::timeout(Duration::from_secs(30), receiver).await {
+        Ok(Ok(lock)) => lock,
+        _ => bail!("the coordinator being replaced did not exit"),
+    }
+}
+
 pub async fn run(paths: Paths) -> Result<()> {
+    let successor = std::env::var_os(SUCCESSOR).is_some();
     let _lock = match platform::lock(&paths.root.join("daemon.lock")) {
+        Ok(lock) if successor => {
+            announce()?;
+            lock
+        }
         Ok(lock) => lock,
+        Err(_) if successor => succeed(&paths).await?,
         Err(_) => return Ok(()),
     };
     let store = Store::open(&paths)?;
@@ -400,8 +515,8 @@ pub async fn run(paths: Paths) -> Result<()> {
                     }
                     Some(Input::Message {connection,message,reply})=> {
                         if matches!(&message, Message::Control {operation,..} if operation=="retire") && daemon.retires() {
-                            if store.jobs()?.iter().any(|job|!job.terminal() && job.state!="queued") {
-                                notify(&reply,Event::Error {message:"requests are executing; the coordinator can be replaced once they finish".into()});
+                            if daemon.refuses_busy_retire() && store.jobs()?.iter().any(|job|!job.terminal() && job.state!="queued") {
+                                notify(&reply,Event::Error {message:BUSY_REFUSAL.into()});
                                 continue;
                             }
                             notify(&reply,Event::Ack);
