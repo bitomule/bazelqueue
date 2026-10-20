@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 use crate::{
     config::Config,
-    protocol::{Budget, Job},
+    protocol::{Admission, Budget, Job, Request},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,6 +63,7 @@ pub fn raise_lone_job<'a>(
 ) -> Option<&'a mut Job> {
     let raisable = |job: &Job| {
         job.state == "queued"
+            && job.metered()
             && job.request.prepared
             && !job.request.budget.exclusive
             && job.request.command != "exec"
@@ -71,10 +72,10 @@ pub fn raise_lone_job<'a>(
         || candidates.iter().filter(|job| raisable(job)).count() != 1
         || jobs
             .iter()
-            .filter(|job| job.state == "queued" && !job.cancel)
+            .filter(|job| job.state == "queued" && !job.cancel && job.metered())
             .count()
             != 1
-        || candidates.iter().any(|job| job.holds_capacity())
+        || candidates.iter().any(|job| job.holds_build_capacity())
     {
         return None;
     }
@@ -92,8 +93,37 @@ pub struct Capacity {
 }
 
 pub fn eligible(jobs: &[Job], config: &Config, capacity: &Capacity) -> Vec<u64> {
-    if capacity.pressure == Pressure::Held || capacity.legacy_active || capacity.drained {
+    if capacity.drained {
         return Vec::new();
+    }
+    let mut chosen = Vec::new();
+    let mut maintained: Vec<&Request> = jobs
+        .iter()
+        .filter(|job| job.holds_capacity() && job.request.admission() == Admission::Maintenance)
+        .map(|job| &job.request)
+        .collect();
+    for job in jobs
+        .iter()
+        .filter(|job| job.state == "queued" && !job.cancel)
+    {
+        match job.request.admission() {
+            Admission::Immediate => chosen.push(job.sequence),
+            Admission::Maintenance
+                if !jobs
+                    .iter()
+                    .filter(|other| other.holds_build_capacity())
+                    .map(|other| &other.request)
+                    .chain(maintained.iter().copied())
+                    .any(|other| other.shares_lane(&job.request)) =>
+            {
+                maintained.push(&job.request);
+                chosen.push(job.sequence);
+            }
+            _ => {}
+        }
+    }
+    if capacity.pressure == Pressure::Held || capacity.legacy_active {
+        return chosen;
     }
     let limit = admission_budget(config, capacity.pressure);
     let max_builds = if capacity.pressure == Pressure::Constrained {
@@ -101,17 +131,19 @@ pub fn eligible(jobs: &[Job], config: &Config, capacity: &Capacity) -> Vec<u64> 
     } else {
         config.max_builds
     };
-    let mut active: Vec<&Job> = jobs.iter().filter(|job| job.holds_capacity()).collect();
+    let mut active: Vec<&Job> = jobs
+        .iter()
+        .filter(|job| job.holds_build_capacity())
+        .collect();
     let mut cpu = active.iter().map(|job| job.request.budget.cpu).sum::<u32>();
     let mut memory = active
         .iter()
         .map(|job| job.request.budget.memory_mib)
         .sum::<u64>()
         .saturating_add(capacity.run_memory_mib);
-    let mut chosen = Vec::new();
     let mut waiting: Vec<_> = jobs
         .iter()
-        .filter(|job| job.state == "queued" && !job.cancel)
+        .filter(|job| job.state == "queued" && !job.cancel && job.metered())
         .collect();
     let ready: Vec<_> = waiting
         .iter()
@@ -144,6 +176,9 @@ pub fn eligible(jobs: &[Job], config: &Config, capacity: &Capacity) -> Vec<u64> 
         if active
             .iter()
             .any(|other| other.request.lane == job.request.lane)
+            || maintained
+                .iter()
+                .any(|other| other.shares_lane(&job.request))
         {
             continue;
         }
@@ -173,6 +208,8 @@ pub fn eligible(jobs: &[Job], config: &Config, capacity: &Capacity) -> Vec<u64> 
 pub fn reason(job: &Job, jobs: &[Job], capacity: &Capacity) -> &'static str {
     if capacity.drained {
         "queue is draining"
+    } else if job.request.admission() == Admission::Maintenance {
+        "workspace is busy"
     } else if capacity.legacy_active {
         "legacy Bazel invocations are draining"
     } else if capacity.pressure == Pressure::Held {
@@ -183,7 +220,7 @@ pub fn reason(job: &Job, jobs: &[Job], capacity: &Capacity) -> &'static str {
     {
         "workspace is busy"
     } else if capacity.pressure == Pressure::Constrained
-        && jobs.iter().any(|other| other.holds_capacity())
+        && jobs.iter().any(|other| other.holds_build_capacity())
     {
         "memory pressure (warning: one reduced build at a time)"
     } else {
@@ -438,5 +475,65 @@ mod tests {
         let raised = raise_lone_job(&candidates, &mut jobs, &limit, limit.memory_mib).unwrap();
         assert_eq!(raised.request.budget.cpu, 8);
         assert_eq!(raised.request.budget.memory_mib, 2048);
+    }
+    fn command(sequence: u64, lane: &str, command: &str, state: &str) -> Job {
+        let mut job = job(sequence, lane, 1, false, state);
+        job.request.command = command.into();
+        job.request.budget = config().request_budget(job.request.admission(), false);
+        job
+    }
+    #[test]
+    fn read_only_commands_never_wait_for_build_capacity() {
+        let jobs = vec![
+            job(1, "a", 8, true, "running"),
+            job(2, "b", 8, true, "queued"),
+            command(3, "a", "info", "queued"),
+            command(4, "c", "cquery", "queued"),
+            command(5, "d", "version", "queued"),
+        ];
+        assert_eq!(eligible(&jobs, &config(), &capacity()), vec![3, 4, 5]);
+        let held = Capacity {
+            pressure: Pressure::Held,
+            ..capacity()
+        };
+        assert_eq!(eligible(&jobs, &config(), &held), vec![3, 4, 5]);
+        let drained = Capacity {
+            drained: true,
+            ..capacity()
+        };
+        assert!(eligible(&jobs, &config(), &drained).is_empty());
+    }
+    #[test]
+    fn running_read_only_commands_do_not_occupy_build_slots() {
+        let jobs = vec![
+            command(1, "a", "query", "running"),
+            command(2, "b", "info", "running"),
+            managed(3, "a"),
+            managed(4, "b"),
+        ];
+        assert_eq!(eligible(&jobs, &config(), &capacity()), vec![3, 4]);
+    }
+    #[test]
+    fn clean_waits_only_for_its_own_workspace() {
+        let mut unprepared = command(3, "a-workspace", "clean", "queued");
+        unprepared.request.workspace = "a".into();
+        unprepared.request.prepared = false;
+        let jobs = vec![
+            job(1, "a", 8, true, "running"),
+            command(2, "b", "clean", "queued"),
+            unprepared,
+            managed(4, "b"),
+            managed(5, "c"),
+        ];
+        assert!(!jobs[1].request.budget.exclusive);
+        assert_eq!(eligible(&jobs, &config(), &capacity()), vec![2]);
+        assert_eq!(reason(&jobs[2], &jobs, &capacity()), "workspace is busy");
+        let mut idle = jobs.clone();
+        idle[0].state = "finished".into();
+        assert_eq!(eligible(&idle, &config(), &capacity()), vec![2, 3, 5]);
+        let mut cleaning = idle;
+        cleaning[1].state = "running".into();
+        cleaning[2].state = "running".into();
+        assert_eq!(eligible(&cleaning, &config(), &capacity()), vec![5]);
     }
 }

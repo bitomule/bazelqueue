@@ -105,7 +105,13 @@ pub fn inspect(args: Vec<OsString>, cwd: &Path, config: &Config) -> Invocation {
         }
         offset += 1;
     }
-    let command = index.map(|index| args[index].to_string_lossy().into_owned());
+    let command = index
+        .map(|index| args[index].to_string_lossy().into_owned())
+        .or_else(|| match args.as_slice() {
+            [] => Some("help".into()),
+            [flag] if flag == "--version" => Some("version".into()),
+            _ => None,
+        });
     let startup = args[..index.unwrap_or(args.len())].to_vec();
     let version = std::env::var("USE_BAZEL_VERSION").ok().or_else(|| {
         std::fs::read_to_string(crate::config::workspace(cwd).join(".bazelversion")).ok()
@@ -310,6 +316,24 @@ mod tests {
         assert_eq!(invocation.command.as_deref(), Some("test"));
         assert_eq!(invocation.args, args);
         assert_eq!(invocation.startup.len(), 2);
+    }
+    #[test]
+    fn client_only_version_and_help_are_named() {
+        for (args, command) in [(vec![], "help"), (vec!["--version"], "version")] {
+            let invocation = inspect(
+                args.into_iter().map(OsString::from).collect(),
+                Path::new("/tmp"),
+                &Config::default(),
+            );
+            assert_eq!(invocation.command.as_deref(), Some(command));
+            assert!(!invocation.managed);
+        }
+        let unknown = inspect(
+            vec!["--unknown_startup".into(), "build".into()],
+            Path::new("/tmp"),
+            &Config::default(),
+        );
+        assert_eq!(unknown.command, None);
     }
     #[test]
     fn compatibility_arguments_are_unchanged() {

@@ -219,10 +219,11 @@ schema for agent/tool integration; no agent-specific plugin is required.
 
 | Class | Handling |
 | --- | --- |
-| help, version, completion | Bounded utility/preparation admission; do not occupy a full build reservation. They may still start a JVM. |
-| info, query, cquery, aquery, mod | Bounded analysis reservation and server lane; these are not assumed memory-free. |
-| build, test, coverage, run, fetch, sync, vendor | Full resource admission with conservative defaults. |
-| clean, shutdown | Exclusive maintenance lane for that output base; not stuck behind unrelated resource admission. |
+| help, version, canonicalize-flags, analyze-profile, dump, license | Unmetered: admitted at once, outside build capacity. They may still start a JVM. |
+| info, query, cquery, aquery | Unmetered: admitted at once, outside build capacity and memory-pressure holds; Bazel's server lock orders them within one output base. |
+| build, test, coverage, run | Full resource admission with conservative defaults. |
+| fetch, sync, vendor, mod | Exclusive compatibility admission. |
+| clean, shutdown | Unmetered maintenance: waits only for its own workspace and output base; never stuck behind unrelated resource admission. |
 | Unknown/opaque | Exclusive compatibility admission. |
 
 Use canonical workspace identity as an initial lane. After bounded admission,

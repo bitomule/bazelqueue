@@ -60,6 +60,35 @@ pub struct Request {
     pub workspace: String,
 }
 
+/// How a request is admitted. Only metered requests consume build capacity; the
+/// others are bounded by Bazel's own server lock, not by the machine-wide queue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Admission {
+    /// Read-only or utility commands: admitted at once.
+    Immediate,
+    /// Output-base maintenance: waits only for its own workspace and lane.
+    Maintenance,
+    Metered,
+}
+
+pub fn admission(command: &str) -> Admission {
+    match command {
+        "info" | "query" | "cquery" | "aquery" | "help" | "version" | "canonicalize-flags"
+        | "analyze-profile" | "dump" | "license" => Admission::Immediate,
+        "clean" | "shutdown" => Admission::Maintenance,
+        _ => Admission::Metered,
+    }
+}
+
+impl Request {
+    pub fn admission(&self) -> Admission {
+        admission(&self.command)
+    }
+    pub fn shares_lane(&self, other: &Request) -> bool {
+        self.lane == other.lane || self.workspace == other.workspace
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NativeServer {
     pub identity: Identity,
@@ -119,6 +148,12 @@ impl Job {
             self.state.as_str(),
             "preparing" | "starting" | "running" | "quarantined"
         )
+    }
+    pub fn metered(&self) -> bool {
+        self.request.admission() == Admission::Metered
+    }
+    pub fn holds_build_capacity(&self) -> bool {
+        self.holds_capacity() && self.metered()
     }
     pub fn terminal(&self) -> bool {
         matches!(self.state.as_str(), "finished" | "cancelled")

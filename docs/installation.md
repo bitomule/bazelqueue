@@ -37,7 +37,9 @@ setup retries the replacement. Preserve the backend's opt-stable absolute path.
 
 On this Mac, --migrate records existing shell shim process birth identities and
 adds the existing cache guard and bounded external-rc synchronization as optional
-local hooks. Hooks run before native server discovery under exclusive preparation.
+local hooks. Hooks run before native server discovery, one invocation at a time
+under a hook lock, inside the request's own reservation; they never reserve the
+whole machine.
 A persistent source-script watcher also catches legacy calls arriving during
 the cutover, including relative script paths. The old processes are allowed to finish; new requests wait while their ownership
 remains active. The old slot TTL is not used to grant new capacity. Original
