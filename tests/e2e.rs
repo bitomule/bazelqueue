@@ -1,10 +1,12 @@
 #![cfg(feature = "test-fixtures")]
 use bazelqueue::{
     config::{Config, Paths},
-    coordinator, platform,
+    coordinator,
+    platform::{self, Identity},
     protocol::{Event, Snapshot},
 };
 use std::{
+    cell::RefCell,
     ffi::OsString,
     fs,
     io::{Read, Write},
@@ -23,6 +25,31 @@ struct Harness {
     paths: Paths,
     daemon: Child,
     children: Vec<Child>,
+    seen: RefCell<Seen>,
+}
+/// Processes the harness launched indirectly (guardians, executors, relaunched
+/// coordinators); it must outlive them all before the state directory goes.
+#[derive(Default)]
+struct Seen {
+    guardians: Vec<Identity>,
+    groups: Vec<Identity>,
+    daemons: Vec<Identity>,
+}
+impl Seen {
+    fn record(&mut self, snapshot: &Snapshot) {
+        fn add(list: &mut Vec<Identity>, identity: &Identity) {
+            if !list.contains(identity) {
+                list.push(identity.clone());
+            }
+        }
+        add(&mut self.daemons, &snapshot.daemon);
+        for job in &snapshot.jobs {
+            add(&mut self.guardians, &job.request.owner);
+            if let Some(child) = &job.child {
+                add(&mut self.groups, child);
+            }
+        }
+    }
 }
 impl Harness {
     fn new(parallel: usize) -> Self {
@@ -69,6 +96,7 @@ impl Harness {
             paths,
             daemon,
             children: Vec::new(),
+            seen: RefCell::default(),
         };
         harness.wait(|snapshot| snapshot.daemon.pid != 0);
         harness
@@ -90,7 +118,10 @@ impl Harness {
             .await?;
             bazelqueue::protocol::receive::<_, Event>(&mut stream).await
         }) {
-            Ok(Event::Snapshot { snapshot }) => Some(snapshot),
+            Ok(Event::Snapshot { snapshot }) => {
+                self.seen.borrow_mut().record(&snapshot);
+                Some(snapshot)
+            }
             _ => None,
         }
     }
@@ -162,27 +193,63 @@ impl Harness {
         }
     }
 }
+fn settle<'a>(processes: impl IntoIterator<Item = &'a Identity>) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    for process in processes {
+        while platform::alive(process) {
+            if Instant::now() >= deadline {
+                assert!(
+                    std::thread::panicking(),
+                    "process {} outlived the harness",
+                    process.pid
+                );
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+fn stop(seen: &Seen) {
+    for group in &seen.groups {
+        if platform::alive(group) {
+            let _ = platform::signal_group(group.pid, libc::SIGKILL);
+        }
+    }
+    for guardian in &seen.guardians {
+        if platform::alive(guardian) {
+            platform::signal_pid(guardian.pid, libc::SIGKILL);
+        }
+    }
+}
 impl Drop for Harness {
     fn drop(&mut self) {
-        if let Some(snapshot) = self.snapshot() {
-            for job in snapshot.jobs {
-                if let Some(child) = job.child {
-                    let _ = platform::signal_group(child.pid, libc::SIGKILL);
-                }
-                if platform::alive(&job.request.owner) {
-                    platform::signal_pid(job.request.owner.pid, libc::SIGTERM);
-                }
+        let _ = self.snapshot();
+        stop(&self.seen.borrow());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        for child in &mut self.children {
+            if matches!(child.try_wait(), Ok(None)) {
+                platform::signal_pid(child.id(), libc::SIGTERM);
             }
         }
         for child in &mut self.children {
+            while matches!(child.try_wait(), Ok(None)) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
             let _ = child.kill();
             let _ = child.wait();
         }
+        let _ = self.snapshot();
+        let seen = self.seen.take();
+        stop(&seen);
+        settle(seen.guardians.iter().chain(&seen.groups));
         let _ = self.daemon.kill();
         let _ = self.daemon.wait();
-        if let Some(snapshot) = self.snapshot() {
-            platform::signal_pid(snapshot.daemon.pid, libc::SIGKILL);
+        for daemon in &seen.daemons {
+            if platform::alive(daemon) {
+                platform::signal_pid(daemon.pid, libc::SIGKILL);
+            }
         }
+        settle(&seen.daemons);
     }
 }
 
