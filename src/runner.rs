@@ -3,7 +3,7 @@ use crate::{
     bazel,
     config::{Config, Paths},
     coordinator, platform,
-    protocol::{self, Event, Message, NativeServer, Request},
+    protocol::{self, Admission, Budget, Event, Message, NativeServer, Request},
 };
 use anyhow::{Context, Result, bail};
 use std::{
@@ -247,31 +247,29 @@ pub async fn guardian(backend: PathBuf, args: Vec<OsString>, generic: bool) -> R
     let _lease = platform::lock(&paths.lease(&id)?)?;
     let cwd = std::env::current_dir()?.canonicalize()?;
     let mut invocation = bazel::inspect(args, &cwd, &config);
+    let command = if generic {
+        "exec".to_owned()
+    } else {
+        invocation
+            .command
+            .clone()
+            .unwrap_or_else(|| "unknown".into())
+    };
+    let immediate = protocol::admission(&command) == Admission::Immediate;
     let mut request = Request {
         id: id.clone(),
         owner,
         lane: crate::config::workspace(&cwd)
             .to_string_lossy()
             .into_owned(),
-        command: if generic {
-            "exec".into()
-        } else {
-            invocation
-                .command
-                .clone()
-                .unwrap_or_else(|| "unknown".into())
-        },
-        budget: config.budget(invocation.managed && !generic),
-        prepared: generic || invocation.command_index.is_none(),
+        command,
+        budget: initial_budget(&config, &invocation, generic),
+        prepared: generic || immediate || invocation.command_index.is_none(),
         workspace: crate::config::workspace(&cwd)
             .to_string_lossy()
             .into_owned(),
     };
-    if !config.hooks.is_empty() && !generic {
-        request.budget = config.budget(false);
-    }
     if generic {
-        request.budget = config.budget(false);
         #[cfg(feature = "test-fixtures")]
         if backend
             .file_name()
@@ -351,7 +349,7 @@ pub async fn guardian(backend: PathBuf, args: Vec<OsString>, generic: bool) -> R
                     }
                 }
                 request.prepared = true;
-                request.budget = config.budget(invocation.managed);
+                request.budget = config.request_budget(request.admission(), invocation.managed);
                 protocol::send(
                     &mut stream,
                     &Message::Prepared {
@@ -519,6 +517,62 @@ pub async fn guardian(backend: PathBuf, args: Vec<OsString>, generic: bool) -> R
     }
 }
 
+/// Hooks never widen a reservation: they run inside the request's own budget.
+pub fn initial_budget(config: &Config, invocation: &bazel::Invocation, generic: bool) -> Budget {
+    if generic {
+        return config.budget(false);
+    }
+    config.request_budget(
+        protocol::admission(invocation.command.as_deref().unwrap_or("unknown")),
+        invocation.managed,
+    )
+}
+
+/// Hooks are not written to run concurrently with each other (a bazelrc mirror
+/// sweeps its peers' staging files), so they take a host-wide hook lock. Only
+/// the hooks wait for it; the reservation stays the request's own.
+async fn hook_lock(
+    paths: &Paths,
+    request: &Request,
+    stream: &mut protocol::Framed<UnixStream>,
+    frontend: &mut UnixStream,
+) -> Result<Option<fs::File>> {
+    let path = paths.root.join("hooks.lock");
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut hangup = signal(SignalKind::hangup())?;
+    let mut eof = [0];
+    let mut announced = false;
+    loop {
+        match platform::lock(&path) {
+            Ok(file) => return Ok(Some(file)),
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock) => {}
+            Err(error) => return Err(error),
+        }
+        if !announced {
+            announced = true;
+            if std::env::var("BAZELQUEUE_PROGRESS").as_deref() != Ok("quiet") {
+                eprintln!("bazelqueue: waiting for another invocation's preflight hooks");
+            }
+        }
+        tokio::select! {
+            _=sleep(Duration::from_millis(25))=>{},
+            _=frontend.read(&mut eof)=>return Ok(None),
+            _=interrupt.recv()=>return Ok(None),
+            _=terminate.recv()=>return Ok(None),
+            _=hangup.recv()=>return Ok(None),
+            event=protocol::receive::<_,Event>(stream)=>match event {
+                Ok(Event::Cancel)=>return Ok(None),
+                Err(_)=>*stream=registration(paths, request).await?,
+                _=>{},
+            },
+        }
+    }
+}
+
 async fn run_hooks(
     config: &Config,
     paths: &Paths,
@@ -527,6 +581,12 @@ async fn run_hooks(
     frontend: &mut UnixStream,
     state: &str,
 ) -> Result<bool> {
+    if config.hooks.is_empty() {
+        return Ok(true);
+    }
+    let Some(_serial) = hook_lock(paths, request, stream, frontend).await? else {
+        return Ok(false);
+    };
     for hook in &config.hooks {
         let args = hook.arguments.iter().map(OsString::from).collect();
         let (mut child, mut permit, identity) =
@@ -600,4 +660,40 @@ async fn finish(
     )?;
     let _ = protocol::send(stream, &Message::Finish { code, stopped }).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Hook;
+    #[test]
+    fn hooks_do_not_turn_requests_into_whole_machine_reservations() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join(".bazelversion"), "8.4.2").unwrap();
+        let config = Config {
+            cpu_capacity: 8,
+            memory_capacity_mib: 8192,
+            action_memory_mib: 2048,
+            max_builds: 2,
+            hooks: vec![Hook {
+                program: "/usr/bin/true".into(),
+                arguments: Vec::new(),
+            }],
+            ..Config::default()
+        };
+        for (args, cpu) in [
+            (vec!["test", "//:x"], 4),
+            (vec!["info", "execution_root"], 1),
+            (vec!["clean", "--expunge"], 1),
+        ] {
+            let invocation = bazel::inspect(
+                args.into_iter().map(OsString::from).collect(),
+                root.path(),
+                &config,
+            );
+            let budget = initial_budget(&config, &invocation, false);
+            assert!(!budget.exclusive, "{:?}", invocation.command);
+            assert_eq!(budget.cpu, cpu, "{:?}", invocation.command);
+        }
+    }
 }

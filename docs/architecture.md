@@ -37,7 +37,13 @@ admission; healthy samples provide recovery hysteresis before full capacity. His
 
 Native info discovers actual output-base lanes before execution. Busy native
 servers yield preparation capacity rather than monopolizing the queue. Opaque
-invocations retain arguments with exclusive admission. Existing project wrappers
+invocations retain arguments with exclusive admission. Read-only and utility
+commands (info, query, cquery, aquery, help, version, canonicalize-flags,
+analyze-profile, dump, license) are unmetered and admitted at once; Bazel's own
+server lock still orders them within one output base. clean and shutdown are
+unmetered maintenance: they wait only for their own workspace and output base.
+Preflight hooks run inside the request's own reservation, one invocation at a
+time under a host-wide hook lock. Existing project wrappers
 are preserved; managed nested requests are rejected instead of deadlocking behind
 their parent.
 

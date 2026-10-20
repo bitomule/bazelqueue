@@ -1,5 +1,8 @@
 #![forbid(unsafe_code)]
-use crate::{platform, protocol::Budget};
+use crate::{
+    platform,
+    protocol::{Admission, Budget},
+};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -112,6 +115,17 @@ impl Config {
                 self.memory_capacity_mib
             },
             exclusive: !managed,
+        }
+    }
+    /// Unmetered requests carry a nominal budget: admission never sums it.
+    pub fn request_budget(&self, admission: Admission, managed: bool) -> Budget {
+        match admission {
+            Admission::Metered => self.budget(managed),
+            Admission::Immediate | Admission::Maintenance => Budget {
+                cpu: 1,
+                memory_mib: 256,
+                exclusive: false,
+            },
         }
     }
     /// One build under memory-pressure warning: a quarter of the default capacity is an

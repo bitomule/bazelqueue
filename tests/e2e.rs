@@ -913,6 +913,56 @@ fn native_distinct_workspaces_execute_in_parallel_with_bounded_shares() {
 }
 
 #[test]
+#[ignore = "requires BAZELQUEUE_TEST_BAZEL; a hooked native build beside a running one"]
+fn native_build_with_hooks_runs_beside_another_build() {
+    let mut harness = Harness::new(2);
+    native_workspace(&harness, "");
+    let mut config = Config::load(&harness.paths).unwrap();
+    config.hooks.push(bazelqueue::config::Hook {
+        program: env!("CARGO_BIN_EXE_fixture-backend").into(),
+        arguments: vec!["exit".into(), "0".into()],
+    });
+    config.save(&harness.paths).unwrap();
+    let busy = harness.spawn_hold("busy");
+    let mut held = Harness::accepted(&busy);
+    let workspace = harness.root.path().join("workspace");
+    let socket = harness.root.path().join("native.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    fs::write(
+        workspace.join("BUILD.bazel"),
+        format!(
+            "genrule(name=\"held\",outs=[\"held.txt\"],tags=[\"local\"],cmd=\"{} hold {}; echo done > $@\")\n",
+            env!("CARGO_BIN_EXE_fixture-backend"),
+            socket.display()
+        ),
+    )
+    .unwrap();
+    let mut args = native_args(&harness, "build");
+    args.push("//:held".into());
+    let child = native_command(&harness, args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    harness.children.push(child);
+    let mut build = Harness::accepted(&listener);
+    let snapshot =
+        harness.wait(|s| s.jobs.iter().filter(|job| job.state == "running").count() == 2);
+    assert!(
+        snapshot
+            .jobs
+            .iter()
+            .filter(|job| job.state == "running")
+            .all(|job| !job.request.budget.exclusive)
+    );
+    build.write_all(b"F").unwrap();
+    held.write_all(b"F").unwrap();
+    for child in &mut harness.children {
+        assert!(child.wait().unwrap().success());
+    }
+}
+
+#[test]
 fn preparing_hook_is_owned_after_guardian_loss_and_cancels_on_frontend_loss() {
     for guardian_loss in [true, false] {
         let mut harness = Harness::new(1);
@@ -1271,4 +1321,156 @@ fn interrupt_sent_to_frontend_is_forwarded_to_owned_backend() {
         harness.children[0].wait().unwrap().signal(),
         Some(libc::SIGINT)
     );
+}
+
+fn shim(harness: &Harness) -> Command {
+    let shim = harness.root.path().join("bazelisk");
+    if !shim.exists() {
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_bazelqueue"), &shim).unwrap();
+    }
+    let mut command = Command::new(shim);
+    command
+        .env("BAZELQUEUE_HOME", &harness.paths.root)
+        .env("HOME", harness.root.path())
+        .current_dir(harness.root.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    command
+}
+fn exits(child: &mut Child) -> std::process::ExitStatus {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "command kept waiting in the queue"
+        );
+        std::thread::yield_now();
+    }
+}
+fn stderr_lines(child: &mut Child) -> std::sync::mpsc::Receiver<String> {
+    use std::io::BufRead;
+    let (sender, lines) = std::sync::mpsc::channel();
+    let stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+    std::thread::spawn(move || {
+        for line in stderr.lines().map_while(Result::ok) {
+            if sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    lines
+}
+fn wait_for_line(lines: &std::sync::mpsc::Receiver<String>, text: &str) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match lines.recv_timeout(left) {
+            Ok(line) if line.contains(text) => return,
+            Ok(_) => {}
+            Err(_) => panic!("never printed {text:?}"),
+        }
+    }
+}
+
+#[test]
+fn read_only_commands_return_while_an_exclusive_job_runs() {
+    let mut harness = Harness::new(1);
+    let busy = harness.spawn_hold("busy");
+    let mut held = Harness::accepted(&busy);
+    for args in [
+        vec!["info", "execution_root"],
+        vec!["cquery", "//:x"],
+        vec!["--version"],
+    ] {
+        let mut child = shim(&harness).args(&args).spawn().unwrap();
+        assert_eq!(exits(&mut child).code(), Some(2), "{args:?}");
+    }
+    held.write_all(b"F").unwrap();
+}
+
+#[test]
+fn clean_expunge_waits_only_for_its_own_workspace() {
+    let mut harness = Harness::new(1);
+    let busy = harness.spawn_hold("busy");
+    let mut held = Harness::accepted(&busy);
+    let other = harness.root.path().join("other");
+    fs::create_dir(&other).unwrap();
+    let mut elsewhere = shim(&harness)
+        .args(["clean", "--expunge"])
+        .current_dir(&other)
+        .spawn()
+        .unwrap();
+    assert_eq!(exits(&mut elsewhere).code(), Some(2));
+    let mut same = shim(&harness)
+        .args(["clean", "--expunge"])
+        .current_dir(harness.root.path().join("busy"))
+        .spawn()
+        .unwrap();
+    let lines = stderr_lines(&mut same);
+    wait_for_line(&lines, "waiting: workspace is busy");
+    assert!(same.try_wait().unwrap().is_none());
+    held.write_all(b"F").unwrap();
+    assert_eq!(exits(&mut same).code(), Some(2));
+}
+
+#[test]
+fn preflight_hooks_run_one_at_a_time_inside_their_own_reservations() {
+    let mut harness = Harness::new(2);
+    let socket = harness.root.path().join("hook.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let mut config = Config::load(&harness.paths).unwrap();
+    config.hooks.push(bazelqueue::config::Hook {
+        program: env!("CARGO_BIN_EXE_fixture-backend").into(),
+        arguments: vec!["hold".into(), socket.to_string_lossy().into_owned()],
+    });
+    config.save(&harness.paths).unwrap();
+    let (sender, lines) = std::sync::mpsc::channel();
+    for label in ["one", "two"] {
+        let lane = harness.root.path().join(label);
+        fs::create_dir(&lane).unwrap();
+        let mut child = harness
+            .command()
+            .args([
+                "exec",
+                "--",
+                env!("CARGO_BIN_EXE_fixture-backend"),
+                "exit",
+                "0",
+            ])
+            .current_dir(lane)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let output = stderr_lines(&mut child);
+        let sender = sender.clone();
+        std::thread::spawn(move || {
+            for line in output {
+                if sender.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        harness.children.push(child);
+    }
+    let mut first = Harness::accepted(&listener);
+    wait_for_line(&lines, "waiting for another invocation's preflight hooks");
+    let snapshot = harness.snapshot().unwrap();
+    assert_eq!(
+        snapshot
+            .jobs
+            .iter()
+            .filter(|job| job.holds_capacity() && !job.request.budget.exclusive)
+            .count(),
+        2
+    );
+    first.write_all(b"F").unwrap();
+    let mut second = Harness::accepted(&listener);
+    second.write_all(b"F").unwrap();
+    for child in &mut harness.children {
+        assert!(exits(child).success());
+    }
 }

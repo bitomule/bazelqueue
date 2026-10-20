@@ -249,14 +249,17 @@ fn show(event: Event, json: bool) -> Result<()> {
             println!("legacy {} draining", owner.pid);
         }
         for job in snapshot.jobs.iter().filter(|job| !job.terminal()) {
+            let reservation = if job.metered() {
+                format!(
+                    "{} CPU {} MiB",
+                    job.request.budget.cpu, job.request.budget.memory_mib
+                )
+            } else {
+                "unmetered".to_owned()
+            };
             println!(
-                "{} {} {} {} CPU {} MiB {}",
-                job.request.id,
-                job.state,
-                job.request.command,
-                job.request.budget.cpu,
-                job.request.budget.memory_mib,
-                job.request.lane
+                "{} {} {} {} {}",
+                job.request.id, job.state, job.request.command, reservation, job.request.lane
             );
         }
     }

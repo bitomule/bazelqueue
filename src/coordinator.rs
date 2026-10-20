@@ -440,6 +440,7 @@ pub async fn run(paths: Paths) -> Result<()> {
                     continue;
                 }
                 if job.state == "queued"
+                    && job.metered()
                     && (job.request.budget.cpu > config.cpu_capacity
                         || job.request.budget.memory_mib > config.memory_capacity_mib)
                 {
@@ -447,6 +448,7 @@ pub async fn run(paths: Paths) -> Result<()> {
                     store.save(job)?;
                 }
                 if job.state == "queued"
+                    && job.metered()
                     && scheduler::fit_queued(&mut job.request.budget, &config, mode)
                 {
                     store.save(job)?;
@@ -535,9 +537,10 @@ pub async fn run(paths: Paths) -> Result<()> {
             };
             let limit = scheduler::admission_budget(&config, mode);
             let remaining_memory = limit.memory_mib.saturating_sub(capacity.run_memory_mib);
-            if remaining_memory >= 256 && !jobs.iter().any(|job| job.holds_capacity()) {
+            if remaining_memory >= 256 && !jobs.iter().any(|job| job.holds_build_capacity()) {
                 for job in jobs.iter_mut().filter(|job| {
                     job.state == "queued"
+                        && job.metered()
                         && (!job.request.prepared
                             || (!job.request.budget.exclusive && job.request.command != "exec"))
                 }) {
