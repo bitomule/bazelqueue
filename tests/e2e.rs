@@ -119,12 +119,18 @@ impl Harness {
         command
     }
     fn spawn_hold(&mut self, label: &str) -> UnixListener {
+        self.spawn_hold_as(label, None)
+    }
+    fn spawn_hold_as(&mut self, label: &str, release: Option<&str>) -> UnixListener {
         let lane = self.root.path().join(label);
         fs::create_dir_all(&lane).unwrap();
         let listener = UnixListener::bind(self.root.path().join(format!("{label}.sock"))).unwrap();
         listener.set_nonblocking(true).unwrap();
-        let child = self
-            .command()
+        let mut command = self.command();
+        if let Some(release) = release {
+            command.env("BAZELQUEUE_FIXTURE_COORDINATOR", release);
+        }
+        let child = command
             .args(["exec", "--", env!("CARGO_BIN_EXE_fixture-backend"), "hold"])
             .arg(listener.local_addr().unwrap().as_pathname().unwrap())
             .current_dir(lane)
@@ -628,6 +634,137 @@ fn upgrade_retires_a_coordinator_of_another_version() {
     let previous = harness.snapshot().unwrap();
     assert_eq!(previous.version, "0.0.1");
     assert_upgraded(harness, previous);
+}
+
+fn queued(snapshot: &Snapshot) -> usize {
+    snapshot
+        .jobs
+        .iter()
+        .filter(|job| job.state == "queued")
+        .count()
+}
+
+fn assert_not_started(listener: &UnixListener) {
+    assert!(matches!(
+        listener.accept(),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    ));
+}
+
+#[test]
+fn upgrade_hands_running_and_queued_jobs_of_released_guardians_to_the_installed_coordinator() {
+    let mut harness = Harness::with_coordinator(1, Some("0.0.1"));
+    let previous = harness.snapshot().unwrap();
+    let first = harness.spawn_hold_as("running", Some("0.0.1"));
+    let mut running = Harness::accepted(&first);
+    let second = harness.spawn_hold_as("second", Some("0.0.1"));
+    harness.wait(|s| queued(s) == 1);
+    let third = harness.spawn_hold_as("third", Some("0.0.1"));
+    let before = harness.wait(|s| queued(s) == 2);
+    let output = upgrade_setup(&harness);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains(&format!("replaced coordinator {}", previous.daemon.pid)),
+        "{stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(harness.daemon.wait().unwrap().success());
+    let installed = harness.paths.root.join("current").canonicalize().unwrap();
+    let current = harness.wait(|s| {
+        s.jobs
+            .iter()
+            .filter(|job| !job.terminal())
+            .all(|job| job.child.is_some() || job.state == "queued")
+    });
+    assert_eq!(current.version, coordinator::VERSION);
+    assert_eq!(current.executable.as_deref(), Some(installed.as_path()));
+    assert!(!current.drained);
+    let states = |snapshot: &Snapshot| {
+        snapshot
+            .jobs
+            .iter()
+            .map(|job| (job.request.id.clone(), job.state.clone()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(states(&current), states(&before));
+    let stable = |harness: &Harness| {
+        for _ in 0..20 {
+            let snapshot = harness.snapshot().expect("coordinator disappeared");
+            assert_eq!(
+                snapshot.daemon, current.daemon,
+                "another coordinator took over"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    stable(&harness);
+    assert_not_started(&first);
+    assert_not_started(&second);
+    running.write_all(b"F").unwrap();
+    let mut next = Harness::accepted(&second);
+    assert_not_started(&third);
+    next.write_all(b"F").unwrap();
+    let mut last = Harness::accepted(&third);
+    last.write_all(b"F").unwrap();
+    for child in &mut harness.children {
+        assert!(child.wait().unwrap().success());
+    }
+    stable(&harness);
+    let finished = harness.snapshot().unwrap();
+    assert_eq!(
+        finished
+            .jobs
+            .iter()
+            .filter(|job| job.state == "finished" && job.code == Some(0))
+            .count(),
+        3
+    );
+}
+
+#[test]
+fn a_guardian_relaunches_the_installed_coordinator_instead_of_its_own_image() {
+    let mut harness = Harness::new(1);
+    let installed = harness.paths.root.join("installed");
+    fs::write(
+        &installed,
+        format!(
+            "#!/bin/sh\nBAZELQUEUE_FIXTURE_COORDINATOR=9.9.9-installed exec '{}' \"$@\"\n",
+            env!("CARGO_BIN_EXE_bazelqueue")
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(
+        &installed,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(&installed, harness.paths.root.join("current")).unwrap();
+    let first = harness.spawn_hold("a");
+    let mut running = Harness::accepted(&first);
+    let second = harness.spawn_hold("b");
+    harness.wait(|s| queued(s) == 1);
+    harness.daemon.kill().unwrap();
+    harness.daemon.wait().unwrap();
+    let relaunched = harness.wait(|s| s.version == "9.9.9-installed");
+    assert_eq!(
+        relaunched
+            .jobs
+            .iter()
+            .map(|job| job.state.as_str())
+            .collect::<Vec<_>>(),
+        ["running", "queued"]
+    );
+    running.write_all(b"F").unwrap();
+    let mut next = Harness::accepted(&second);
+    next.write_all(b"F").unwrap();
+    for child in &mut harness.children {
+        assert!(child.wait().unwrap().success());
+    }
 }
 
 #[test]

@@ -119,6 +119,12 @@ pub fn lock(path: &Path) -> Result<File> {
     Ok(file)
 }
 
+pub fn wait_lock(path: &Path) -> Result<File> {
+    let file = private_file(path)?;
+    file.lock_exclusive()?;
+    Ok(file)
+}
+
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path.parent().context("missing parent directory")?;
     private_directory(parent)?;

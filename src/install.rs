@@ -378,7 +378,14 @@ async fn resume(paths: &Paths) -> Result<()> {
     }
     Ok(())
 }
-async fn transact(paths: &Paths, mut journal: Journal) -> Result<()> {
+/// Setup hands queued and executing requests to the new coordinator; uninstall
+/// still waits for an idle queue.
+#[derive(PartialEq)]
+enum Activity {
+    HandedOver,
+    Refused,
+}
+async fn transact(paths: &Paths, mut journal: Journal, activity: Activity) -> Result<()> {
     save_journal(paths, &journal)?;
     let result = async {
         checkpoint(paths, "journal")?;
@@ -388,7 +395,7 @@ async fn transact(paths: &Paths, mut journal: Journal) -> Result<()> {
         else {
             bail!("ownership verification unavailable");
         };
-        if snapshot.jobs.iter().any(|job| !job.terminal()) {
+        if activity == Activity::Refused && snapshot.jobs.iter().any(|job| !job.terminal()) {
             bail!("active requests exist; drain and wait before changing installation");
         }
         apply(&journal, true, paths, false)?;
@@ -679,6 +686,7 @@ pub async fn setup(
             committed: false,
             changes,
         },
+        Activity::HandedOver,
     )
     .await?;
     println!(
@@ -748,6 +756,7 @@ pub async fn uninstall(paths: &Paths) -> Result<()> {
             committed: false,
             changes,
         },
+        Activity::Refused,
     )
     .await?;
     println!("bazelqueue: user shims restored");

@@ -110,7 +110,7 @@ bazelqueue status --json     # Inspect it from a script or agent
 
 `brew upgrade` only replaces the Homebrew binary; the running coordinator and
 the shims keep using the previous retained executable. `bazelqueue setup` is the
-upgrade step. Run it when the queue has no active requests:
+upgrade step, and it does not wait for the queue to empty:
 
 ```sh
 brew upgrade bazelqueue
@@ -118,7 +118,10 @@ bazelqueue setup
 ```
 
 Setup activates the new executable and replaces an older coordinator with one
-started from it before resuming the queue. `bazelqueue status` and
+started from it before resuming the queue. Queued and running requests stay
+where they are: their guardians reconnect to the new coordinator, which already
+holds the coordinator lock when the old one exits, so a guardian of an older
+release cannot bring its own coordinator back. `bazelqueue status` and
 `bazelqueue doctor` warn while the running coordinator is a different version
 than the command you run.
 
