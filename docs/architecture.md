@@ -17,6 +17,16 @@ target begins as an internal executor blocked on a private permit. The guardian
 records its identity, waits for the correlated ownership ACK, then releases the
 permit. Crashing before that ACK cannot start real work.
 
+When a request ends, the guardian writes its summary before telling the
+coordinator, so a request the coordinator reports as finished always has its
+summary on disk unless the guardian died first. Managed Bazel invocations get a
+private Build Event Protocol JSON file the guardian reads for failed tests and
+targets and then deletes; abandoned event files older than a day and summaries
+beyond the newest 200 are pruned. `bazelqueue wait` reads the coordinator's
+snapshot until the request is terminal, then the saved summary; when none exists
+(the guardian died, or it was cancelled by recovery) it reports the coordinator's
+recorded exit code.
+
 The coordinator has its own process group, so suspending a foreground caller
 cannot suspend the global queue. TTY execution hands foreground ownership to
 owned child groups and restores it afterwards. Ctrl-C, Ctrl-Z/fg, stdin and isatty

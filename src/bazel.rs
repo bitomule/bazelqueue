@@ -277,6 +277,104 @@ pub fn arguments(
     args
 }
 
+/// Where Bazel's Build Event Protocol JSON file goes for a managed invocation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EventFile {
+    /// The caller already asked for one: read it, never redirect or delete it.
+    Caller(PathBuf),
+    /// bazelqueue adds its own flag and owns the file.
+    Owned,
+    /// A bazelrc may set its own file; adding ours would silently override it.
+    Unavailable,
+}
+
+pub fn event_file(invocation: &Invocation, cwd: &Path, home: Option<&Path>) -> EventFile {
+    if !invocation.managed {
+        return EventFile::Unavailable;
+    }
+    let start = invocation.command_index.map_or(0, |index| index + 1);
+    let args = &invocation.args[start..];
+    for (index, arg) in args.iter().enumerate() {
+        if arg == "--" {
+            break;
+        }
+        let text = arg.to_string_lossy();
+        let value = if text == "--build_event_json_file" {
+            args.get(index + 1).map(PathBuf::from)
+        } else {
+            text.strip_prefix("--build_event_json_file=")
+                .map(PathBuf::from)
+        };
+        if let Some(value) = value {
+            return EventFile::Caller(cwd.join(value));
+        }
+    }
+    let workspace = crate::config::workspace(cwd);
+    let mut rc_files: Vec<PathBuf> = vec!["/etc/bazel.bazelrc".into(), workspace.join(".bazelrc")];
+    if let Some(home) = home {
+        rc_files.push(home.join(".bazelrc"));
+    }
+    for (index, arg) in invocation.startup.iter().enumerate() {
+        let text = arg.to_string_lossy();
+        if let Some(value) = text.strip_prefix("--bazelrc=") {
+            rc_files.push(cwd.join(value));
+        } else if text == "--bazelrc"
+            && let Some(value) = invocation.startup.get(index + 1)
+        {
+            rc_files.push(cwd.join(value));
+        }
+    }
+    if rc_files
+        .iter()
+        .any(|file| rc_sets_event_file(file, &workspace, 0))
+    {
+        EventFile::Unavailable
+    } else {
+        EventFile::Owned
+    }
+}
+
+fn rc_sets_event_file(file: &Path, workspace: &Path, depth: usize) -> bool {
+    let Ok(text) = std::fs::read_to_string(file) else {
+        return false;
+    };
+    text.lines().any(|line| {
+        let line = line.trim();
+        if line.starts_with('#') {
+            return false;
+        }
+        if line.contains("build_event_json_file") {
+            return true;
+        }
+        let imported = line
+            .strip_prefix("try-import ")
+            .or_else(|| line.strip_prefix("import "));
+        depth < 4
+            && imported.is_some_and(|path| {
+                let path = path
+                    .trim()
+                    .trim_matches('"')
+                    .replace("%workspace%", &workspace.to_string_lossy());
+                rc_sets_event_file(
+                    &file.parent().unwrap_or(workspace).join(path),
+                    workspace,
+                    depth + 1,
+                )
+            })
+    })
+}
+
+pub fn with_event_file(mut args: Vec<OsString>, file: &Path) -> Vec<OsString> {
+    let position = args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(args.len());
+    let mut flag = OsString::from("--build_event_json_file=");
+    flag.push(file);
+    args.insert(position, flag);
+    args
+}
+
 pub fn probe_arguments(invocation: &Invocation) -> Vec<OsString> {
     let mut args = invocation.startup.clone();
     args.push("--noblock_for_lock".into());
@@ -307,6 +405,64 @@ pub fn parse_info(stdout: &[u8]) -> Option<(PathBuf, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn event_files_are_added_only_where_no_caller_or_bazelrc_chose_one() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("w");
+        let home = root.path().join("home");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(workspace.join("MODULE.bazel"), "").unwrap();
+        std::fs::write(workspace.join(".bazelversion"), "8.4.2").unwrap();
+        let config = Config::default();
+        let classify = |args: &[&str]| {
+            let invocation = inspect(
+                args.iter().map(OsString::from).collect(),
+                &workspace,
+                &config,
+            );
+            event_file(&invocation, &workspace, Some(&home))
+        };
+        assert_eq!(classify(&["test", "//:x"]), EventFile::Owned);
+        assert_eq!(classify(&["info"]), EventFile::Unavailable);
+        assert_eq!(
+            classify(&["build", "--build_event_json_file=out/bep.json", "//:x"]),
+            EventFile::Caller(workspace.join("out/bep.json"))
+        );
+        assert_eq!(
+            classify(&["build", "--build_event_json_file", "/abs.json", "//:x"]),
+            EventFile::Caller("/abs.json".into())
+        );
+        std::fs::write(
+            workspace.join(".bazelrc"),
+            "try-import %workspace%/ci.bazelrc\n",
+        )
+        .unwrap();
+        assert_eq!(classify(&["test", "//:x"]), EventFile::Owned);
+        std::fs::write(
+            workspace.join("ci.bazelrc"),
+            "build --build_event_json_file=/ci.json\n",
+        )
+        .unwrap();
+        assert_eq!(classify(&["test", "//:x"]), EventFile::Unavailable);
+        std::fs::remove_file(workspace.join("ci.bazelrc")).unwrap();
+        std::fs::write(home.join(".bazelrc"), "# build --build_event_json_file=x\n").unwrap();
+        assert_eq!(classify(&["test", "//:x"]), EventFile::Owned);
+        assert_eq!(
+            with_event_file(
+                ["run", "//:x", "--", "--flag"].map(OsString::from).to_vec(),
+                Path::new("/s/1.bep.json")
+            ),
+            [
+                "run",
+                "//:x",
+                "--build_event_json_file=/s/1.bep.json",
+                "--",
+                "--flag"
+            ]
+            .map(OsString::from)
+        );
+    }
     #[test]
     fn startup_values_cannot_be_confused_with_commands() {
         let args = ["--output_base", "build", "test", "//:x", "--", "run"]

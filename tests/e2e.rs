@@ -945,6 +945,58 @@ fn native_build_and_authenticated_idle_probe() {
 
 #[test]
 #[ignore = "requires BAZELQUEUE_TEST_BAZEL; real Bazel in an isolated workspace"]
+fn native_failed_tests_and_targets_are_summarized_with_their_logs() {
+    let harness = Harness::new(1);
+    native_workspace(
+        &harness,
+        "load(\":script_test.bzl\", \"script_test\")\nscript_test(name=\"passes\", code=0)\nscript_test(name=\"fails\", code=1)\ngenrule(name=\"broken\", outs=[\"broken.txt\"], cmd=\"exit 1\")\n",
+    );
+    fs::write(
+        harness.root.path().join("workspace/script_test.bzl"),
+        "def _impl(ctx):\n    out = ctx.actions.declare_file(ctx.label.name + \".sh\")\n    ctx.actions.write(out, \"#!/bin/sh\\necho ran\\nexit %d\\n\" % ctx.attr.code, is_executable = True)\n    return [DefaultInfo(executable = out)]\n\nscript_test = rule(_impl, test = True, attrs = {\"code\": attr.int()})\n",
+    )
+    .unwrap();
+    let mut args = native_args(&harness, "test");
+    args.extend([
+        "//:passes".into(),
+        "//:fails".into(),
+        "//:broken".into(),
+        "--keep_going".into(),
+    ]);
+    let output = native_command(&harness, args).output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    let block: Vec<_> = stderr
+        .lines()
+        .skip_while(|line| !line.starts_with("bazelqueue: finished "))
+        .collect();
+    assert!(
+        block[0].contains(" exit=1 BUILD_FAILURE ") && block[0].ends_with(" failed=2"),
+        "{stderr}"
+    );
+    let failing = block
+        .iter()
+        .find_map(|line| line.strip_prefix("bazelqueue: FAILED //:fails FAILED log="))
+        .unwrap_or_else(|| panic!("{stderr}"));
+    assert!(fs::read_to_string(failing).unwrap().contains("ran"));
+    assert!(
+        block.contains(&"bazelqueue: FAILED //:broken (build)"),
+        "{stderr}"
+    );
+    assert!(block.last().unwrap().starts_with("bazelqueue: summary "));
+    let runs = harness.paths.root.join("runs");
+    let left: Vec<_> = fs::read_dir(&runs)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert!(
+        left.iter().all(|name| !name.ends_with(".bep.json")),
+        "{left:?}"
+    );
+}
+
+#[test]
+#[ignore = "requires BAZELQUEUE_TEST_BAZEL; real Bazel in an isolated workspace"]
 fn native_run_preserves_arguments_and_target_exit_nine() {
     let mut harness = Harness::new(1);
     native_workspace(
@@ -1677,4 +1729,119 @@ fn preflight_hooks_run_one_at_a_time_inside_their_own_reservations() {
     for child in &mut harness.children {
         assert!(exits(child).success());
     }
+}
+
+#[test]
+fn an_agent_learns_a_queued_result_from_one_backgrounded_call() {
+    let mut harness = Harness::new(1);
+    let first = harness.spawn_hold("a");
+    let mut a = Harness::accepted(&first);
+    let ahead = harness.spawn_hold("c");
+    harness.wait(|s| s.jobs.iter().any(|job| job.state == "queued"));
+    let lane = harness.root.path().join("b");
+    fs::create_dir_all(&lane).unwrap();
+    let socket = harness.root.path().join("b.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let copy = harness.root.path().join("result.json");
+    let agent = harness
+        .command()
+        .args(["exec", "--", env!("CARGO_BIN_EXE_fixture-backend"), "hold"])
+        .arg(&socket)
+        .arg("3")
+        .env("BAZELQUEUE_SUMMARY", &copy)
+        .env_remove("BAZELQUEUE_PROGRESS")
+        .current_dir(&lane)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    harness.children.push(agent);
+    let lane_name = lane.canonicalize().unwrap().to_string_lossy().into_owned();
+    let snapshot = harness.wait(|s| {
+        s.jobs
+            .iter()
+            .any(|job| job.request.workspace == lane_name && job.state == "queued")
+    });
+    let id = snapshot
+        .jobs
+        .iter()
+        .find(|job| job.request.workspace == lane_name)
+        .unwrap()
+        .request
+        .id
+        .clone();
+    let waiter = |command: &mut Command| {
+        command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let by_id = waiter(harness.command().args(["wait", &id]));
+    let by_workspace = waiter(harness.command().arg("wait").current_dir(&lane));
+    harness.children.push(by_id);
+    harness.children.push(by_workspace);
+    a.write_all(b"F").unwrap();
+    let mut c = Harness::accepted(&ahead);
+    harness.wait(|s| {
+        s.jobs
+            .iter()
+            .any(|job| job.request.id == id && job.state == "queued")
+    });
+    c.write_all(b"F").unwrap();
+    let mut b = Harness::accepted(&listener);
+    for waiter in &mut harness.children[3..] {
+        assert!(
+            waiter.try_wait().unwrap().is_none(),
+            "wait returned before the run ended"
+        );
+    }
+    b.write_all(b"F").unwrap();
+    let mut outputs = Vec::new();
+    for child in &mut harness.children[2..] {
+        let status = child.wait().unwrap();
+        let mut output = String::new();
+        child
+            .stdout
+            .take()
+            .map(|mut out| out.read_to_string(&mut output).unwrap());
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut output)
+            .unwrap();
+        outputs.push((status.code(), output));
+    }
+    let (agent_code, agent_output) = &outputs[0];
+    assert_eq!(*agent_code, Some(3));
+    let lines: Vec<_> = agent_output.lines().collect();
+    assert_eq!(lines.len(), 5, "{agent_output}");
+    assert!(
+        lines[0].starts_with(&format!("bazelqueue: queued {id} at position 2 (waiting: ")),
+        "{agent_output}"
+    );
+    assert!(
+        lines[1].starts_with("bazelqueue: this call exits when the build ends"),
+        "{agent_output}"
+    );
+    assert!(lines[2].starts_with(&format!("bazelqueue: started {id} after ")));
+    assert!(
+        lines[3].starts_with(&format!("bazelqueue: finished {id} exit=3 queued="))
+            && lines[3].ends_with(" failed=unreported"),
+        "{agent_output}"
+    );
+    let summary_path = harness.paths.root.join("runs").join(format!("{id}.json"));
+    assert_eq!(
+        lines[4],
+        format!("bazelqueue: summary {}", summary_path.display())
+    );
+    for (code, output) in &outputs[1..] {
+        assert_eq!(*code, Some(3), "{output}");
+        assert_eq!(output.lines().collect::<Vec<_>>(), lines[3..], "{output}");
+    }
+    let saved: serde_json::Value = serde_json::from_slice(&fs::read(&copy).unwrap()).unwrap();
+    assert_eq!(saved["id"], id.as_str());
+    assert_eq!(saved["exit_code"], 3);
+    assert_eq!(fs::read(&copy).unwrap(), fs::read(&summary_path).unwrap());
 }

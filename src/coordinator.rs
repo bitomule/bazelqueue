@@ -798,20 +798,7 @@ fn handle(
                         message: "request has already finished".into(),
                     },
                 ),
-                "queued" => {
-                    let position = store
-                        .jobs()?
-                        .iter()
-                        .filter(|other| other.state == "queued" && other.sequence <= job.sequence)
-                        .count();
-                    notify(
-                        reply,
-                        Event::Queued {
-                            position,
-                            reason: "resource capacity".into(),
-                        },
-                    );
-                }
+                // A queued request hears its position and real reason from the next tick.
                 _ => {}
             }
         }
