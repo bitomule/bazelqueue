@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6](https://github.com/bitomule/bazelqueue/compare/v0.1.5...v0.1.6) - 2026-10-22
+
+### Added
+
+- tell agents how a queued build ended in one call ([#12](https://github.com/bitomule/bazelqueue/pull/12))
+
+### Fixed
+
+- let setup upgrade the coordinator while jobs are queued or running ([#9](https://github.com/bitomule/bazelqueue/pull/9))
+
+### Internal
+
+- el Harness de e2e espera a guardianes y coordinadores antes de borrar su carpeta ([#11](https://github.com/bitomule/bazelqueue/pull/11))
+
 ## [0.1.5](https://github.com/bitomule/bazelqueue/compare/v0.1.4...v0.1.5) - 2026-10-20
 
 ### Fixed
