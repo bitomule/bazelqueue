@@ -66,6 +66,7 @@ An illustrative call from an agent while another workspace occupies the budget:
 ```text
 $ bazelisk test //app:all 2> build.log
 bazelqueue: queued 4242-1792672532967253000 at position 2 (waiting: resource capacity)
+bazelqueue: this call exits when the build ends and then prints a `bazelqueue: finished` summary with each failure and its log; wait for it instead of polling status, pgrep or the log
 bazelqueue: started 4242-1792672532967253000 after 3m12s in queue
 INFO: …Bazel's own output…
 bazelqueue: finished 4242-1792672532967253000 exit=3 TESTS_FAILED queued=3m12s ran=1m05s failed=1
@@ -95,7 +96,10 @@ verifies idleness. [Architecture and recovery](docs/architecture.md).
 
 Waiting builds and long logs are what make an agent expensive: every poll, `tail`
 or `grep` re-reads the whole conversation. bazelqueue is built so one call is
-enough to learn the result:
+enough to learn the result, and it tells the agent so itself: when stderr is not
+a terminal, the first notice of a build is followed by one line saying the call
+exits when the build ends and prints a summary. No project instructions are
+needed for an agent to read it at the moment it would start polling.
 
 - **Run Bazel in the background and wait for the process to exit.** Do not poll
   `bazelqueue status`, `pgrep` or the log in a loop. While queued, a call prints
@@ -117,7 +121,7 @@ Where it cannot (unsupported Bazel versions, `tools/bazel` wrappers, a bazelrc
 that sets its own `--build_event_json_file`), the summary still has the exit
 code and timings and says `failed=unreported`.
 
-A block you can paste into a project's `AGENTS.md` or `CLAUDE.md`:
+If you also want it in a project's `AGENTS.md` or `CLAUDE.md`:
 
 ```markdown
 Bazel calls go through bazelqueue and may wait in a queue. Run them in the
@@ -261,7 +265,6 @@ reproduced the blocked client, and the consumed-output version passed.
 | [Architecture](docs/architecture.md) | Reservations, ownership, server lanes and recovery. |
 | [Validation](docs/validation.md) | Fault tests and measured performance. |
 | [Releases](docs/release.md) | Immutable artifacts, Homebrew and Actions credentials. |
-| [Design plan](PLAN.md) | The original contract and implementation decisions. |
 
 <details>
 <summary>Development commands</summary>

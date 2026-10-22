@@ -96,16 +96,23 @@ struct Notices {
     id: String,
     quiet: bool,
     verbose: bool,
+    hint: bool,
     queued: Option<Instant>,
 }
 
+/// Agents read this line in their captured output at the moment they would
+/// otherwise start polling, whatever repository they work in.
+const HINT: &str = "bazelqueue: this call exits when the build ends and then prints a `bazelqueue: finished` summary with each failure and its log; wait for it instead of polling status, pgrep or the log";
+
 impl Notices {
-    fn new(id: &str) -> Self {
+    fn new(id: &str, reported: bool) -> Self {
         let mode = std::env::var("BAZELQUEUE_PROGRESS").unwrap_or_default();
+        let verbose = mode == "verbose" || std::io::stderr().is_terminal();
         Self {
             id: id.to_owned(),
             quiet: mode == "quiet",
-            verbose: mode == "verbose" || std::io::stderr().is_terminal(),
+            verbose,
+            hint: reported && !verbose,
             queued: None,
         }
     }
@@ -134,7 +141,11 @@ impl Notices {
             }),
             _ => None,
         };
-        line.filter(|_| !self.quiet).into_iter().collect()
+        let mut lines: Vec<_> = line.filter(|_| !self.quiet).into_iter().collect();
+        if !lines.is_empty() && std::mem::take(&mut self.hint) {
+            lines.push(HINT.to_owned());
+        }
+        lines
     }
     fn show(&mut self, event: &Event) {
         for line in self.lines(event, Instant::now()) {
@@ -384,7 +395,7 @@ pub async fn guardian(backend: PathBuf, args: Vec<OsString>, generic: bool) -> R
         events: None,
         report: !immediate,
     };
-    let mut notices = Notices::new(&id);
+    let mut notices = Notices::new(&id, ledger.report);
     let mut stream = registration(&paths, &request).await?;
     let mut server = None;
     let mut hooks_ran = false;
@@ -873,6 +884,7 @@ mod tests {
             id: "7-1".into(),
             quiet: false,
             verbose: false,
+            hint: true,
             queued: None,
         };
         let mut printed = Vec::new();
@@ -886,6 +898,7 @@ mod tests {
             printed,
             [
                 "bazelqueue: queued 7-1 at position 3 (waiting: resource capacity)",
+                HINT,
                 "bazelqueue: started 7-1 after 3m12s in queue",
             ]
         );
@@ -912,6 +925,16 @@ mod tests {
             ..quiet
         };
         assert_eq!(immediate.lines(&grant, start), ["bazelqueue: started 7-1"]);
+        let mut unqueued_agent = Notices {
+            verbose: false,
+            hint: true,
+            queued: None,
+            ..immediate
+        };
+        assert_eq!(
+            unqueued_agent.lines(&grant, start),
+            ["bazelqueue: started 7-1", HINT]
+        );
     }
     #[test]
     fn hooks_do_not_turn_requests_into_whole_machine_reservations() {

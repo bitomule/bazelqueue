@@ -1816,25 +1816,29 @@ fn an_agent_learns_a_queued_result_from_one_backgrounded_call() {
     let (agent_code, agent_output) = &outputs[0];
     assert_eq!(*agent_code, Some(3));
     let lines: Vec<_> = agent_output.lines().collect();
-    assert_eq!(lines.len(), 4, "{agent_output}");
+    assert_eq!(lines.len(), 5, "{agent_output}");
     assert!(
         lines[0].starts_with(&format!("bazelqueue: queued {id} at position 2 (waiting: ")),
         "{agent_output}"
     );
-    assert!(lines[1].starts_with(&format!("bazelqueue: started {id} after ")));
     assert!(
-        lines[2].starts_with(&format!("bazelqueue: finished {id} exit=3 queued="))
-            && lines[2].ends_with(" failed=unreported"),
+        lines[1].starts_with("bazelqueue: this call exits when the build ends"),
+        "{agent_output}"
+    );
+    assert!(lines[2].starts_with(&format!("bazelqueue: started {id} after ")));
+    assert!(
+        lines[3].starts_with(&format!("bazelqueue: finished {id} exit=3 queued="))
+            && lines[3].ends_with(" failed=unreported"),
         "{agent_output}"
     );
     let summary_path = harness.paths.root.join("runs").join(format!("{id}.json"));
     assert_eq!(
-        lines[3],
+        lines[4],
         format!("bazelqueue: summary {}", summary_path.display())
     );
     for (code, output) in &outputs[1..] {
         assert_eq!(*code, Some(3), "{output}");
-        assert_eq!(output.lines().collect::<Vec<_>>(), lines[2..], "{output}");
+        assert_eq!(output.lines().collect::<Vec<_>>(), lines[3..], "{output}");
     }
     let saved: serde_json::Value = serde_json::from_slice(&fs::read(&copy).unwrap()).unwrap();
     assert_eq!(saved["id"], id.as_str());

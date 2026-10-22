@@ -2,12 +2,10 @@
 
 - This is an independent Rust CLI repository. Alondra's product, deployment,
   release, and Bazel-only test rules do not apply here.
-- Read `PLAN.md` before implementation. It is the product and architecture
-  contract; update it when an implementation decision changes that contract.
+- `README.md` and `docs/` are the product and architecture contract; update
+  them in the same change when behavior changes.
 - The repository contains the implementation. Keep behavior and support claims
   aligned with executed native, terminal, installation and packaging evidence.
-- Implement the milestones in order. Compatibility and recovery prototypes are
-  release gates, not optional research after shipping.
 - Use Rust and native APIs for runtime behavior. Shell/Ruby/YAML glue is allowed
   only where external packaging or Bazel-generated run scripts require it.
 - Keep the scheduler deterministic and independent of the OS, database, and
@@ -30,10 +28,6 @@
   commit its evidence ledger. Validate packaging changes separately.
 - Use Conventional Commit PR titles for release-plz. Never move published tags
   or replace already published release bytes.
-- Do not activate the new shims or retire existing cache/queue scripts until the
-  migration milestone is authorized and its acceptance checks have passed.
-- Running Bazel through bazelqueue (here or in any repo): run the call in the
-  background and wait for it to exit, then read only the `bazelqueue: finished`
-  and `bazelqueue: FAILED` lines. Do not poll `bazelqueue status`, `pgrep` or
-  logs; use `bazelqueue wait [ID]` if you lost the process. Keep the README's
-  "Using it from an agent" section accurate when the summary format changes.
+- Agents learn how to wait from bazelqueue's own output (the hint on the first
+  notice and the `bazelqueue: finished` summary). Keep those lines, the README's
+  "Using it from an agent" section and their tests in step.
