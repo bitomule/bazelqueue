@@ -21,7 +21,7 @@ Its exit code or signal goes back to the caller.
 One Rust executable, approximately **5 MiB**, with SQLite linked in. End users
 need Bazel/Bazelisk; Rust and Python are development dependencies.
 
-[Install](#install) · [Queue controls](#queue-controls) · [Configure](#configure) · [Compatibility](#compatibility) · [Documentation](#documentation)
+[Install](#install) · [Agents](#using-it-from-an-agent) · [Queue controls](#queue-controls) · [Configure](#configure) · [Compatibility](#compatibility) · [Documentation](#documentation)
 
 ## Install
 
@@ -61,18 +61,21 @@ Use an absolute backend path that does not resolve back to a queue shim.
 
 ## What waiting looks like
 
-An illustrative call while another workspace occupies the available budget:
+An illustrative call from an agent while another workspace occupies the budget:
 
 ```text
-$ bazelisk build //app:cli
-bazelqueue: position 2; waiting: resource capacity
-bazelqueue: position 1; waiting: workspace is busy
-bazelqueue: admitted; starting command
-INFO: Build completed successfully
+$ bazelisk test //app:all 2> build.log
+bazelqueue: queued 4242-1792672532967253000 at position 2 (waiting: resource capacity)
+bazelqueue: started 4242-1792672532967253000 after 3m12s in queue
+INFO: …Bazel's own output…
+bazelqueue: finished 4242-1792672532967253000 exit=3 TESTS_FAILED queued=3m12s ran=1m05s failed=1
+bazelqueue: FAILED //app:unit_tests FAILED log=/…/testlogs/app/unit_tests/test.log
+bazelqueue: summary ~/.local/state/bazelqueue/runs/4242-1792672532967253000.json
 ```
 
-Queue notices go to **stderr**, so stdout remains available for scripts and pipes.
-The calling agent stays attached to the command while it waits.
+Queue notices and the summary go to **stderr**, so stdout remains available for
+scripts and pipes. The calling agent stays attached to the command while it
+waits. In a terminal, every position change is shown as it happens.
 
 ![Queue flow: callers wait for CPU and memory capacity, then real Bazel runs and returns its original result.](docs/assets/queue-flow.svg)
 
@@ -88,6 +91,44 @@ Running builds never lose their reservation because a timer expired. Uncertain
 native work stays quarantined until an authenticated, nonblocking server probe
 verifies idleness. [Architecture and recovery](docs/architecture.md).
 
+## Using it from an agent
+
+Waiting builds and long logs are what make an agent expensive: every poll, `tail`
+or `grep` re-reads the whole conversation. bazelqueue is built so one call is
+enough to learn the result:
+
+- **Run Bazel in the background and wait for the process to exit.** Do not poll
+  `bazelqueue status`, `pgrep` or the log in a loop. While queued, a call prints
+  one line with its request ID; it prints nothing more until the build starts.
+- **Read only the summary.** The last lines of every build start with
+  `bazelqueue: finished` and `bazelqueue: FAILED`: exit code, queue wait, run
+  time, and each failed test or target with its `test.log` path. Open a test log
+  only for a failure you need to fix; do not read the whole build output.
+- **Lost track of a build?** `bazelqueue wait` blocks until the newest build of
+  the current workspace ends, prints the same summary and exits with its exit
+  code. `bazelqueue wait ID` waits for a specific request; `--json` prints the
+  summary as JSON.
+- **Want a file?** Set `BAZELQUEUE_SUMMARY=/path/result.json` for a JSON copy of
+  the summary, or read `~/.local/state/bazelqueue/runs/ID.json`.
+
+Failed targets and test logs come from Bazel's Build Event Protocol, which
+bazelqueue requests for managed `build`, `test`, `run` and `coverage` calls.
+Where it cannot (unsupported Bazel versions, `tools/bazel` wrappers, a bazelrc
+that sets its own `--build_event_json_file`), the summary still has the exit
+code and timings and says `failed=unreported`.
+
+A block you can paste into a project's `AGENTS.md` or `CLAUDE.md`:
+
+```markdown
+Bazel calls go through bazelqueue and may wait in a queue. Run them in the
+background and wait for the process to exit; never poll `bazelqueue status`,
+`pgrep` or the log. When it ends, read only the lines starting with
+`bazelqueue: finished` / `bazelqueue: FAILED` (for example `grep '^bazelqueue:'
+build.log`) and open a listed test log only for a failure you are fixing. If you
+lost the process, `bazelqueue wait` blocks until the workspace's newest build
+ends and exits with its status.
+```
+
 ## Queue controls
 
 ```sh
@@ -98,6 +139,7 @@ bazelqueue status --json     # Inspect it from a script or agent
 | Command | Purpose |
 |---|---|
 | `bazelqueue status` | Show current requests and waiting reasons. |
+| `bazelqueue wait [REQUEST_ID]` | Block until a request ends; print its summary and exit with its status. |
 | `bazelqueue cancel REQUEST_ID` | Cancel a queued or owned running request. |
 | `bazelqueue drain` | Pause new admissions while current work finishes. |
 | `bazelqueue resume` | Reopen admission. |
@@ -174,7 +216,9 @@ before increasing concurrency.
 | Environment variable | Use |
 |---|---|
 | `BAZELQUEUE_HOME` | Select an isolated state namespace. |
-| `BAZELQUEUE_PROGRESS=quiet` | Suppress queue notices. |
+| `BAZELQUEUE_PROGRESS=quiet` | Suppress queue notices (the end-of-run summary stays). |
+| `BAZELQUEUE_PROGRESS=verbose` | Print every position change even when stderr is not a terminal. |
+| `BAZELQUEUE_SUMMARY` | Also write the end-of-run summary JSON to this path. |
 
 ## Compatibility
 

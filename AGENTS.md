@@ -32,3 +32,8 @@
   or replace already published release bytes.
 - Do not activate the new shims or retire existing cache/queue scripts until the
   migration milestone is authorized and its acceptance checks have passed.
+- Running Bazel through bazelqueue (here or in any repo): run the call in the
+  background and wait for it to exit, then read only the `bazelqueue: finished`
+  and `bazelqueue: FAILED` lines. Do not poll `bazelqueue status`, `pgrep` or
+  logs; use `bazelqueue wait [ID]` if you lost the process. Keep the README's
+  "Using it from an agent" section accurate when the summary format changes.

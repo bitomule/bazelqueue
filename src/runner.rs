@@ -4,18 +4,20 @@ use crate::{
     config::{Config, Paths},
     coordinator, platform,
     protocol::{self, Admission, Budget, Event, Message, NativeServer, Request},
+    summary,
 };
 use anyhow::{Context, Result, bail};
 use std::{
     ffi::OsString,
     fs,
+    io::IsTerminal,
     os::{
         fd::AsRawFd,
         unix::process::{CommandExt, ExitStatusExt},
     },
     path::PathBuf,
     process::{ExitStatus, Stdio},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -80,16 +82,104 @@ async fn registration(paths: &Paths, request: &Request) -> Result<protocol::Fram
     Ok(stream)
 }
 
-fn progress(event: &Event) {
-    if std::env::var("BAZELQUEUE_PROGRESS").as_deref() == Ok("quiet") {
-        return;
-    }
-    match event {
-        Event::Queued { position, reason } => {
-            eprintln!("bazelqueue: position {position}; waiting: {reason}")
+/// Notices must never abort a guardian whose caller closed its stderr.
+macro_rules! report {
+    ($($argument:tt)*) => {{
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), $($argument)*);
+    }};
+}
+
+/// Queue notices for one request. Off a terminal (agents, redirected logs) the
+/// caller sees the first queue position and the start, not every change.
+struct Notices {
+    id: String,
+    quiet: bool,
+    verbose: bool,
+    queued: Option<Instant>,
+}
+
+impl Notices {
+    fn new(id: &str) -> Self {
+        let mode = std::env::var("BAZELQUEUE_PROGRESS").unwrap_or_default();
+        Self {
+            id: id.to_owned(),
+            quiet: mode == "quiet",
+            verbose: mode == "verbose" || std::io::stderr().is_terminal(),
+            queued: None,
         }
-        Event::Grant { .. } => eprintln!("bazelqueue: admitted; starting command"),
-        _ => {}
+    }
+    fn lines(&mut self, event: &Event, now: Instant) -> Vec<String> {
+        let line = match event {
+            Event::Queued { position, reason } => match self.queued {
+                None => {
+                    self.queued = Some(now);
+                    Some(format!(
+                        "bazelqueue: queued {} at position {position} (waiting: {reason})",
+                        self.id
+                    ))
+                }
+                Some(_) if self.verbose => Some(format!(
+                    "bazelqueue: position {position}; waiting: {reason}"
+                )),
+                Some(_) => None,
+            },
+            Event::Grant { .. } => Some(match self.queued {
+                Some(since) => format!(
+                    "bazelqueue: started {} after {} in queue",
+                    self.id,
+                    summary::duration(now.duration_since(since).as_millis() as u64)
+                ),
+                None => format!("bazelqueue: started {}", self.id),
+            }),
+            _ => None,
+        };
+        line.filter(|_| !self.quiet).into_iter().collect()
+    }
+    fn show(&mut self, event: &Event) {
+        for line in self.lines(event, Instant::now()) {
+            report!("{line}");
+        }
+    }
+}
+
+/// What the end-of-run summary needs to know about a request.
+struct Ledger {
+    id: String,
+    command: String,
+    workspace: String,
+    registered: Instant,
+    granted: Option<Instant>,
+    events: Option<(PathBuf, bool)>,
+    report: bool,
+}
+
+impl Ledger {
+    fn summary(&self, code: i32, now: Instant) -> summary::Summary {
+        let parsed = self.events.as_ref().and_then(|(path, owned)| {
+            let text = fs::read_to_string(path).ok();
+            if *owned {
+                let _ = fs::remove_file(path);
+            }
+            text.map(|text| summary::parse_events(&text))
+        });
+        summary::Summary {
+            id: self.id.clone(),
+            command: self.command.clone(),
+            workspace: self.workspace.clone(),
+            exit_code: code,
+            targets_reported: parsed.is_some(),
+            exit_name: parsed.as_ref().and_then(|events| events.exit_name.clone()),
+            failures: parsed.map(|events| events.failures).unwrap_or_default(),
+            queued_ms: self
+                .granted
+                .unwrap_or(now)
+                .duration_since(self.registered)
+                .as_millis() as u64,
+            ran_ms: self
+                .granted
+                .map_or(0, |granted| now.duration_since(granted).as_millis() as u64),
+        }
     }
 }
 
@@ -285,16 +375,26 @@ pub async fn guardian(backend: PathBuf, args: Vec<OsString>, generic: bool) -> R
     let mut hangup = signal(SignalKind::hangup())?;
     let mut child_changes = signal(SignalKind::from_raw(libc::SIGCHLD))?;
     let mut continuation = signal(SignalKind::from_raw(libc::SIGCONT))?;
+    let mut ledger = Ledger {
+        id: id.clone(),
+        command: request.command.clone(),
+        workspace: request.workspace.clone(),
+        registered: Instant::now(),
+        granted: None,
+        events: None,
+        report: !immediate,
+    };
+    let mut notices = Notices::new(&id);
     let mut stream = registration(&paths, &request).await?;
     let mut server = None;
     let mut hooks_ran = false;
     loop {
         let event = tokio::select! {
             event=protocol::receive::<_,Event>(&mut stream)=>event,
-            _=frontend.read(&mut eof)=>{finish(&paths,&id,130,true,&mut stream).await?;return Ok(ExitStatus::from_raw(libc::SIGINT));},
-            _=interrupt.recv()=>{finish(&paths,&id,130,true,&mut stream).await?;return Ok(ExitStatus::from_raw(libc::SIGINT));},
-            _=terminate.recv()=>{finish(&paths,&id,143,true,&mut stream).await?;return Ok(ExitStatus::from_raw(libc::SIGTERM));},
-            _=hangup.recv()=>{finish(&paths,&id,129,true,&mut stream).await?;return Ok(ExitStatus::from_raw(libc::SIGHUP));},
+            _=frontend.read(&mut eof)=>{finish(&paths,&ledger,130,true,&mut stream).await?;return Ok(ExitStatus::from_raw(libc::SIGINT));},
+            _=interrupt.recv()=>{finish(&paths,&ledger,130,true,&mut stream).await?;return Ok(ExitStatus::from_raw(libc::SIGINT));},
+            _=terminate.recv()=>{finish(&paths,&ledger,143,true,&mut stream).await?;return Ok(ExitStatus::from_raw(libc::SIGTERM));},
+            _=hangup.recv()=>{finish(&paths,&ledger,129,true,&mut stream).await?;return Ok(ExitStatus::from_raw(libc::SIGHUP));},
         };
         let event = match event {
             Ok(event) => event,
@@ -304,7 +404,7 @@ pub async fn guardian(backend: PathBuf, args: Vec<OsString>, generic: bool) -> R
                 continue;
             }
         };
-        progress(&event);
+        notices.show(&event);
         match event {
             Event::Prepare => {
                 if !run_hooks(
@@ -317,7 +417,7 @@ pub async fn guardian(backend: PathBuf, args: Vec<OsString>, generic: bool) -> R
                 )
                 .await?
                 {
-                    finish(&paths, &id, 130, true, &mut stream).await?;
+                    finish(&paths, &ledger, 130, true, &mut stream).await?;
                     return Ok(ExitStatus::from_raw(libc::SIGINT));
                 }
                 hooks_ran = true;
@@ -326,7 +426,7 @@ pub async fn guardian(backend: PathBuf, args: Vec<OsString>, generic: bool) -> R
                     {
                         Ok(Preparation::Ready(server)) => server,
                         Ok(Preparation::Cancelled) => {
-                            finish(&paths, &id, 130, true, &mut stream).await?;
+                            finish(&paths, &ledger, 130, true, &mut stream).await?;
                             return Ok(ExitStatus::from_raw(libc::SIGINT));
                         }
                         Ok(Preparation::Busy) => {
@@ -362,10 +462,11 @@ pub async fn guardian(backend: PathBuf, args: Vec<OsString>, generic: bool) -> R
             }
             Event::Grant { budget } => {
                 request.budget = budget;
+                ledger.granted = Some(Instant::now());
                 break;
             }
             Event::Cancel => {
-                finish(&paths, &id, 130, true, &mut stream).await?;
+                finish(&paths, &ledger, 130, true, &mut stream).await?;
                 return Ok(ExitStatus::from_raw(libc::SIGINT));
             }
             Event::Error { message } => bail!("{message}"),
@@ -383,7 +484,7 @@ pub async fn guardian(backend: PathBuf, args: Vec<OsString>, generic: bool) -> R
         )
         .await?
     {
-        finish(&paths, &id, 130, true, &mut stream).await?;
+        finish(&paths, &ledger, 130, true, &mut stream).await?;
         return Ok(ExitStatus::from_raw(libc::SIGINT));
     }
     let run_directory = paths.root.join(format!("run-{id}"));
@@ -391,22 +492,41 @@ pub async fn guardian(backend: PathBuf, args: Vec<OsString>, generic: bool) -> R
         platform::private_directory(&run_directory)?;
     }
     let script = run_directory.join("execute");
+    if !generic {
+        ledger.events = match bazel::event_file(
+            &invocation,
+            &cwd,
+            std::env::var_os("HOME")
+                .as_deref()
+                .map(std::path::Path::new),
+        ) {
+            bazel::EventFile::Owned => summary::events_location(&paths, &id)
+                .ok()
+                .map(|path| (path, true)),
+            bazel::EventFile::Caller(path) => Some((path, false)),
+            bazel::EventFile::Unavailable => None,
+        };
+    }
     let backend_args = if generic {
         invocation.args.clone()
     } else {
-        bazel::arguments(
+        let arguments = bazel::arguments(
             &invocation,
             &request.budget,
             &config,
             invocation.run.then_some(script.as_path()),
-        )
+        );
+        match &ledger.events {
+            Some((path, true)) => bazel::with_event_file(arguments, path),
+            _ => arguments,
+        }
     };
     let (mut child, mut permit, child_identity) =
         owned_executor(&backend, backend_args, false, Some(&id)).await?;
     if !authorize(&paths, &request, &mut stream, &child_identity, "running").await? {
         drop(permit);
         child.wait().await?;
-        finish(&paths, &id, 130, true, &mut stream).await?;
+        finish(&paths, &ledger, 130, true, &mut stream).await?;
         return Ok(ExitStatus::from_raw(libc::SIGINT));
     }
     let terminal = platform::Terminal::handoff(child_identity.pid)?;
@@ -466,7 +586,7 @@ pub async fn guardian(backend: PathBuf, args: Vec<OsString>, generic: bool) -> R
         if !authorize(&paths, &request, &mut stream, &target_identity, "run_phase").await? {
             drop(permit);
             target.wait().await?;
-            finish(&paths, &id, 130, true, &mut stream).await?;
+            finish(&paths, &ledger, 130, true, &mut stream).await?;
             return Ok(ExitStatus::from_raw(libc::SIGINT));
         }
         let terminal = platform::Terminal::handoff(target_identity.pid)?;
@@ -491,7 +611,7 @@ pub async fn guardian(backend: PathBuf, args: Vec<OsString>, generic: bool) -> R
         let _ = fs::remove_dir_all(run_directory);
         finish(
             &paths,
-            &id,
+            &ledger,
             target_status
                 .code()
                 .unwrap_or(128 + target_status.signal().unwrap_or(1)),
@@ -503,7 +623,7 @@ pub async fn guardian(backend: PathBuf, args: Vec<OsString>, generic: bool) -> R
     }
     finish(
         &paths,
-        &id,
+        &ledger,
         status.code().unwrap_or(128 + status.signal().unwrap_or(1)),
         stopped,
         &mut stream,
@@ -514,6 +634,65 @@ pub async fn guardian(backend: PathBuf, args: Vec<OsString>, generic: bool) -> R
         Ok(ExitStatus::from_raw(cancellation_signal))
     } else {
         Ok(status)
+    }
+}
+
+/// Blocks until a request ends and returns its summary. Without an id it follows
+/// the newest build of the caller's workspace, preferring one still in progress.
+pub async fn wait(
+    paths: &Paths,
+    id: Option<String>,
+    cwd: &std::path::Path,
+) -> Result<summary::Summary> {
+    let mut target = id;
+    loop {
+        let Event::Snapshot { snapshot } = coordinator::control(paths, "status", None).await?
+        else {
+            bail!("coordinator returned no snapshot");
+        };
+        let id = match &target {
+            Some(id) => id.clone(),
+            None => {
+                let workspace = crate::config::workspace(&cwd.canonicalize()?)
+                    .to_string_lossy()
+                    .into_owned();
+                let mine: Vec<_> = snapshot
+                    .jobs
+                    .iter()
+                    .filter(|job| {
+                        job.request.workspace == workspace
+                            && job.request.admission() != Admission::Immediate
+                    })
+                    .collect();
+                let job = mine
+                    .iter()
+                    .filter(|job| !job.terminal())
+                    .max_by_key(|job| job.sequence)
+                    .or_else(|| mine.iter().max_by_key(|job| job.sequence))
+                    .with_context(|| format!("no request from {workspace} in the queue"))?;
+                target = Some(job.request.id.clone());
+                job.request.id.clone()
+            }
+        };
+        let job = snapshot.jobs.iter().find(|job| job.request.id == id);
+        if job.is_none_or(|job| job.terminal()) {
+            if let Some(summary) = summary::load(paths, &id)? {
+                return Ok(summary);
+            }
+            let job = job.with_context(|| format!("unknown request {id}"))?;
+            return Ok(summary::Summary {
+                id,
+                command: job.request.command.clone(),
+                workspace: job.request.workspace.clone(),
+                exit_code: job.code.unwrap_or(130),
+                exit_name: (job.state == "cancelled").then(|| "CANCELLED".into()),
+                queued_ms: 0,
+                ran_ms: 0,
+                targets_reported: false,
+                failures: Vec::new(),
+            });
+        }
+        sleep(Duration::from_secs(1)).await;
     }
 }
 
@@ -649,13 +828,27 @@ async fn run_hooks(
 
 async fn finish(
     paths: &Paths,
-    id: &str,
+    ledger: &Ledger,
     code: i32,
     stopped: bool,
     stream: &mut protocol::Framed<UnixStream>,
 ) -> Result<()> {
+    let summary = ledger.summary(code, Instant::now());
+    let location = summary::save(paths, &summary)
+        .inspect_err(|error| report!("bazelqueue: summary not saved: {error:#}"))
+        .ok();
+    if let Some(destination) = std::env::var_os("BAZELQUEUE_SUMMARY")
+        && let Err(error) = summary::copy_to(std::path::Path::new(&destination), &summary)
+    {
+        report!("bazelqueue: summary copy not written: {error:#}");
+    }
+    if ledger.report {
+        for line in summary.lines(location.as_deref()) {
+            report!("{line}");
+        }
+    }
     platform::atomic_write(
-        &paths.root.join(format!("receipt-{id}")),
+        &paths.root.join(format!("receipt-{}", ledger.id)),
         &serde_json::to_vec(&(code, stopped))?,
     )?;
     let _ = protocol::send(stream, &Message::Finish { code, stopped }).await;
@@ -666,6 +859,60 @@ async fn finish(
 mod tests {
     use super::*;
     use crate::config::Hook;
+    #[test]
+    fn off_a_terminal_a_queued_request_prints_its_first_position_and_its_start_only() {
+        let queued = |position| Event::Queued {
+            position,
+            reason: "resource capacity".into(),
+        };
+        let grant = Event::Grant {
+            budget: Config::default().budget(true),
+        };
+        let start = Instant::now();
+        let mut agent = Notices {
+            id: "7-1".into(),
+            quiet: false,
+            verbose: false,
+            queued: None,
+        };
+        let mut printed = Vec::new();
+        for (offset, event) in [queued(3), queued(2), queued(1), grant.clone()]
+            .iter()
+            .enumerate()
+        {
+            printed.extend(agent.lines(event, start + Duration::from_secs(64 * offset as u64)));
+        }
+        assert_eq!(
+            printed,
+            [
+                "bazelqueue: queued 7-1 at position 3 (waiting: resource capacity)",
+                "bazelqueue: started 7-1 after 3m12s in queue",
+            ]
+        );
+        let mut terminal = Notices {
+            verbose: true,
+            queued: None,
+            ..agent
+        };
+        assert_eq!(terminal.lines(&queued(2), start).len(), 1);
+        assert_eq!(
+            terminal.lines(&queued(1), start),
+            ["bazelqueue: position 1; waiting: resource capacity"]
+        );
+        let mut quiet = Notices {
+            quiet: true,
+            queued: None,
+            ..terminal
+        };
+        assert!(quiet.lines(&queued(1), start).is_empty());
+        assert!(quiet.lines(&grant, start).is_empty());
+        let mut immediate = Notices {
+            quiet: false,
+            queued: None,
+            ..quiet
+        };
+        assert_eq!(immediate.lines(&grant, start), ["bazelqueue: started 7-1"]);
+    }
     #[test]
     fn hooks_do_not_turn_requests_into_whole_machine_reservations() {
         let root = tempfile::tempdir().unwrap();

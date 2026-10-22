@@ -195,23 +195,43 @@ bypass. Calls that bypass PATH remain outside the interception guarantee.
 For example, stderr in a noninteractive agent session:
 
 ```text
-bazelqueue: request 42 queued; position 3; waiting for memory capacity
-bazelqueue: request 42 queued; position 2; waiting for the workspace
-bazelqueue: request 42 starting; profile balanced; 4 CPU, 3072 MiB action estimate
+bazelqueue: queued 4242-1792672532967253000 at position 3 (waiting: resource capacity)
+bazelqueue: started 4242-1792672532967253000 after 3m12s in queue
+…Bazel's own output…
+bazelqueue: finished 4242-1792672532967253000 exit=3 TESTS_FAILED queued=3m12s ran=1m05s failed=1
+bazelqueue: FAILED //app:unit_tests FAILED log=/…/testlogs/app/unit_tests/test.log
+bazelqueue: summary ~/.local/state/bazelqueue/runs/4242-1792672532967253000.json
 ```
 
 Stdout remains exclusively the backend's stdout, so `bazel cquery --output=files`
-and command substitutions remain valid. Keep stderr notifications concise:
-initial registration, position/reason changes, admission, and infrequent bounded
-keepalive notices. Use one updating line on a TTY and plain lines otherwise.
-`BAZELQUEUE_PROGRESS=quiet` suppresses progress but not actionable errors.
+and command substitutions remain valid. Keep stderr notifications concise. Off a
+TTY (agents, redirected logs) a request prints its first queue position with its
+request ID, then its start, and nothing while the position changes. On a TTY, or
+with `BAZELQUEUE_PROGRESS=verbose`, every position/reason change is printed.
+`BAZELQUEUE_PROGRESS=quiet` suppresses queue notices but not actionable errors or
+the end-of-run summary.
+
+Every metered or maintenance request ends with a stable summary block on stderr,
+each line prefixed `bazelqueue:`: exit code (and Bazel's exit name), queue wait,
+run time and, for managed invocations, at most 20 failed tests/targets with the
+test log path. For managed build/test/run/coverage invocations the guardian adds
+`--build_event_json_file` pointing into the private `runs/` directory, reads it
+after Bazel exits and deletes it. It reads the caller's file instead when the
+command line already sets one, and adds nothing when a reachable bazelrc mentions
+the flag, so a caller's own event file is never overridden. Unmanaged invocations
+report `failed=unreported`. The summary JSON is kept in `runs/<id>.json` (newest
+200) and copied to `BAZELQUEUE_SUMMARY` when set. `bazelqueue wait [ID] [--json]`
+blocks until a request ends, prints the same summary on stdout and exits with the
+request's exit code; without an ID it follows the newest build of the current
+workspace. One backgrounded call therefore tells an agent both when the build
+ended and what failed, without polling `status` or reading the log.
 
 Position is the rank in the global waiting queue, not an ETA or a promise that
 every earlier blocked lane will run first. Status also exposes lane position,
 active reservations, eligibility, queue age, and waiting reason. Explicitly show
 `reconnecting` or `recovering` during coordinator recovery.
 
-Control commands: setup, doctor, status, status --json, watch, cancel <id>, drain,
+Control commands: setup, doctor, status, status --json, watch, wait [id], cancel <id>, drain,
 resume, config show, daemon run, and uninstall. Prefer a documented JSON event
 schema for agent/tool integration; no agent-specific plugin is required.
 

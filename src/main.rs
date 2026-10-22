@@ -3,7 +3,7 @@ use bazelqueue::{
     config::{Config, Paths},
     coordinator, install, platform,
     protocol::Event,
-    runner,
+    runner, summary,
 };
 use clap::{Parser, Subcommand};
 use std::{ffi::OsString, os::unix::process::ExitStatusExt, path::PathBuf};
@@ -28,6 +28,13 @@ enum Control {
         json: bool,
     },
     Watch,
+    /// Block until a request ends, print its summary and exit with its status.
+    Wait {
+        /// Request id from the `queued`/`started` notice; defaults to the newest build of this workspace.
+        id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     Cancel {
         id: String,
     },
@@ -158,6 +165,18 @@ async fn entry() -> Result<()> {
             show(coordinator::control(&paths, "status", None).await?, false)?;
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         },
+        Control::Wait { id, json } => {
+            let summary = runner::wait(&paths, id, &std::env::current_dir()?).await?;
+            if json {
+                println!("{}", serde_json::to_string(&summary)?);
+            } else {
+                let location = summary::location(&paths, &summary.id)?;
+                for line in summary.lines(location.exists().then_some(location.as_path())) {
+                    println!("{line}");
+                }
+            }
+            std::process::exit(summary.exit_code);
+        }
         Control::Cancel { id } => {
             coordinator::control(&paths, "cancel", Some(id)).await?;
         }
