@@ -35,6 +35,20 @@ struct Entry {
     updated: u64,
 }
 
+/// Flags that change what a run reports or which tests in its targets run,
+/// but barely what it costs.
+const VALUED: [&str; 7] = [
+    "--test_filter",
+    "--test_arg",
+    "--test_output",
+    "--test_env",
+    "--runs_per_test",
+    "--build_event_json_file",
+    "--execution_log_json_file",
+];
+const SWITCHES: [&str; 2] = ["--nocache_test_results", "--cache_test_results"];
+const FAMILY_RUNS: usize = 9;
+
 /// Worktrees of one repository share a key: they build the same targets
 /// against the same caches.
 pub fn key(invocation: &Invocation, workspace: &Path) -> String {
@@ -50,17 +64,28 @@ pub fn key(invocation: &Invocation, workspace: &Path) -> String {
         if std::mem::take(&mut skip_value) {
             continue;
         }
-        if text == "--build_event_json_file" {
-            skip_value = true;
+        let (name, value) = match text.split_once('=') {
+            Some((name, _)) => (name, true),
+            None => (text.as_ref(), false),
+        };
+        if VALUED.contains(&name) {
+            skip_value = !value;
             continue;
         }
-        if text.starts_with("--build_event_json_file=") {
+        if SWITCHES.contains(&name) {
             continue;
         }
         key.push('\0');
         key.push_str(&text);
     }
     key
+}
+
+fn family(key: &str) -> &str {
+    match key.match_indices('\0').nth(1) {
+        Some((end, _)) => &key[..end],
+        None => key,
+    }
 }
 
 fn repository(workspace: &Path) -> String {
@@ -121,12 +146,37 @@ pub fn budget(config: &Config, invocation: &Invocation, cores: &[f64]) -> Option
     })
 }
 
+/// The runs of this exact key, or else the median of the latest runs of the
+/// same command in the same repository.
 pub fn lookup(root: &Path, key: &str) -> Vec<f64> {
-    load(root)
+    let mut history = load(root);
+    if let Some(entry) = history.entries.remove(key) {
+        return entry.cores;
+    }
+    let wanted = family(key);
+    let mut related: Vec<&Entry> = history
         .entries
-        .remove(key)
-        .map(|entry| entry.cores)
-        .unwrap_or_default()
+        .iter()
+        .filter(|(other, _)| family(other) == wanted)
+        .map(|(_, entry)| entry)
+        .collect();
+    related.sort_by_key(|entry| std::cmp::Reverse(entry.updated));
+    let mut cores: Vec<f64> = related
+        .iter()
+        .take(FAMILY_RUNS)
+        .filter_map(|entry| entry.cores.last().copied())
+        .collect();
+    if cores.is_empty() {
+        return cores;
+    }
+    cores.sort_by(f64::total_cmp);
+    let middle = cores.len() / 2;
+    let median = if cores.len().is_multiple_of(2) {
+        (cores[middle - 1] + cores[middle]) / 2.0
+    } else {
+        cores[middle]
+    };
+    vec![median]
 }
 
 pub fn record(root: &Path, key: &str, cores: f64) -> Result<()> {
@@ -262,5 +312,106 @@ mod tests {
         }
         assert_eq!(lookup(&state, &in_worktree), vec![0.6, 0.8, 1.0]);
         assert!(lookup(&state, "unknown").is_empty());
+    }
+
+    #[test]
+    fn runs_that_differ_only_in_cheap_flags_share_an_estimate() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = workspace(&root.path().join("w"));
+        let filtered = key(
+            &invocation(
+                &[
+                    "test",
+                    "//:unit",
+                    "--test_filter=Fast",
+                    "--test_output=errors",
+                ],
+                &workspace,
+            ),
+            &workspace,
+        );
+        let other_filter = key(
+            &invocation(
+                &[
+                    "test",
+                    "--test_filter",
+                    "Slow",
+                    "//:unit",
+                    "--test_arg=--verbose",
+                    "--runs_per_test=3",
+                    "--nocache_test_results",
+                ],
+                &workspace,
+            ),
+            &workspace,
+        );
+        assert_eq!(filtered, other_filter);
+        assert_ne!(
+            filtered,
+            key(
+                &invocation(&["test", "//:unit", "--config=release"], &workspace),
+                &workspace
+            )
+        );
+
+        let state = root.path().join("state");
+        record(&state, &filtered, 0.9).unwrap();
+        assert_eq!(lookup(&state, &other_filter), vec![0.9]);
+    }
+
+    #[test]
+    fn a_new_run_is_sized_by_the_median_of_its_repository() {
+        let root = tempfile::tempdir().unwrap();
+        let elsewhere = workspace(&root.path().join("elsewhere"));
+        let workspace = workspace(&root.path().join("w"));
+        let state = root.path().join("state");
+        for (target, cores) in [("//:a", 1.0), ("//:b", 3.0), ("//:c", 5.0)] {
+            let test = invocation(&["test", target], &workspace);
+            record(&state, &key(&test, &workspace), cores).unwrap();
+        }
+        let build = invocation(&["build", "//:a"], &workspace);
+        record(&state, &key(&build, &workspace), 8.0).unwrap();
+        let foreign = invocation(&["test", "//:a"], &elsewhere);
+        record(&state, &key(&foreign, &elsewhere), 8.0).unwrap();
+
+        let new = invocation(&["test", "//:new"], &workspace);
+        let history = lookup(&state, &key(&new, &workspace));
+        assert_eq!(history, vec![3.0]);
+        let estimated = budget(&config(), &new, &history).unwrap();
+        assert_eq!((estimated.cpu, estimated.memory_mib), (4, 4608));
+        assert!(estimated.estimate.is_some());
+
+        let unseen = invocation(&["test", "//:new"], &root.path().join("unseen"));
+        assert!(lookup(&state, &key(&unseen, &root.path().join("unseen"))).is_empty());
+    }
+
+    #[test]
+    fn without_any_history_a_run_asks_for_what_it_did_before() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = workspace(&root.path().join("w"));
+        let test = invocation(&["test", "//:unit"], &workspace);
+        let history = lookup(&root.path().join("state"), &key(&test, &workspace));
+        assert!(history.is_empty());
+        assert!(budget(&config(), &test, &history).is_none());
+    }
+
+    #[test]
+    fn history_written_with_the_old_keys_still_loads() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = workspace(&root.path().join("w"));
+        let state = root.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let repository = repository(&workspace);
+        let old = serde_json::json!({"entries": {
+            format!("{repository}\0test\0//:unit\0--test_filter=Fast"):
+                {"cores": [2.0, 4.0], "updated": 1},
+        }});
+        std::fs::write(state.join("estimates.json"), old.to_string()).unwrap();
+
+        let test = invocation(&["test", "//:unit", "--test_filter=Fast"], &workspace);
+        let key = key(&test, &workspace);
+        assert_eq!(lookup(&state, &key), vec![4.0]);
+        record(&state, &key, 1.0).unwrap();
+        assert_eq!(lookup(&state, &key), vec![1.0]);
     }
 }

@@ -713,17 +713,25 @@ mod cpu_tests {
     }
     #[test]
     fn a_tree_keeps_the_cpu_its_exited_children_used() {
+        let directory = tempfile::tempdir().unwrap();
+        let reaped = directory.path().join("reaped");
         let root = Reaped(
             std::process::Command::new("/bin/sh")
                 .args([
                     "-c",
-                    "yes >/dev/null & child=$!; sleep 1; kill $child; wait $child; sleep 30",
+                    "(i=0; while [ $i -lt 300000 ]; do i=$((i+1)); done) & wait $!; : > \"$1\"; sleep 30",
+                    "sh",
                 ])
+                .arg(&reaped)
                 .spawn()
                 .unwrap(),
         );
         let identity = identity(root.0.id()).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(1600));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !reaped.exists() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
         let used = tree_cpu_seconds(&identity).unwrap();
         assert!((0.5..3.0).contains(&used), "{used}");
     }

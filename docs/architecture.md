@@ -43,7 +43,8 @@ The scheduler reserves CPU tokens and invocation memory, including overhead.
 A managed build or test with history reserves an estimate: the guardian samples
 the CPU time of its Bazel server's process tree (live members plus reaped
 children, so workers, actions and tests all count) before and after the client
-runs, keyed by repository, command and arguments. Estimated reservations are
+runs, keyed by repository, command and the arguments that change what gets built;
+a run without its own history takes the median of its repository and command. Estimated reservations are
 bounded by summed CPU and memory rather than `max_builds`, admission stays first
 come first served, and warning pressure still admits one reduced build at a time.
 Reservations stay immutable while executing. Profiles can broaden only before
