@@ -1,6 +1,7 @@
 pub mod bazel;
 pub mod config;
 pub mod coordinator;
+pub mod estimate;
 pub mod install;
 pub mod native_server;
 pub mod platform;

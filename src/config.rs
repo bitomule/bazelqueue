@@ -115,6 +115,7 @@ impl Config {
                 self.memory_capacity_mib
             },
             exclusive: !managed,
+            estimate: None,
         }
     }
     /// Unmetered requests carry a nominal budget: admission never sums it.
@@ -125,6 +126,7 @@ impl Config {
                 cpu: 1,
                 memory_mib: 256,
                 exclusive: false,
+                estimate: None,
             },
         }
     }
@@ -137,6 +139,7 @@ impl Config {
                 .max(1024)
                 .min(self.memory_capacity_mib),
             exclusive: false,
+            estimate: None,
         }
     }
     pub fn save(&self, paths: &Paths) -> Result<()> {
@@ -226,7 +229,8 @@ mod tests {
             Budget {
                 cpu: 2,
                 memory_mib: 2304,
-                exclusive: false
+                exclusive: false,
+                estimate: None,
             }
         );
         let small = Config {

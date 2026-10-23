@@ -47,6 +47,16 @@ pub struct Budget {
     pub cpu: u32,
     pub memory_mib: u64,
     pub exclusive: bool,
+    /// What earlier runs of the same invocation measured; such a request shares
+    /// the machine by CPU and memory instead of taking a whole `max_builds` slot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimate: Option<Estimate>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Estimate {
+    pub cpu: u32,
+    pub memory_mib: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

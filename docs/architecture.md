@@ -40,6 +40,12 @@ cookie, current process birth identity, final command result and returned PID
 must agree. Unknown work keeps its reservation until evidence is available.
 
 The scheduler reserves CPU tokens and invocation memory, including overhead.
+A managed build or test with history reserves an estimate: the guardian samples
+the CPU time of its Bazel server's process tree (live members plus reaped
+children, so workers, actions and tests all count) before and after the client
+runs, keyed by repository, command and arguments. Estimated reservations are
+bounded by summed CPU and memory rather than `max_builds`, admission stays first
+come first served, and warning pressure still admits one reduced build at a time.
 Reservations stay immutable while executing. Profiles can broaden only before
 execution; lowering settings drains active work. Native memory-pressure warning
 admits one build at a time with a reduced budget; critical pressure stops new

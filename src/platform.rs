@@ -231,6 +231,77 @@ pub fn process_memory(owners: &[Identity]) -> u64 {
         .sum()
 }
 
+/// CPU seconds a process tree has used: every live member's own time plus what
+/// its reaped children used, so the total does not drop when a child exits.
+/// Persistent Bazel workers are live members, actions and tests reaped ones.
+pub fn tree_cpu_seconds(root: &Identity) -> Option<f64> {
+    if !alive(root) {
+        return None;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut system = System::new();
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing(),
+        );
+        let mut pids = std::collections::HashSet::from([Pid::from_u32(root.pid)]);
+        loop {
+            let before = pids.len();
+            for (pid, process) in system.processes() {
+                if process
+                    .parent()
+                    .is_some_and(|parent| pids.contains(&parent))
+                {
+                    pids.insert(*pid);
+                }
+            }
+            if pids.len() == before {
+                break;
+            }
+        }
+        let mut ticks = 0_u64;
+        for pid in pids {
+            let mut info: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
+            let read = unsafe {
+                libc::proc_pid_rusage(
+                    pid.as_u32() as i32,
+                    libc::RUSAGE_INFO_V4,
+                    (&mut info as *mut libc::rusage_info_v4).cast(),
+                )
+            };
+            if read != 0 {
+                if pid.as_u32() == root.pid {
+                    return None;
+                }
+                continue;
+            }
+            ticks += info.ri_user_time
+                + info.ri_system_time
+                + info.ri_child_user_time
+                + info.ri_child_system_time;
+        }
+        #[repr(C)]
+        struct Timebase {
+            numer: u32,
+            denom: u32,
+        }
+        unsafe extern "C" {
+            fn mach_timebase_info(info: *mut Timebase) -> libc::c_int;
+        }
+        let mut timebase = Timebase { numer: 0, denom: 0 };
+        if unsafe { mach_timebase_info(&mut timebase) } != 0 || timebase.denom == 0 {
+            return None;
+        }
+        Some(ticks as f64 * f64::from(timebase.numer) / f64::from(timebase.denom) / 1e9)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
 pub fn bazel_servers(workspace: &str) -> Result<Vec<crate::protocol::NativeServer>> {
     let mut system = System::new();
     system.refresh_processes_specifics(
@@ -627,5 +698,33 @@ mod legacy_tests {
             None
         );
         assert!(shell_script(&args(&["bash", "./bazelisk"]), None).is_err());
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod cpu_tests {
+    use super::*;
+    struct Reaped(std::process::Child);
+    impl Drop for Reaped {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    #[test]
+    fn a_tree_keeps_the_cpu_its_exited_children_used() {
+        let root = Reaped(
+            std::process::Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    "yes >/dev/null & child=$!; sleep 1; kill $child; wait $child; sleep 30",
+                ])
+                .spawn()
+                .unwrap(),
+        );
+        let identity = identity(root.0.id()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1600));
+        let used = tree_cpu_seconds(&identity).unwrap();
+        assert!((0.5..3.0).contains(&used), "{used}");
     }
 }
