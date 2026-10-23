@@ -197,7 +197,7 @@ ${EDITOR:-vi} ~/.local/state/bazelqueue/config.toml
 
 | Setting | Controls |
 |---|---|
-| `max_builds` | Concurrent invocations. Default: **1**, with parallel actions inside that build. |
+| `max_builds` | Concurrent invocations that have no estimate yet. Default: **1**, with parallel actions inside that build. |
 | `cpu_capacity` | The total CPU token budget shared by admitted builds. |
 | `memory_capacity_mib` | The total estimated invocation memory budget. |
 | `jobs` | The upper cap on parallel Bazel actions. |
@@ -206,6 +206,18 @@ ${EDITOR:-vi} ~/.local/state/bazelqueue/config.toml
 A lone supported build can receive the wide profile. Concurrent managed builds
 use smaller reservations; their budgets remain fixed once execution starts.
 Proven stricter direct numeric caller limits are preserved.
+
+**Repeated builds and tests are sized from their last runs.** When a managed
+build or test ends, bazelqueue records how many cores its Bazel server, workers,
+actions and tests kept busy on average. The next run of the same command and
+arguments in the same repository (any of its worktrees) reserves 1.25 times the
+busiest of the last three runs, at least 2 CPUs, with memory in the same
+proportion: a cached test run on an 8 CPU / 9 GiB budget asks for 2 CPU and
+2304 MiB. Estimated runs share the machine by CPU and memory instead of taking a
+`max_builds` slot, so several small test runs execute side by side. A run that
+kept most of its reservation busy asks for the whole machine next time, and a run
+with no history keeps the share above. History lives in `estimates.json` in the
+state directory.
 
 **We kept the default at one build after measuring our workload.** We ran sixteen
 fresh Clang compilations on an 11-core M3 Pro with 18 GiB RAM: one admitted build

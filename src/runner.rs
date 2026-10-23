@@ -2,7 +2,7 @@
 use crate::{
     bazel,
     config::{Config, Paths},
-    coordinator, platform,
+    coordinator, estimate, platform,
     protocol::{self, Admission, Budget, Event, Message, NativeServer, Request},
     summary,
 };
@@ -357,18 +357,19 @@ pub async fn guardian(backend: PathBuf, args: Vec<OsString>, generic: bool) -> R
             .unwrap_or_else(|| "unknown".into())
     };
     let immediate = protocol::admission(&command) == Admission::Immediate;
+    let workspace = crate::config::workspace(&cwd);
+    let estimate_key = estimate::key(&invocation, &workspace);
+    let history = estimate::lookup(&paths.root, &estimate_key);
     let mut request = Request {
         id: id.clone(),
         owner,
-        lane: crate::config::workspace(&cwd)
-            .to_string_lossy()
-            .into_owned(),
+        lane: workspace.to_string_lossy().into_owned(),
         command,
-        budget: initial_budget(&config, &invocation, generic),
+        budget: estimate::budget(&config, &invocation, &history)
+            .filter(|_| !generic)
+            .unwrap_or_else(|| initial_budget(&config, &invocation, generic)),
         prepared: generic || immediate || invocation.command_index.is_none(),
-        workspace: crate::config::workspace(&cwd)
-            .to_string_lossy()
-            .into_owned(),
+        workspace: workspace.to_string_lossy().into_owned(),
     };
     if generic {
         #[cfg(feature = "test-fixtures")]
@@ -460,7 +461,11 @@ pub async fn guardian(backend: PathBuf, args: Vec<OsString>, generic: bool) -> R
                     }
                 }
                 request.prepared = true;
-                request.budget = config.request_budget(request.admission(), invocation.managed);
+                request.budget = estimate::budget(&config, &invocation, &history)
+                    .filter(|_| !generic)
+                    .unwrap_or_else(|| {
+                        config.request_budget(request.admission(), invocation.managed)
+                    });
                 protocol::send(
                     &mut stream,
                     &Message::Prepared {
@@ -532,6 +537,13 @@ pub async fn guardian(backend: PathBuf, args: Vec<OsString>, generic: bool) -> R
             _ => arguments,
         }
     };
+    let measured = server
+        .as_ref()
+        .filter(|_| !generic && invocation.managed)
+        .and_then(|server| {
+            platform::tree_cpu_seconds(&server.identity)
+                .map(|cpu| (server.identity.clone(), cpu, Instant::now()))
+        });
     let (mut child, mut permit, child_identity) =
         owned_executor(&backend, backend_args, false, Some(&id)).await?;
     if !authorize(&paths, &request, &mut stream, &child_identity, "running").await? {
@@ -574,6 +586,21 @@ pub async fn guardian(backend: PathBuf, args: Vec<OsString>, generic: bool) -> R
         }
     };
     drop(terminal);
+    if !cancelled
+        && status.signal().is_none()
+        && let Some((server, before, started)) = &measured
+        && let Some(after) = platform::tree_cpu_seconds(server)
+    {
+        let cores = estimate::observe(
+            after - before,
+            started.elapsed().as_secs_f64(),
+            request.budget.cpu,
+            &config,
+        );
+        if let Err(error) = estimate::record(&paths.root, &estimate_key, cores) {
+            report!("bazelqueue: estimate not saved: {error:#}");
+        }
+    }
     let stopped = if generic || (status.signal().is_none() && !cancelled) {
         true
     } else {

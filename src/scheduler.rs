@@ -36,6 +36,7 @@ pub fn admission_budget(config: &Config, pressure: Pressure) -> Budget {
             cpu: config.cpu_capacity,
             memory_mib: config.memory_capacity_mib,
             exclusive: false,
+            estimate: None,
         }
     }
 }
@@ -46,8 +47,13 @@ pub fn fit_queued(budget: &mut Budget, config: &Config, pressure: Pressure) -> b
     }
     let before = budget.clone();
     let share = config.budget(true);
-    if pressure == Pressure::Normal && budget.cpu < share.cpu {
-        *budget = share;
+    if pressure == Pressure::Normal {
+        if let Some(estimate) = budget.estimate {
+            budget.cpu = estimate.cpu;
+            budget.memory_mib = estimate.memory_mib;
+        } else if budget.cpu < share.cpu {
+            *budget = share;
+        }
     }
     let limit = admission_budget(config, pressure);
     budget.cpu = budget.cpu.min(limit.cpu);
@@ -66,6 +72,7 @@ pub fn raise_lone_job<'a>(
             && job.metered()
             && job.request.prepared
             && !job.request.budget.exclusive
+            && job.request.budget.estimate.is_none()
             && job.request.command != "exec"
     };
     if remaining_memory < 256
@@ -189,9 +196,16 @@ pub fn eligible(jobs: &[Job], config: &Config, capacity: &Capacity) -> Vec<u64> 
         } else {
             (limit.cpu, limit.memory_mib)
         };
+        let slots = active
+            .iter()
+            .filter(|job| {
+                capacity.pressure == Pressure::Constrained || job.request.budget.estimate.is_none()
+            })
+            .count();
         if exclusive
             || (budget.exclusive && !active.is_empty())
-            || active.len() >= max_builds
+            || ((budget.estimate.is_none() || capacity.pressure == Pressure::Constrained)
+                && slots >= max_builds)
             || cpu.saturating_add(budget.cpu) > cpu_limit
             || memory.saturating_add(budget.memory_mib) > memory_limit
         {
@@ -250,6 +264,7 @@ mod tests {
                     cpu,
                     memory_mib: 512,
                     exclusive,
+                    estimate: None,
                 },
                 prepared: true,
                 workspace: lane.into(),
@@ -535,5 +550,87 @@ mod tests {
         cleaning[1].state = "running".into();
         cleaning[2].state = "running".into();
         assert_eq!(eligible(&cleaning, &config(), &capacity()), vec![5]);
+    }
+    fn whole_machine() -> Config {
+        Config {
+            cpu_capacity: 8,
+            memory_capacity_mib: 9216,
+            max_builds: 1,
+            action_memory_mib: 6144,
+            ..Config::default()
+        }
+    }
+    fn estimated(sequence: u64, lane: &str, cpu: u32, state: &str) -> Job {
+        let mut job = job(sequence, lane, cpu, false, state);
+        job.request.command = "test".into();
+        job.request.budget.memory_mib = 9216 * u64::from(cpu) / 8;
+        job.request.budget.estimate = Some(crate::protocol::Estimate {
+            cpu,
+            memory_mib: job.request.budget.memory_mib,
+        });
+        job
+    }
+    #[test]
+    fn small_estimated_runs_share_the_machine_even_with_one_build_slot() {
+        let jobs: Vec<_> = (1..=5)
+            .map(|sequence| estimated(sequence, &format!("w{sequence}"), 2, "queued"))
+            .collect();
+        assert_eq!(
+            eligible(&jobs, &whole_machine(), &capacity()),
+            vec![1, 2, 3, 4]
+        );
+        let mut unestimated = job(1, "a", 8, false, "queued");
+        unestimated.request.budget.memory_mib = 9216;
+        let mut second = unestimated.clone();
+        second.sequence = 2;
+        second.request.lane = "b".into();
+        second.request.workspace = "b".into();
+        assert_eq!(
+            eligible(&[unestimated, second], &whole_machine(), &capacity()),
+            vec![1]
+        );
+    }
+    #[test]
+    fn a_large_run_ahead_of_small_ones_is_not_overtaken() {
+        let mut large = job(2, "b", 8, false, "queued");
+        large.request.budget.memory_mib = 9216;
+        let jobs = vec![
+            estimated(1, "a", 2, "running"),
+            large,
+            estimated(3, "c", 2, "queued"),
+        ];
+        assert!(eligible(&jobs, &whole_machine(), &capacity()).is_empty());
+    }
+    #[test]
+    fn memory_pressure_still_admits_one_reduced_run_at_a_time() {
+        let jobs = vec![
+            estimated(1, "a", 2, "queued"),
+            estimated(2, "b", 2, "queued"),
+        ];
+        let constrained = Capacity {
+            pressure: Pressure::Constrained,
+            ..capacity()
+        };
+        assert_eq!(eligible(&jobs, &whole_machine(), &constrained), vec![1]);
+    }
+    #[test]
+    fn an_estimate_survives_pressure_and_is_not_widened() {
+        let config = whole_machine();
+        let mut budget = estimated(1, "a", 3, "queued").request.budget;
+        assert!(fit_queued(&mut budget, &config, Pressure::Constrained));
+        assert_eq!((budget.cpu, budget.memory_mib), (2, 2304));
+        assert!(fit_queued(&mut budget, &config, Pressure::Normal));
+        assert_eq!((budget.cpu, budget.memory_mib), (3, 3456));
+        let mut jobs = vec![estimated(1, "a", 2, "queued")];
+        let candidates = jobs.clone();
+        assert!(
+            raise_lone_job(
+                &candidates,
+                &mut jobs,
+                &admission_budget(&config, Pressure::Normal),
+                9216
+            )
+            .is_none()
+        );
     }
 }
