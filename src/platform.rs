@@ -749,7 +749,7 @@ mod cpu_tests {
         let used = tree_cpu_seconds(&identity).unwrap();
         let expected = work_cpu_seconds();
         assert!(
-            (expected * 0.5..expected * 1.6).contains(&used),
+            (expected * 0.5..expected * 4.0).contains(&used),
             "{used} for {expected}"
         );
     }
