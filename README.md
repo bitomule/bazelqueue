@@ -209,15 +209,21 @@ Proven stricter direct numeric caller limits are preserved.
 
 **Repeated builds and tests are sized from their last runs.** When a managed
 build or test ends, bazelqueue records how many cores its Bazel server, workers,
-actions and tests kept busy on average. The next run of the same command and
-arguments in the same repository (any of its worktrees) reserves 1.25 times the
-busiest of the last three runs, at least 2 CPUs, with memory in the same
-proportion: a cached test run on an 8 CPU / 9 GiB budget asks for 2 CPU and
-2304 MiB. Estimated runs share the machine by CPU and memory instead of taking a
-`max_builds` slot, so several small test runs execute side by side. A run that
-kept most of its reservation busy asks for the whole machine next time, and a run
-with no history keeps the share above. History lives in `estimates.json` in the
-state directory.
+actions and tests kept busy on average. The next run of the same command,
+targets and flags in the same repository (any of its worktrees) reserves 1.25
+times the busiest of the last three runs, at least 2 CPUs, with memory in the
+same proportion: a cached test run on an 8 CPU / 9 GiB budget asks for 2 CPU and
+2304 MiB. Flags that pick tests or shape their output rather than what gets
+built (`--test_filter`, `--test_arg`, `--test_output`, `--test_env`,
+`--runs_per_test`, `--[no]cache_test_results`, `--build_event_json_file`,
+`--execution_log_json_file`) do not count, so runs that only change them share
+one history. A run with no history of its own reserves 1.25 times the median of
+the latest nine runs of the same command in the same repository. Estimated runs
+share the machine by CPU and memory instead of taking a `max_builds` slot, so
+several small test runs execute side by side. A run that kept most of its
+reservation busy asks for the whole machine next time, and a run in a repository
+with no history of its command keeps the share above. History lives in
+`estimates.json` in the state directory.
 
 **We kept the default at one build after measuring our workload.** We ran sixteen
 fresh Clang compilations on an 11-core M3 Pro with 18 GiB RAM: one admitted build

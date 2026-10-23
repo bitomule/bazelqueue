@@ -711,20 +711,46 @@ mod cpu_tests {
             let _ = self.0.wait();
         }
     }
+    const WORK: &str = "i=0; while [ $i -lt 200000 ]; do i=$((i+1)); done";
+
+    fn work_cpu_seconds() -> f64 {
+        let output = std::process::Command::new("/usr/bin/time")
+            .args(["-p", "/bin/sh", "-c", WORK])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .filter_map(|line| line.strip_prefix("user ").or(line.strip_prefix("sys ")))
+            .map(|seconds| seconds.trim().parse::<f64>().unwrap())
+            .sum()
+    }
+
     #[test]
     fn a_tree_keeps_the_cpu_its_exited_children_used() {
+        let directory = tempfile::tempdir().unwrap();
+        let reaped = directory.path().join("reaped");
         let root = Reaped(
             std::process::Command::new("/bin/sh")
                 .args([
                     "-c",
-                    "yes >/dev/null & child=$!; sleep 1; kill $child; wait $child; sleep 30",
+                    &format!("({WORK}) & wait $!; : > \"$1\"; sleep 30"),
+                    "sh",
                 ])
+                .arg(&reaped)
                 .spawn()
                 .unwrap(),
         );
         let identity = identity(root.0.id()).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(1600));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !reaped.exists() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
         let used = tree_cpu_seconds(&identity).unwrap();
-        assert!((0.5..3.0).contains(&used), "{used}");
+        let expected = work_cpu_seconds();
+        assert!(
+            (expected * 0.5..expected * 4.0).contains(&used),
+            "{used} for {expected}"
+        );
     }
 }
