@@ -432,6 +432,56 @@ impl Daemon {
     }
 }
 
+/// A runner writes its receipt before it reports `Finish`, so the receipt
+/// outlives that message whenever the message arrives first. Receipts are
+/// listed before the jobs are read: a receipt only exists for a registered job.
+fn settle_receipts(paths: &Paths, store: &Store) -> Result<()> {
+    let Ok(entries) = fs::read_dir(&paths.root) else {
+        return Ok(());
+    };
+    let receipts: Vec<(String, PathBuf)> = entries
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let id = entry
+                .file_name()
+                .to_str()?
+                .strip_prefix("receipt-")?
+                .to_owned();
+            Some((id, entry.path()))
+        })
+        .collect();
+    if receipts.is_empty() {
+        return Ok(());
+    }
+    let mut jobs = store.jobs()?;
+    for (id, receipt) in receipts {
+        let outcome = fs::read(&receipt)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<(i32, bool)>(&bytes).ok());
+        match jobs.iter_mut().find(|job| job.request.id == id) {
+            Some(job) if !job.terminal() => {
+                let Some((code, stopped)) = outcome else {
+                    continue;
+                };
+                job.code = Some(code);
+                job.state = if stopped { "finished" } else { "quarantined" }.into();
+                store.save(job)?;
+            }
+            Some(job) => {
+                if job.code.is_none()
+                    && let Some((code, _)) = outcome
+                {
+                    job.code = Some(code);
+                    store.save(job)?;
+                }
+            }
+            None => {}
+        }
+        let _ = fs::remove_file(receipt);
+    }
+    Ok(())
+}
+
 fn notify(reply: &mpsc::Sender<Event>, event: Event) {
     let _ = reply.try_send(event);
 }
@@ -549,6 +599,7 @@ pub async fn run(paths: Paths) -> Result<()> {
             _=tokio::signal::ctrl_c()=>break,
         }
         if reschedule {
+            settle_receipts(&paths, &store)?;
             let mut jobs = store.jobs()?;
             for job in &mut jobs {
                 if job.terminal() {
@@ -567,16 +618,6 @@ pub async fn run(paths: Paths) -> Result<()> {
                     && scheduler::fit_queued(&mut job.request.budget, &config, mode)
                 {
                     store.save(job)?;
-                }
-                let receipt = paths.root.join(format!("receipt-{}", job.request.id));
-                if let Ok(bytes) = fs::read(&receipt)
-                    && let Ok((code, stopped)) = serde_json::from_slice::<(i32, bool)>(&bytes)
-                {
-                    job.code = Some(code);
-                    job.state = if stopped { "finished" } else { "quarantined" }.into();
-                    store.save(job)?;
-                    let _ = fs::remove_file(receipt);
-                    continue;
                 }
                 if !platform::alive(&job.request.owner) {
                     if job.state == "queued" {
@@ -969,4 +1010,168 @@ fn legacy_owners(store: &Store, config: &Config) -> Result<Vec<platform::Identit
     owners.sort_by_key(|owner| owner.pid);
     owners.dedup();
     Ok(owners)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{Budget, Job, Request};
+
+    struct Fixture {
+        _root: tempfile::TempDir,
+        paths: Paths,
+        store: Store,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let paths = Paths {
+                root: root.path().into(),
+                config: root.path().join("config.toml"),
+                socket: root.path().join("control.sock"),
+                database: root.path().join("queue.sqlite3"),
+            };
+            let store = Store::open(&paths).unwrap();
+            Self {
+                _root: root,
+                paths,
+                store,
+            }
+        }
+        fn job(&self, id: &str, state: &str) -> Job {
+            let mut job = self
+                .store
+                .register(Request {
+                    id: id.into(),
+                    owner: platform::Identity {
+                        pid: 1,
+                        birth: "test".into(),
+                    },
+                    lane: "lane".into(),
+                    command: "build".into(),
+                    budget: Budget {
+                        cpu: 1,
+                        memory_mib: 512,
+                        exclusive: false,
+                        estimate: None,
+                    },
+                    prepared: true,
+                    workspace: "workspace".into(),
+                })
+                .unwrap();
+            job.state = state.into();
+            self.store.save(&job).unwrap();
+            job
+        }
+        fn receipt(&self, id: &str) -> PathBuf {
+            self.paths.root.join(format!("receipt-{id}"))
+        }
+        fn write_receipt(&self, id: &str, code: i32, stopped: bool) {
+            platform::atomic_write(
+                &self.receipt(id),
+                &serde_json::to_vec(&(code, stopped)).unwrap(),
+            )
+            .unwrap();
+        }
+        fn stored(&self, id: &str) -> Job {
+            self.store
+                .jobs()
+                .unwrap()
+                .into_iter()
+                .find(|job| job.request.id == id)
+                .unwrap()
+        }
+        fn settle(&self) {
+            settle_receipts(&self.paths, &self.store).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_receipt_is_removed_after_finish_already_recorded_the_job() {
+        let fixture = Fixture::new();
+        let mut job = fixture.job("done", "running");
+        fixture.write_receipt("done", 0, true);
+        job.code = Some(0);
+        job.state = "finished".into();
+        fixture.store.save(&job).unwrap();
+        fixture.settle();
+        assert!(!fixture.receipt("done").exists());
+        assert_eq!(fixture.stored("done").state, "finished");
+        assert_eq!(fixture.stored("done").code, Some(0));
+    }
+
+    #[test]
+    fn a_failed_job_receipt_quarantines_the_job_and_is_removed() {
+        let fixture = Fixture::new();
+        fixture.job("failed", "running");
+        fixture.write_receipt("failed", 1, false);
+        fixture.settle();
+        assert!(!fixture.receipt("failed").exists());
+        assert_eq!(fixture.stored("failed").state, "quarantined");
+        assert_eq!(fixture.stored("failed").code, Some(1));
+    }
+
+    #[test]
+    fn a_cancelled_job_keeps_its_state_and_its_late_receipt_is_removed() {
+        let fixture = Fixture::new();
+        fixture.job("cancelled", "cancelled");
+        fixture.write_receipt("cancelled", 130, true);
+        fixture.settle();
+        assert!(!fixture.receipt("cancelled").exists());
+        assert_eq!(fixture.stored("cancelled").state, "cancelled");
+        assert_eq!(fixture.stored("cancelled").code, Some(130));
+    }
+
+    #[test]
+    fn a_runner_that_died_before_finish_is_recorded_from_its_receipt() {
+        let fixture = Fixture::new();
+        fixture.job("crashed", "run_phase");
+        fixture.write_receipt("crashed", 3, true);
+        fixture.settle();
+        assert!(!fixture.receipt("crashed").exists());
+        assert_eq!(fixture.stored("crashed").state, "finished");
+        assert_eq!(fixture.stored("crashed").code, Some(3));
+    }
+
+    #[test]
+    fn a_restarted_coordinator_records_and_removes_pending_receipts() {
+        let fixture = Fixture::new();
+        fixture.job("running", "running");
+        let mut finished = fixture.job("finished", "running");
+        finished.state = "finished".into();
+        finished.code = Some(0);
+        fixture.store.save(&finished).unwrap();
+        fixture.write_receipt("running", 0, true);
+        fixture.write_receipt("finished", 0, true);
+        let restarted = Store::open(&fixture.paths).unwrap();
+        settle_receipts(&fixture.paths, &restarted).unwrap();
+        assert!(!fixture.receipt("running").exists());
+        assert!(!fixture.receipt("finished").exists());
+        assert_eq!(fixture.stored("running").state, "finished");
+    }
+
+    #[test]
+    fn receipts_of_jobs_the_store_no_longer_knows_are_pruned() {
+        let fixture = Fixture::new();
+        for index in 0..3 {
+            fixture.write_receipt(&format!("trimmed-{index}"), 0, true);
+        }
+        fs::write(fixture.paths.root.join(".write-1"), b"partial").unwrap();
+        fixture.settle();
+        for index in 0..3 {
+            assert!(!fixture.receipt(&format!("trimmed-{index}")).exists());
+        }
+        assert!(fixture.paths.root.join(".write-1").exists());
+    }
+
+    #[test]
+    fn an_unreadable_receipt_of_a_running_job_is_kept() {
+        let fixture = Fixture::new();
+        fixture.job("running", "running");
+        fs::write(fixture.receipt("running"), b"{").unwrap();
+        fixture.settle();
+        assert!(fixture.receipt("running").exists());
+        assert_eq!(fixture.stored("running").state, "running");
+    }
 }
