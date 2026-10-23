@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.7](https://github.com/bitomule/bazelqueue/compare/v0.1.6...v0.1.7) - 2026-10-23
+
+### Fixed
+
+- size repeated builds and tests from their last runs so small ones share the machine ([#13](https://github.com/bitomule/bazelqueue/pull/13))
+
 ## [0.1.6](https://github.com/bitomule/bazelqueue/compare/v0.1.5...v0.1.6) - 2026-10-22
 
 ### Added
