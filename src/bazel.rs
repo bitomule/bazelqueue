@@ -239,7 +239,7 @@ pub fn arguments(
     if !invocation.managed {
         return invocation.args.clone();
     }
-    let jobs = numeric_limit(invocation, "--jobs", u64::from(budget.cpu.min(config.jobs)));
+    let jobs = numeric_limit(invocation, "--jobs", u64::from(config.jobs));
     let memory = config.action_memory_mib.min(budget.memory_mib * 2 / 3);
     let policy = format!(
         "flag_policies {{flag_name:'jobs' set_value {{flag_value:'{jobs}' behavior:FINAL_VALUE_IGNORE_OVERRIDES}}}} flag_policies {{flag_name:'local_resources' set_value {{flag_value:'cpu={cpu}' flag_value:'memory={memory}' behavior:APPEND}}}} flag_policies {{flag_name:'worker_max_instances' set_value {{flag_value:'={workers}' behavior:FINAL_VALUE_IGNORE_OVERRIDES}}}} flag_policies {{flag_name:'worker_max_multiplex_instances' set_value {{flag_value:'={workers}' behavior:FINAL_VALUE_IGNORE_OVERRIDES}}}} flag_policies {{flag_name:'local_test_jobs' commands:'test' set_value {{flag_value:'{tests}' behavior:FINAL_VALUE_IGNORE_OVERRIDES}}}}",
@@ -254,11 +254,9 @@ pub fn arguments(
             "--worker_max_multiplex_instances",
             u64::from(config.worker_instances.min(budget.cpu))
         )),
-        tests = numeric_limit(
-            invocation,
-            "--local_test_jobs",
-            u64::from(budget.cpu.min(2))
-        )
+        tests = Some(numeric_limit(invocation, "--local_test_jobs", u64::MAX))
+            .filter(|tests| *tests != u64::MAX)
+            .map_or(0, |tests| tests.min(u64::from(budget.cpu)))
     );
     let mut args = invocation.args.clone();
     if let Some(script) = script {
@@ -512,6 +510,52 @@ mod tests {
                 None
             ),
             args
+        );
+    }
+    fn policy(args: &[&str], budget: &Budget) -> String {
+        let invocation = Invocation {
+            args: args.iter().map(OsString::from).collect(),
+            startup: Vec::new(),
+            command: Some(args[0].into()),
+            managed: true,
+            run: false,
+            command_index: Some(0),
+        };
+        arguments(&invocation, budget, &Config::default(), None)[0]
+            .to_string_lossy()
+            .into_owned()
+    }
+    #[test]
+    fn cache_checks_run_beyond_the_reserved_cpus() {
+        let budget = Budget {
+            cpu: 2,
+            ..Config::default().budget(true)
+        };
+        let policy = policy(&["test", "//:x"], &budget);
+        assert!(policy.contains("flag_name:'jobs' set_value {flag_value:'64'"));
+        assert!(policy.contains("flag_value:'cpu=2'"));
+    }
+    #[test]
+    fn local_tests_are_limited_by_reserved_resources() {
+        let budget = Budget {
+            cpu: 8,
+            ..Config::default().budget(true)
+        };
+        let tests = |args: &[&str]| {
+            policy(args, &budget)
+                .split("flag_name:'local_test_jobs' commands:'test' set_value {flag_value:'")
+                .nth(1)
+                .and_then(|rest| rest.split('\'').next())
+                .map(str::to_owned)
+        };
+        assert_eq!(tests(&["test", "//:x"]).as_deref(), Some("0"));
+        assert_eq!(
+            tests(&["test", "--local_test_jobs=3", "//:x"]).as_deref(),
+            Some("3")
+        );
+        assert_eq!(
+            tests(&["test", "--local_test_jobs", "20", "//:x"]).as_deref(),
+            Some("8")
         );
     }
     #[test]

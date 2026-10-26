@@ -48,7 +48,7 @@ impl Default for Config {
             cpu_capacity: cpu,
             memory_capacity_mib: budget,
             max_builds: 1,
-            jobs: cpu,
+            jobs: 64,
             action_memory_mib: (budget * 2 / 3).max(256),
             worker_instances: 2,
             managed: true,
@@ -85,7 +85,7 @@ impl Config {
         if self.cpu_capacity == 0
             || self.memory_capacity_mib < 256
             || self.max_builds == 0
-            || self.jobs == 0
+            || !(1..=5000).contains(&self.jobs)
             || self.worker_instances == 0
             || self.pressure_recovery_samples == 0
             || self.constrained_divisor == 0
@@ -249,6 +249,21 @@ mod tests {
             .validate()
             .is_err()
         );
+    }
+    #[test]
+    fn jobs_stay_within_what_bazel_accepts() {
+        assert_eq!(Config::default().jobs, 64);
+        for (jobs, valid) in [(0, false), (1, true), (5000, true), (5001, false)] {
+            assert_eq!(
+                Config {
+                    jobs,
+                    ..Config::default()
+                }
+                .validate()
+                .is_ok(),
+                valid
+            );
+        }
     }
     #[test]
     fn unsafe_backend_names_and_zero_share_configurations_are_rejected() {
