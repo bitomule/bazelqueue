@@ -82,3 +82,33 @@ to the native shims. Two real calls reported queue positions 1 and 2, waited
 behind drain, and completed successfully after resume. Another agent's queued
 clean command also completed through the installed queue. The queue was left
 resumed; no running user build was terminated.
+
+## Cache checks beyond the reserved CPUs
+
+`--jobs` used to equal the reserved CPUs and `--local_test_jobs` was 2. Under
+memory pressure the queue reserves 2 CPUs, so a cold build checked and fetched
+its cache hits two at a time. Measured on Alondra at 195f391, the 63 `bazel
+test` targets of its `MUSTS.yml` in one command, each run in a fresh worktree
+with its own output base and `--repo_contents_cache=` (the shared repository
+cache had a broken entry that day). Every run below was admitted with 2 CPU /
+2304 MiB; v0.1.8 therefore passed `--jobs=2`, this change `--jobs=64` with
+`--local_resources=cpu=2`.
+
+| Cached test results, same disk and remote cache | v0.1.8 | `--jobs=64` |
+| --- | --- | --- |
+| Cold command | 233 s | 78 s |
+| Cold remote cache checks (wall / summed) | 73.4 s / 107.8 s | 19.9 s / 7.7 min |
+| Cold critical path | 11.8 s | 18.0 s |
+| Warm command, after the server exited | 40 s | 51 s |
+
+With `//crates/alondrad:alondrad_test` executed locally (about 5 minutes on
+the critical path) the cold command took 8.4 min before and 7.1 min after, and
+remote cache checks 102.7 s and 28.8 s of wall time. That test timed out at
+300 s in three of four local runs, before and after; with 2 reserved CPUs both
+versions run at most two tests at once.
+
+Memory was sampled every 2 s while each command ran. Other builds kept the Mac
+at the warning level throughout (87–100 % of samples, in both versions). The
+`--jobs=64` runs never reached critical and kept at least 21 % free; the
+v0.1.8 runs reached critical in 35 % of one warm run's samples and 18 % free.
+Swap grew 0.4–2.1 GiB per run in both.
