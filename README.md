@@ -200,12 +200,21 @@ ${EDITOR:-vi} ~/.local/state/bazelqueue/config.toml
 | `max_builds` | Concurrent invocations that have no estimate yet. Default: **1**, with parallel actions inside that build. |
 | `cpu_capacity` | The total CPU token budget shared by admitted builds. |
 | `memory_capacity_mib` | The total estimated invocation memory budget. |
-| `jobs` | The upper cap on parallel Bazel actions. |
+| `jobs` | The cap on actions Bazel keeps in flight, cache checks included. Default: **64**; the reserved CPUs, not this, limit what runs locally. |
 | `worker_instances` | Worker and multiplex-worker instance caps. |
 
 A lone supported build can receive the wide profile. Concurrent managed builds
 use smaller reservations; their budgets remain fixed once execution starts.
 Proven stricter direct numeric caller limits are preserved.
+
+**Cache checks do not wait for CPUs.** Bazel counts every action against
+`--jobs`, including the ones it only looks up and downloads from the disk or
+remote cache. bazelqueue therefore passes `--jobs` from `jobs` (64 by default)
+and limits local work with `--local_resources=cpu=N,memory=M` from the
+reservation. Tests are not capped at two: `--local_test_jobs=0` lets each test
+reserve its CPUs from the same budget, one by default or N with a `cpu:N` tag.
+A `--local_test_jobs` given on the command line is kept, up to the reserved
+CPUs.
 
 **Repeated builds and tests are sized from their last runs.** When a managed
 build or test ends, bazelqueue records how many cores its Bazel server, workers,
