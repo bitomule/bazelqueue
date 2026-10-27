@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.9](https://github.com/bitomule/bazelqueue/compare/v0.1.8...v0.1.9) - 2026-10-27
+
+### Fixed
+
+- let Bazel check the cache beyond the reserved CPUs and size local tests by their reservation ([#19](https://github.com/bitomule/bazelqueue/pull/19))
+- remove job receipts once the coordinator has recorded them, and prune receipts of forgotten jobs ([#17](https://github.com/bitomule/bazelqueue/pull/17))
+
 ## [0.1.8](https://github.com/bitomule/bazelqueue/compare/v0.1.7...v0.1.8) - 2026-10-23
 
 ### Fixed
