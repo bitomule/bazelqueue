@@ -57,6 +57,7 @@ pub fn decide(job: &Job, observation: Observation) -> Decision {
 /// The exit reported by a guardian wins; recovery never invents success.
 pub fn finish(job: &mut Job, reason: &str) {
     job.state = "finished".into();
+    job.retiring_server = None;
     let code = *job.code.get_or_insert(125);
     job.reason = Some(match job.reason.take() {
         Some(previous) if previous.contains("unresponsive orphan server") => {
@@ -76,6 +77,18 @@ pub fn finish(job: &mut Job, reason: &str) {
 }
 
 pub fn record_finish(job: &mut Job, code: i32, stopped: bool, reason: Option<String>) {
+    if job.terminal() {
+        // A receipt may precede Finish. Enrich its generic diagnosis, but never
+        // reopen a terminal job or replace a later recovery/cancellation reason.
+        if job.code == Some(code)
+            && reason.is_some()
+            && (job.reason.is_none()
+                || job.reason.as_deref() == Some(&format!("backend exited with code {code}")))
+        {
+            job.reason = reason;
+        }
+        return;
+    }
     job.code = Some(code);
     job.state = if stopped { "finished" } else { "quarantined" }.into();
     job.reason = reason.or_else(|| (code != 0).then(|| format!("backend exited with code {code}")));
@@ -173,6 +186,21 @@ mod tests {
         assert!(!failed.holds_capacity());
         assert_eq!(failed.code, Some(36));
         assert!(failed.reason.unwrap().contains("disk full"));
+    }
+
+    #[test]
+    fn late_finish_enriches_a_receipt_but_cannot_reopen_or_erase_a_recovered_job() {
+        let mut ended = job(1, "running");
+        record_finish(&mut ended, 36, true, None);
+        record_finish(&mut ended, 36, false, Some("disk full".into()));
+        assert_eq!(ended.state, "finished");
+        assert_eq!(ended.reason.as_deref(), Some("disk full"));
+        finish(&mut ended, "native server verified idle");
+        let recovered = ended.clone();
+        record_finish(&mut ended, 36, false, Some("disk full".into()));
+        assert_eq!(ended, recovered);
+        record_finish(&mut ended, 0, false, None);
+        assert_eq!(ended, recovered);
     }
 
     #[test]

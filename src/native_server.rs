@@ -2,7 +2,14 @@
 use crate::{platform, protocol::NativeServer, recovery::NativeState};
 use anyhow::{Context, Result, bail};
 use prost::Message;
-use std::{fs, net::SocketAddr, os::unix::fs::MetadataExt, path::Path, time::Duration};
+use std::{
+    fs,
+    io::Read,
+    net::SocketAddr,
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    path::Path,
+    time::Duration,
+};
 use tonic::{client::Grpc, codegen::http::uri::PathAndQuery, transport::Endpoint};
 
 #[cfg(test)]
@@ -51,11 +58,20 @@ struct Cookie {
 
 fn read_info(base: &str) -> Result<ServerInfo> {
     let path = Path::new(base).join("server/server_info.rawproto");
-    let file = fs::symlink_metadata(&path)?;
-    if !file.is_file() || file.uid() != platform::uid() || file.len() > 65536 {
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.uid() != platform::uid() || metadata.len() > 65536 {
         bail!("native server identity file is not trustworthy");
     }
-    let info = ServerInfo::decode(fs::read(path)?.as_slice())?;
+    let mut bytes = Vec::new();
+    (&mut file).take(65537).read_to_end(&mut bytes)?;
+    if bytes.len() > 65536 {
+        bail!("native identity file exceeds limit");
+    }
+    let info = ServerInfo::decode(bytes.as_slice())?;
     let address: SocketAddr = info.address.parse()?;
     if !address.ip().is_loopback() {
         bail!("native server must listen on loopback");

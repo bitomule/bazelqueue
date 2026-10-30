@@ -1210,8 +1210,11 @@ fn native_unresponsive_orphan_finishes_and_admits_its_successor() {
             .success()
     );
     let mut job = harness
-        .snapshot()
-        .unwrap()
+        .wait(|s| {
+            s.jobs
+                .iter()
+                .any(|job| job.terminal() && job.server.is_some())
+        })
         .jobs
         .into_iter()
         .find(|job| job.server.is_some())
@@ -1316,11 +1319,9 @@ fn native_idle_quarantine_releases_while_guardian_is_paused_and_ignores_late_fin
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(125));
-    assert!(
-        String::from_utf8(output.stdout)
-            .unwrap()
-            .contains("native server verified idle")
-    );
+    let waited = String::from_utf8(output.stdout).unwrap();
+    assert!(waited.contains("native server verified idle"));
+    assert!(!waited.contains("SUCCESS"), "{waited}");
     admitted.write_all(b"F").unwrap();
 }
 
@@ -1352,6 +1353,56 @@ fn retirement_leaf_proof_refuses_a_live_child_without_signalling_it() {
         birth: "stale".into(),
     };
     assert!(!platform::signal_verified(&stale, libc::SIGKILL).unwrap());
+}
+
+#[test]
+#[ignore = "requires BAZELQUEUE_TEST_BAZEL; real Bazel in an isolated workspace"]
+fn native_restart_reprobes_a_responsive_server_instead_of_replaying_retirement() {
+    let mut harness = Harness::new(1);
+    native_workspace(&harness, "");
+    let mut args = native_args(&harness, "build");
+    args.push("//:hello".into());
+    assert!(
+        native_command(&harness, args)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let mut job = harness
+        .wait(|s| {
+            s.jobs
+                .iter()
+                .any(|job| job.terminal() && job.server.is_some())
+        })
+        .jobs[0]
+        .clone();
+    let server = job.server.as_ref().unwrap().clone();
+    harness.daemon.kill().unwrap();
+    harness.daemon.wait().unwrap();
+    fs::remove_file(bazelqueue::summary::location(&harness.paths, &job.request.id).unwrap())
+        .unwrap();
+    job.state = "quarantined".into();
+    job.code = None;
+    job.retiring_server = Some(server.identity.clone());
+    bazelqueue::store::Store::open(&harness.paths)
+        .unwrap()
+        .save(&job)
+        .unwrap();
+    let next = harness.spawn_hold("next");
+    let mut admitted = Harness::accepted(&next);
+    let recovered = harness.snapshot().unwrap();
+    assert_eq!(recovered.jobs[0].state, "finished");
+    assert!(recovered.jobs[0].retiring_server.is_none());
+    assert!(
+        recovered.jobs[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("native server verified idle")
+    );
+    assert!(platform::alive(&server.identity));
+    admitted.write_all(b"F").unwrap();
 }
 
 fn control(harness: &Harness, operation: &str) {

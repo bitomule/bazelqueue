@@ -687,6 +687,31 @@ fn advance_retirement(store: &Store, job: &mut Job) -> Result<()> {
     store.save(job)
 }
 
+/// A previous coordinator's liveness observation is not authority for this one.
+/// Resume its exact stopped process, discard the intent, and require fresh
+/// probes/grace before any new retirement. No saved intent is replayed as kill.
+fn restore_retirements(store: &Store) -> Result<()> {
+    for mut job in store.jobs()? {
+        if let Some(owner) = job.retiring_server.take() {
+            if job.terminal() {
+                store.save(&job)?;
+                continue;
+            }
+            if job
+                .server
+                .as_ref()
+                .is_some_and(|server| server.identity == owner)
+            {
+                platform::signal_verified(&owner, libc::SIGCONT)?;
+            }
+            job.reason =
+                Some("recovery pending: interrupted retirement; rechecking native liveness".into());
+            store.save(&job)?;
+        }
+    }
+    Ok(())
+}
+
 fn notify(reply: &mpsc::Sender<Event>, event: Event) {
     let _ = reply.try_send(event);
 }
@@ -727,6 +752,7 @@ pub async fn run(paths: Paths) -> Result<()> {
         Err(_) => return Ok(()),
     };
     let store = Store::open(&paths)?;
+    restore_retirements(&store)?;
     let mut config = Config::load(&paths)?;
     if fs::symlink_metadata(&paths.socket).is_ok() {
         fs::remove_file(&paths.socket)?;
@@ -1250,12 +1276,7 @@ fn handle(
                     stopped,
                     reason,
                 } => {
-                    if !job.terminal() {
-                        recovery::record_finish(&mut job, code, stopped, reason);
-                    } else if job.code == Some(code) && reason.is_some() {
-                        // The receipt may have won the race with this message.
-                        job.reason = reason;
-                    }
+                    recovery::record_finish(&mut job, code, stopped, reason);
                 }
                 _ => bail!("invalid lifecycle transition from {}", job.state),
             }
@@ -1320,6 +1341,30 @@ mod tests {
         second.child = None;
         second.server = None;
         assert!(other_owner(&first, &[first.clone(), second]));
+    }
+
+    #[test]
+    fn restart_discards_retirement_authority_and_preserves_terminal_diagnoses() {
+        let fixture = Fixture::new();
+        let mut orphan = fixture.job("intent", "quarantined");
+        orphan.retiring_server = Some(orphan.request.owner.clone());
+        fixture.store.save(&orphan).unwrap();
+        let mut done = fixture.job("done", "finished");
+        done.retiring_server = Some(done.request.owner.clone());
+        done.reason = Some("exit=125; unresponsive orphan server exited".into());
+        fixture.store.save(&done).unwrap();
+        restore_retirements(&fixture.store).unwrap();
+        let restored = fixture.stored("intent");
+        assert_eq!(restored.state, "quarantined");
+        assert!(restored.retiring_server.is_none());
+        assert!(
+            restored
+                .reason
+                .unwrap()
+                .contains("rechecking native liveness")
+        );
+        assert_eq!(fixture.stored("done").reason, done.reason);
+        assert!(fixture.stored("done").retiring_server.is_none());
     }
 
     #[tokio::test]

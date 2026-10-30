@@ -718,6 +718,9 @@ pub async fn wait(
             if let Some(mut summary) = summary::load(paths, &id)? {
                 if let Some(job) = job.filter(|job| job.terminal()) {
                     if let Some(code) = job.code {
+                        if code != summary.exit_code {
+                            summary.exit_name = None;
+                        }
                         summary.exit_code = code;
                     }
                     if job.reason.is_some() {
