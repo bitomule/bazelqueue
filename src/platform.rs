@@ -196,6 +196,114 @@ pub fn pressure() -> Option<u32> {
     }
 }
 
+/// Stateful CPU sampling stays at the native boundary; the scheduler receives values only.
+#[derive(Default)]
+pub struct ResourceSampler {
+    system: System,
+    cpu_ready: bool,
+}
+
+impl ResourceSampler {
+    pub fn sample(&mut self, at_ms: u64) -> crate::resources::Sample {
+        self.system.refresh_memory();
+        self.system.refresh_cpu_usage();
+        let total_mib = self.system.total_memory() / 1_048_576;
+        let mut sample = crate::resources::Sample {
+            at_ms,
+            pressure: pressure(),
+            total_mib,
+            available_mib: (total_mib > 0).then(|| self.system.available_memory() / 1_048_576),
+            cpu_busy_percent: self
+                .cpu_ready
+                .then(|| f64::from(self.system.global_cpu_usage())),
+            load_per_cpu: Some(System::load_average().one / self.system.cpus().len().max(1) as f64),
+            ..Default::default()
+        };
+        self.cpu_ready = true;
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(percent) =
+                sysctl_u32(c"kern.memorystatus_level").filter(|value| *value <= 100)
+            {
+                sample.available_mib = Some(total_mib * u64::from(percent) / 100);
+            }
+            let mut stats: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
+            let mut count = libc::HOST_VM_INFO64_COUNT;
+            static HOST: std::sync::OnceLock<libc::mach_port_t> = std::sync::OnceLock::new();
+            #[allow(deprecated)]
+            let host = *HOST.get_or_init(|| unsafe { libc::mach_host_self() });
+            // SAFETY: stats has HOST_VM_INFO64_COUNT integer slots and host is a valid send right.
+            let result = unsafe {
+                libc::host_statistics64(
+                    host,
+                    libc::HOST_VM_INFO64,
+                    (&raw mut stats).cast(),
+                    &raw mut count,
+                )
+            };
+            if result == libc::KERN_SUCCESS && count == libc::HOST_VM_INFO64_COUNT {
+                // SAFETY: sysconf reads a system constant.
+                if let Ok(page) = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }) {
+                    sample.swap_in_bytes = Some(stats.swapins.saturating_mul(page));
+                    sample.swap_out_bytes = Some(stats.swapouts.saturating_mul(page));
+                    sample.compressor_mib =
+                        Some(u64::from(stats.compressor_page_count) * page / 1_048_576);
+                }
+            }
+            let mut swap: libc::xsw_usage = unsafe { std::mem::zeroed() };
+            let mut length = std::mem::size_of_val(&swap);
+            // SAFETY: swap has exactly length bytes; sysctl only writes that buffer.
+            if unsafe {
+                libc::sysctlbyname(
+                    c"vm.swapusage".as_ptr(),
+                    (&raw mut swap).cast(),
+                    &raw mut length,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            } == 0
+                && length == std::mem::size_of_val(&swap)
+            {
+                sample.swap_used_mib = Some(swap.xsu_used / 1_048_576);
+            }
+        }
+        #[cfg(target_os = "linux")]
+        if let Ok(vm) = fs::read_to_string("/proc/vmstat") {
+            let counter = |name: &str| {
+                vm.lines().find_map(|line| {
+                    let (key, value) = line.split_once(' ')?;
+                    (key == name)
+                        .then(|| value.trim().parse::<u64>().ok())
+                        .flatten()
+                })
+            };
+            // SAFETY: sysconf reads a system constant.
+            if let Ok(page) = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }) {
+                sample.swap_in_bytes = counter("pswpin").map(|value| value.saturating_mul(page));
+                sample.swap_out_bytes = counter("pswpout").map(|value| value.saturating_mul(page));
+            }
+        }
+        sample
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn sysctl_u32(name: &std::ffi::CStr) -> Option<u32> {
+    let mut value = 0_u32;
+    let mut length = std::mem::size_of_val(&value);
+    // SAFETY: value has exactly length bytes; name is NUL terminated.
+    let result = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            (&raw mut value).cast(),
+            &raw mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (result == 0 && length == std::mem::size_of_val(&value)).then_some(value)
+}
+
 pub fn process_memory(owners: &[Identity]) -> u64 {
     if owners.is_empty() {
         return 0;

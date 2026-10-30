@@ -185,6 +185,10 @@ pub struct Snapshot {
     pub held: bool,
     pub cpu_capacity: u32,
     pub memory_capacity_mib: u64,
+    #[serde(default)]
+    pub resources: Option<Box<crate::resources::Signals>>,
+    #[serde(default)]
+    pub utilization: Vec<crate::utilization::Hour>,
     pub legacy: Vec<Identity>,
     pub jobs: Vec<Job>,
 }

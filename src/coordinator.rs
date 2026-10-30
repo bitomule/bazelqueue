@@ -3,8 +3,10 @@ use crate::{
     config::{Config, Paths},
     platform,
     protocol::{self, Event, Message, Snapshot},
+    resources::{Monitor, Sample},
     scheduler::{self, Capacity, Pressure},
     store::Store,
+    utilization::{Observation, Utilization},
 };
 use anyhow::{Result, bail};
 use std::{
@@ -12,7 +14,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Stdio,
-    time::Duration,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     net::{UnixListener, UnixStream},
@@ -35,13 +37,40 @@ enum Input {
     },
 }
 
-fn sample_pressure(paths: &Paths) -> Option<u32> {
+fn sample_resources(
+    paths: &Paths,
+    config: &Config,
+    sampler: &mut platform::ResourceSampler,
+    at_ms: u64,
+) -> Sample {
     #[cfg(feature = "test-fixtures")]
-    if let Ok(value) = std::fs::read_to_string(paths.root.join("pressure")) {
-        return value.trim().parse().ok();
+    {
+        if let Ok(value) = fs::read_to_string(paths.root.join("resources.json")) {
+            let mut sample: Sample = serde_json::from_str(&value).unwrap_or_default();
+            sample.at_ms = serde_json::from_str::<serde_json::Value>(&value)
+                .ok()
+                .and_then(|value| value.get("at_ms").and_then(serde_json::Value::as_u64))
+                .unwrap_or(at_ms);
+            return sample;
+        }
+        if let Ok(value) = fs::read_to_string(paths.root.join("pressure")) {
+            let memory = config.memory_capacity_mib
+                + config
+                    .memory_safety_mib
+                    .max(config.memory_capacity_mib / 10);
+            return Sample {
+                at_ms,
+                pressure: value.trim().parse().ok(),
+                total_mib: memory,
+                available_mib: Some(memory),
+                swap_in_bytes: Some(0),
+                swap_out_bytes: Some(0),
+                ..Sample::default()
+            };
+        }
     }
-    let _ = paths;
-    platform::pressure()
+    let _ = (paths, config);
+    sampler.sample(at_ms)
 }
 
 async fn connection(stream: UnixStream, number: u64, send: mpsc::Sender<Input>) -> Result<()> {
@@ -534,10 +563,13 @@ pub async fn run(paths: Paths) -> Result<()> {
     let mut notices: BTreeMap<String, (usize, String)> = BTreeMap::new();
     let mut count = 0_u64;
     let daemon = Daemon::current()?;
-    let mut healthy_samples = 0_u32;
-    let mut pressure = sample_pressure(&paths);
-    let mut last_known = pressure;
-    let mut mode = Pressure::from_samples(pressure, None, 0, config.pressure_recovery_samples);
+    let started = Instant::now();
+    let mut sampler = platform::ResourceSampler::default();
+    let mut monitor = Monitor::default();
+    monitor.update(sample_resources(&paths, &config, &mut sampler, 0), &config);
+    let mut usage = store.utilization()?;
+    let mut last_flush = Instant::now();
+    let mut resident = HashMap::<String, u64>::new();
     let mut tick = 0;
     let mut probing = std::collections::HashSet::new();
     let mut deferred: HashMap<String, tokio::time::Instant> = HashMap::new();
@@ -578,7 +610,7 @@ pub async fn run(paths: Paths) -> Result<()> {
                                 Err(error)=>{notify(&reply,Event::Error {message:error.to_string()});continue;},
                             }
                         }
-                        let result=handle(&paths,&store,&config,&daemon,pressure,mode,connection,message,&reply,&mut sessions,&mut connection_ids);
+                        let result=handle(&paths,&store,&config,&daemon,&monitor,&usage,connection,message,&reply,&mut sessions,&mut connection_ids);
                         if let Err(error)=result {notify(&reply,Event::Error {message:error.to_string()});}
                     }
                     None=>break,
@@ -589,18 +621,26 @@ pub async fn run(paths: Paths) -> Result<()> {
                 tick+=1;
                 if tick%4==0 {
                     if let Ok(updated)=Config::load(&paths) {config=updated;}
-                    pressure=sample_pressure(&paths);
-                    if pressure==Some(1) {healthy_samples=healthy_samples.saturating_add(1);} else {healthy_samples=0;}
-                    mode=Pressure::from_samples(pressure,last_known,healthy_samples,config.pressure_recovery_samples);
-                    if pressure.is_some() {last_known=pressure;}
+                    let sample=sample_resources(&paths, &config, &mut sampler, started.elapsed().as_millis() as u64);
+                    let sampled_jobs=store.jobs()?;
+                    crate::resources::refresh_resident(&sample,&mut resident,||sampled_jobs.iter().filter(|job|job.holds_build_capacity()).map(|job| {
+                        let owners:Vec<_>=job.child.iter().cloned().chain(job.server.iter().map(|server|server.identity.clone())).collect();
+                        (job.request.id.clone(),platform::process_memory(&owners))
+                    }).collect());
+                    monitor.update(sample, &config);
                 }
 
             }
             _=tokio::signal::ctrl_c()=>break,
         }
         if reschedule {
+            let mode = monitor.mode();
             settle_receipts(&paths, &store)?;
             let mut jobs = store.jobs()?;
+            let previous_budgets: HashMap<_, _> = jobs
+                .iter()
+                .map(|job| (job.sequence, job.request.budget.clone()))
+                .collect();
             for job in &mut jobs {
                 if job.terminal() {
                     continue;
@@ -611,13 +651,9 @@ pub async fn run(paths: Paths) -> Result<()> {
                         || job.request.budget.memory_mib > config.memory_capacity_mib)
                 {
                     job.request.budget = config.budget(!job.request.budget.exclusive);
-                    store.save(job)?;
                 }
-                if job.state == "queued"
-                    && job.metered()
-                    && scheduler::fit_queued(&mut job.request.budget, &config, mode)
-                {
-                    store.save(job)?;
+                if job.state == "queued" && job.metered() {
+                    scheduler::fit_queued(&mut job.request.budget, &config, mode);
                 }
                 if !platform::alive(&job.request.owner) {
                     if job.state == "queued" {
@@ -690,6 +726,10 @@ pub async fn run(paths: Paths) -> Result<()> {
                     && legacy_owners(&store, &config).map_or(true, |owners| !owners.is_empty()),
                 drained: store.drained()?,
                 run_memory_mib: platform::process_memory(&run_owners),
+                new_memory_mib: monitor
+                    .headroom(&config)
+                    .saturating_sub(crate::resources::promised_growth(&jobs, &resident)),
+                reason: monitor.signals.reason.clone(),
             };
             let limit = scheduler::admission_budget(&config, mode);
             let remaining_memory = limit.memory_mib.saturating_sub(capacity.run_memory_mib);
@@ -702,7 +742,6 @@ pub async fn run(paths: Paths) -> Result<()> {
                 }) {
                     job.request.budget.memory_mib =
                         job.request.budget.memory_mib.min(remaining_memory);
-                    store.save(job)?;
                 }
             }
             let candidates: Vec<_> = jobs
@@ -716,9 +755,19 @@ pub async fn run(paths: Paths) -> Result<()> {
                 })
                 .cloned()
                 .collect();
-            if let Some(job) =
-                scheduler::raise_lone_job(&candidates, &mut jobs, &limit, remaining_memory)
-            {
+            let mut profiled = candidates;
+            scheduler::allocate_queued(&mut profiled, &config, &capacity);
+            for updated in profiled.iter().filter(|job| job.state == "queued") {
+                if let Some(job) = jobs.iter_mut().find(|job| job.sequence == updated.sequence)
+                    && job.request.budget != updated.request.budget
+                {
+                    job.request.budget = updated.request.budget.clone();
+                }
+            }
+            for job in jobs.iter().filter(|job| {
+                job.state == "queued"
+                    && previous_budgets.get(&job.sequence) != Some(&job.request.budget)
+            }) {
                 store.save(job)?;
             }
             let candidates: Vec<_> = jobs
@@ -783,8 +832,35 @@ pub async fn run(paths: Paths) -> Result<()> {
                 }
             }
             store.trim()?;
+            usage.observe(Observation {
+                monotonic_ms: started.elapsed().as_millis() as u64,
+                unix_ms: SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64,
+                busy: jobs
+                    .iter()
+                    .any(|job| job.metered() && job.state == "running"),
+                reserved_cpu_percent: jobs
+                    .iter()
+                    .filter(|job| job.holds_build_capacity())
+                    .map(|job| f64::from(job.request.budget.cpu))
+                    .sum::<f64>()
+                    * 100.0
+                    / f64::from(config.cpu_capacity),
+                reserved_memory_percent: jobs
+                    .iter()
+                    .filter(|job| job.holds_build_capacity())
+                    .map(|job| job.request.budget.memory_mib as f64)
+                    .sum::<f64>()
+                    * 100.0
+                    / config.memory_capacity_mib as f64,
+                host_cpu_percent: monitor.signals.sample.cpu_busy_percent,
+            });
+            if last_flush.elapsed() >= Duration::from_secs(1) {
+                store.save_utilization(&usage)?;
+                last_flush = Instant::now();
+            }
         }
     }
+    store.save_utilization(&usage)?;
     fs::remove_file(&paths.socket)?;
     Ok(())
 }
@@ -795,8 +871,8 @@ fn handle(
     store: &Store,
     config: &Config,
     daemon: &Daemon,
-    pressure: Option<u32>,
-    mode: Pressure,
+    monitor: &Monitor,
+    usage: &Utilization,
     connection: u64,
     message: Message,
     reply: &mpsc::Sender<Event>,
@@ -852,19 +928,26 @@ fn handle(
                         version: daemon.version.clone(),
                         executable: daemon.executable.clone(),
                         drained: store.drained()?,
-                        pressure: pressure.map_or("unavailable".into(), |value| {
-                            match value {
-                                1 => "normal",
-                                2 => "warning",
-                                _ => "critical",
-                            }
-                            .into()
-                        }),
-                        constrained: (mode == Pressure::Constrained)
+                        pressure: monitor.signals.sample.pressure.map_or(
+                            "unavailable".into(),
+                            |value| {
+                                match value {
+                                    1 => "normal",
+                                    2 => "warning",
+                                    _ => "critical",
+                                }
+                                .into()
+                            },
+                        ),
+                        constrained: (monitor.mode() == Pressure::Constrained)
                             .then(|| config.constrained_budget()),
-                        held: mode == Pressure::Held,
+                        held: monitor.mode() == Pressure::Held,
                         cpu_capacity: config.cpu_capacity,
                         memory_capacity_mib: config.memory_capacity_mib,
+                        resources: Some(Box::new(monitor.signals.clone())),
+                        utilization: usage.visible_hours(
+                            SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64,
+                        ),
                         legacy: legacy_owners(store, config)?,
                         jobs: {
                             let jobs = store.jobs()?;
