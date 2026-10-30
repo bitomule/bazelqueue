@@ -89,8 +89,13 @@ waits. In a terminal, every position change is shown as it happens.
 | `bazel run` finishes compiling | The target runs through Bazel's generated script. Compilation capacity is released; the target's process footprint remains tracked. |
 
 Running builds never lose their reservation because a timer expired. Uncertain
-native work stays quarantined until an authenticated, nonblocking server probe
-verifies idleness. [Architecture and recovery](docs/architecture.md).
+native work stays quarantined while recovery verifies its processes and server.
+Idle or terminated work releases its reservation and gets a final exit code and
+reason. A recorded orphan server that no longer answers its liveness RPC is
+stopped only after identity and ownership checks and a stopped-process check
+proves it has no children. A server with children is resumed and keeps its
+reservation. Busy servers keep their reservation. Recovery never
+retries the build. [Architecture and recovery](docs/architecture.md).
 
 ## Using it from an agent
 
@@ -150,6 +155,13 @@ bazelqueue status --json     # Inspect it from a script or agent
 | `bazelqueue doctor` | Check the backend, telemetry and recovery state. |
 | `bazelqueue config show` | Print the effective configuration. |
 | `bazelqueue exec -- /absolute/backend ARGS...` | Queue a backend explicitly without PATH interception. |
+
+`status` also shows the ten most recent failed requests, with their exit code
+and reason. `status --json` includes those details in the retained job records.
+Recovered requests with no known result end with exit 125; `bazelqueue wait ID`
+reports that failure even if the guardian could not save a summary. Explicit
+disk-full evidence is shown as such; an environmental exit code alone is not
+treated as proof that the disk was full.
 
 <details>
 <summary>Upgrades and removal</summary>
@@ -285,15 +297,16 @@ nested calls are rejected to avoid waiting behind their own parent.
 
 ## Tested against actual process failures
 
-For **v0.1.1**, the validation suite passed **65 checks**:
+The current validation suite covers these contracts. Executed native results
+and any limitations are recorded in the validation evidence below.
 
 | Layer | Checks | Evidence covered |
 |---|---:|---|
-| Unit | 67 | Scheduling, resource samples, utilization, framing, configuration and persistent drain state. |
-| Process E2E | 29 | FIFO/rank, warning parallelism, pressure/swap recovery, cancellation, restart, raw argument bytes and retained executables. |
+| Unit | 88 | Scheduling, injected recovery/liveness, resource samples, utilization, framing, configuration and persistent drain state. |
+| Process E2E | 31 | FIFO/rank, warning parallelism, pressure/swap recovery, cancellation, restart, raw argument bytes, retained executables and failure diagnostics. |
 | Installation | 17 | Interrupted setup, rollback, upgrades, original backups and shell activation. |
 | Interactive PTY | 3 | Terminal input, Ctrl-C and Ctrl-Z/fg in a real shell. |
-| Native Bazel | 9 × 2 versions | Parallel held actions under warning, guardian loss, authenticated recovery and run handoff. |
+| Native Bazel | 12 per version | Parallel held actions under warning, paused guardians, interrupted retirement, orphan recovery and run handoff; matrix: 8.4.2 and 9.2.0. |
 
 We deleted the original frontend executable during a live build and restarted
 the coordinator; retained ownership and native run handoff still completed.

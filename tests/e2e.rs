@@ -35,6 +35,14 @@ struct Seen {
     groups: Vec<Identity>,
     daemons: Vec<Identity>,
 }
+
+/// A failed assertion must not leave this test's native server/guardian stopped.
+struct ResumeOnDrop(Identity);
+impl Drop for ResumeOnDrop {
+    fn drop(&mut self) {
+        let _ = platform::signal_verified(&self.0, libc::SIGCONT);
+    }
+}
 impl Seen {
     fn record(&mut self, snapshot: &Snapshot) {
         fn add(list: &mut Vec<Identity>, identity: &Identity) {
@@ -365,6 +373,54 @@ fn guardian_death_quarantines_a_still_running_child() {
     running.write_all(b"F").unwrap();
     let mut next = Harness::accepted(&second);
     next.write_all(b"F").unwrap();
+}
+
+#[test]
+fn a_failed_backend_is_terminal_and_visible_in_status() {
+    let harness = Harness::new(1);
+    let output = harness
+        .command()
+        .args([
+            "exec",
+            "--",
+            env!("CARGO_BIN_EXE_fixture-backend"),
+            "exit",
+            "36",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(36));
+    let output = harness.command().arg("status").output().unwrap();
+    let status = String::from_utf8(output.stdout).unwrap();
+    assert!(status.contains("failed exec exit=36"), "{status}");
+    assert!(status.contains("backend exited with code 36"), "{status}");
+    let store = bazelqueue::store::Store::open(&harness.paths).unwrap();
+    let mut job = store
+        .jobs()
+        .unwrap()
+        .into_iter()
+        .find(|job| job.code == Some(36))
+        .unwrap();
+    assert!(
+        bazelqueue::summary::load(&harness.paths, &job.request.id)
+            .unwrap()
+            .unwrap()
+            .reason
+            .is_none()
+    );
+    job.reason = Some("disk full writing completion receipt".into());
+    store.save(&job).unwrap();
+    let waited = harness
+        .command()
+        .args(["wait", &job.request.id])
+        .output()
+        .unwrap();
+    assert_eq!(waited.status.code(), Some(36));
+    assert!(
+        String::from_utf8(waited.stdout)
+            .unwrap()
+            .contains("disk full writing completion receipt")
+    );
 }
 
 #[test]
@@ -1109,6 +1165,7 @@ fn native_guardian_loss_holds_capacity_until_client_and_server_finish() {
     let job = &snapshot.jobs[0];
     let owner = job.request.owner.pid;
     let server = job.server.as_ref().unwrap().clone();
+    let _resume = ResumeOnDrop(server.identity.clone());
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1136,6 +1193,222 @@ fn native_guardian_loss_holds_capacity_until_client_and_server_finish() {
             .block_on(bazelqueue::native_server::idle(&server))
             .unwrap()
     );
+}
+
+#[test]
+#[ignore = "requires BAZELQUEUE_TEST_BAZEL; real Bazel in an isolated workspace"]
+fn native_unresponsive_orphan_finishes_and_admits_its_successor() {
+    let mut harness = Harness::new(1);
+    native_workspace(&harness, "");
+    let mut args = native_args(&harness, "build");
+    args.push("//:hello".into());
+    assert!(
+        native_command(&harness, args)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let mut job = harness
+        .wait(|s| {
+            s.jobs
+                .iter()
+                .any(|job| job.terminal() && job.server.is_some())
+        })
+        .jobs
+        .into_iter()
+        .find(|job| job.server.is_some())
+        .unwrap();
+    let server = job.server.as_ref().unwrap().clone();
+    platform::signal_pid(server.identity.pid, libc::SIGSTOP);
+    let _resume = ResumeOnDrop(server.identity.clone());
+    // Simulate guardian death after client completion, before its durable result.
+    fs::remove_file(bazelqueue::summary::location(&harness.paths, &job.request.id).unwrap())
+        .unwrap();
+    job.state = "quarantined".into();
+    job.code = None;
+    job.reason = None;
+    bazelqueue::store::Store::open(&harness.paths)
+        .unwrap()
+        .save(&job)
+        .unwrap();
+    let successor = harness.spawn_hold("successor");
+    let mut admitted = Harness::accepted(&successor);
+    let recovered = harness.snapshot().unwrap();
+    assert_eq!(recovered.jobs[0].state, "finished");
+    assert_eq!(recovered.jobs[0].code, Some(125));
+    assert!(
+        recovered.jobs[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("unresponsive orphan server")
+    );
+    assert!(!platform::alive(&server.identity));
+    let output = harness.command().arg("status").output().unwrap();
+    let status = String::from_utf8(output.stdout).unwrap();
+    assert!(status.contains("failed build exit=125"), "{status}");
+    assert!(status.contains("unresponsive orphan server"));
+    let output = harness
+        .command()
+        .args(["wait", &job.request.id])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(125));
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("unresponsive orphan server")
+    );
+    admitted.write_all(b"F").unwrap();
+}
+
+#[test]
+#[ignore = "requires BAZELQUEUE_TEST_BAZEL; real Bazel in an isolated workspace"]
+fn native_idle_quarantine_releases_while_guardian_is_paused_and_ignores_late_finish() {
+    let mut harness = Harness::new(1);
+    let socket = harness.root.path().join("action.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    native_workspace(
+        &harness,
+        &format!(
+            "genrule(name=\"held\",outs=[\"held.txt\"],tags=[\"local\"],cmd=\"{} hold {}; echo done > $@\")",
+            env!("CARGO_BIN_EXE_fixture-backend"),
+            socket.display()
+        ),
+    );
+    let mut args = native_args(&harness, "build");
+    args.push("//:held".into());
+    let child = native_command(&harness, args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(
+            fs::File::create(harness.root.path().join("native.log")).unwrap(),
+        ))
+        .spawn()
+        .unwrap();
+    harness.children.push(child);
+    let mut action = Harness::accepted(&listener);
+    let mut job = harness
+        .wait(|s| s.jobs.iter().any(|job| job.state == "running"))
+        .jobs[0]
+        .clone();
+    platform::signal_pid(job.request.owner.pid, libc::SIGSTOP);
+    let _resume = ResumeOnDrop(job.request.owner.clone());
+    job.state = "quarantined".into();
+    bazelqueue::store::Store::open(&harness.paths)
+        .unwrap()
+        .save(&job)
+        .unwrap();
+    let next = harness.spawn_hold("next");
+    harness.wait(|s| s.jobs.iter().any(|job| job.state == "queued"));
+    assert!(next.accept().is_err());
+    assert!(platform::alive(job.child.as_ref().unwrap()));
+    action.write_all(b"F").unwrap();
+    let mut admitted = Harness::accepted(&next);
+    assert!(platform::alive(&job.request.owner));
+    let recovered = harness.snapshot().unwrap();
+    assert_eq!(recovered.jobs[0].state, "finished");
+    assert_eq!(recovered.jobs[0].code, Some(125));
+    platform::signal_pid(job.request.owner.pid, libc::SIGCONT);
+    assert!(harness.children[0].wait().unwrap().success());
+    let late = harness.snapshot().unwrap();
+    assert_eq!(late.jobs[0].state, "finished");
+    assert_eq!(late.jobs[0].code, Some(125));
+    let output = harness
+        .command()
+        .args(["wait", &job.request.id])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(125));
+    let waited = String::from_utf8(output.stdout).unwrap();
+    assert!(waited.contains("native server verified idle"));
+    assert!(!waited.contains("SUCCESS"), "{waited}");
+    admitted.write_all(b"F").unwrap();
+}
+
+#[test]
+fn retirement_leaf_proof_refuses_a_live_child_without_signalling_it() {
+    // Unix socket paths have a small native bound; TMPDIR may be a long
+    // worktree path. Keep this isolated process fixture beside the harnesses.
+    let root = tempfile::Builder::new()
+        .prefix("bql-")
+        .tempdir_in("/private/tmp")
+        .unwrap();
+    let listener = UnixListener::bind(root.path().join("child.sock")).unwrap();
+    let mut parent = Command::new(env!("CARGO_BIN_EXE_fixture-backend"))
+        .arg("tree-hold")
+        .arg(listener.local_addr().unwrap().as_pathname().unwrap())
+        .spawn()
+        .unwrap();
+    let mut child = Harness::accepted(&listener);
+    let identity = platform::identity(parent.id()).unwrap();
+    let _resume = ResumeOnDrop(identity.clone());
+    platform::signal_verified(&identity, libc::SIGSTOP).unwrap();
+    loop {
+        if let Some(leaf) = platform::stopped_leaf(&identity).unwrap() {
+            assert!(!leaf);
+            break;
+        }
+        std::thread::yield_now();
+    }
+    child.write_all(b"F").unwrap();
+    platform::signal_verified(&identity, libc::SIGCONT).unwrap();
+    assert!(parent.wait().unwrap().success());
+    let stale = platform::Identity {
+        pid: std::process::id(),
+        birth: "stale".into(),
+    };
+    assert!(!platform::signal_verified(&stale, libc::SIGKILL).unwrap());
+}
+
+#[test]
+#[ignore = "requires BAZELQUEUE_TEST_BAZEL; real Bazel in an isolated workspace"]
+fn native_restart_reprobes_a_responsive_server_instead_of_replaying_retirement() {
+    let mut harness = Harness::new(1);
+    native_workspace(&harness, "");
+    let mut args = native_args(&harness, "build");
+    args.push("//:hello".into());
+    assert!(
+        native_command(&harness, args)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let mut job = harness
+        .wait(|s| {
+            s.jobs
+                .iter()
+                .any(|job| job.terminal() && job.server.is_some())
+        })
+        .jobs[0]
+        .clone();
+    let server = job.server.as_ref().unwrap().clone();
+    harness.daemon.kill().unwrap();
+    harness.daemon.wait().unwrap();
+    fs::remove_file(bazelqueue::summary::location(&harness.paths, &job.request.id).unwrap())
+        .unwrap();
+    job.state = "quarantined".into();
+    job.code = None;
+    job.retiring_server = Some(server.identity.clone());
+    bazelqueue::store::Store::open(&harness.paths)
+        .unwrap()
+        .save(&job)
+        .unwrap();
+    let next = harness.spawn_hold("next");
+    let mut admitted = Harness::accepted(&next);
+    let recovered = harness.snapshot().unwrap();
+    assert_eq!(recovered.jobs[0].state, "finished");
+    assert!(recovered.jobs[0].retiring_server.is_none());
+    assert!(
+        recovered.jobs[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("native server verified idle")
+    );
+    assert!(platform::alive(&server.identity));
+    admitted.write_all(b"F").unwrap();
 }
 
 fn control(harness: &Harness, operation: &str) {

@@ -6,6 +6,7 @@ pub mod install;
 pub mod native_server;
 pub mod platform;
 pub mod protocol;
+pub mod recovery;
 pub mod resources;
 pub mod runner;
 pub mod scheduler;

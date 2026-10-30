@@ -130,3 +130,66 @@ at the warning level throughout (87–100 % of samples, in both versions). The
 `--jobs=64` runs never reached critical and kept at least 21 % free; the
 v0.1.8 runs reached critical in 35 % of one warm run's samples and 18 % free.
 Swap grew 0.4–2.1 GiB per run in both.
+
+## Orphan quarantine and disk-full completion (30 October 2026)
+
+The live 0.1.8 coordinator (84301) held request
+`96533-1793367982921034000` in quarantine with 2 CPU / 2304 MiB. That consumed
+the entire warning budget, with requests queued and no managed build running.
+Its guardian 96533 and client 78122 were gone; server 78014 remained. Its output
+base's command log explicitly reported `No space left on device` during
+dependency extraction. Neither a completion receipt nor a saved summary existed.
+This does not establish why the guardian died.
+
+The same recovery path remained on freshly fetched main at f7d3cf6. A direct
+nonblocking `info server_pid release` query on the affected output base reported
+`Killed non-responsive server process (pid=78014)`. Bazel replaced that server;
+the coordinator then released the quarantine and status showed request
+`42696-1793368547389235000` running. No queue cancellation was sent. The cache
+volume had 10 GiB available at inspection time.
+
+The regression suite injects native liveness outcomes, guardian/client state,
+elapsed recovery time and ENOSPC without filling any real volume. It checks
+successor admission after recovery, preservation of real execution reservations,
+late results and reconnects, PID/birth mismatches, authenticated busy versus hung
+RPCs, and completion delivery when receipt storage fails. Native contracts use
+held actions and isolated HOME/state/output bases; they retain capacity for a
+busy client, admit a successor after verified idleness even with a paused
+guardian, and verify a stopped leaf server's exit before admitting its successor.
+A child-process barrier checks that leaf verification refuses a nonleaf without
+signalling its child. Execution and ablation results are recorded with
+the PR and the committed validation ledger.
+
+The final ordinary `make all` run passed 88 unit tests, 31 process E2E tests,
+17 installation transaction tests and 3 PTY tests. The locked production release
+build and `musts validate` also passed. Two isolated ablations removed orphan
+retirement and restored receipt-before-message short-circuiting, respectively:
+both regressions passed before removal, failed without the fix, and passed after
+restoration. Three review rounds fixed seven findings; a separate directed
+verifier found none remaining. A further deterministic receipt interleaving
+failed with a pending recovery reason masking the saved disk-full diagnosis;
+preferring the completion summary and removing provisional waiting text fixed
+it. The review was orchestrated manually because this session had no workflow
+tool.
+
+All three new native contracts passed on both Bazel 8.4.2 and 9.2.0: recovery with
+a paused living guardian, fresh liveness checks after interrupted retirement,
+and termination/exit verification of an unresponsive orphan before successor
+admission. The complete local native runs were **11/12 on 8.4.2** and **10/12 on
+9.2.0**, so they are not represented as clean matrix runs. On 8.4.2, the existing
+parallel-action contract hit its 30-second action-start watchdog; an unchanged
+diagnostic copy subsequently passed (33.06 seconds total), as did a copy of main
+9f2bf16 (20.39 seconds total). On 9.2.0, the existing idle-probe contract found no
+recorded server after a successful build, and the hooks/parallel contract hit the
+action-start watchdog. The isolated idle-probe diagnostic then passed (21.97
+seconds). Neither deadlines nor assertions were relaxed. Native preparation's
+15-second probe and exclusive fallback are unchanged from main; these observations
+do not by themselves establish the cause of the intermittent failures. CI's
+complete native matrix remains a separate release gate.
+
+The ordinary suite also exposed an intermittent failure in the existing hot
+migration/restart contract: one run timed out with no coordinator snapshot
+(30/31 process E2E passed). Its diagnostic run passed unchanged in 1.46 seconds;
+the corresponding main contract passed in 1.60 seconds. Two earlier complete
+ordinary runs passed 31/31. The failed run is retained rather than counted as a
+clean pass, and no timeout or assertion was weakened.

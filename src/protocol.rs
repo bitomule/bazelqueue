@@ -59,7 +59,7 @@ pub struct Estimate {
     pub memory_mib: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Request {
     pub id: String,
     pub owner: Identity,
@@ -99,7 +99,7 @@ impl Request {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NativeServer {
     pub identity: Identity,
     pub output_base: String,
@@ -134,6 +134,8 @@ pub enum Message {
     Finish {
         code: i32,
         stopped: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     Control {
         operation: String,
@@ -141,7 +143,7 @@ pub enum Message {
     },
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Job {
     pub sequence: u64,
     pub request: Request,
@@ -150,6 +152,10 @@ pub struct Job {
     pub server: Option<NativeServer>,
     pub code: Option<i32>,
     pub cancel: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retiring_server: Option<Identity>,
 }
 
 impl Job {

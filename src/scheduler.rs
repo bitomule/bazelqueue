@@ -376,6 +376,8 @@ mod tests {
             server: None,
             code: None,
             cancel: false,
+            reason: None,
+            retiring_server: None,
         }
     }
     fn capacity() -> Capacity {

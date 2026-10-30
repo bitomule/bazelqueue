@@ -313,8 +313,32 @@ fn show(event: Event, json: bool) -> Result<()> {
                 "unmetered".to_owned()
             };
             println!(
-                "{} {} {} {} {}",
-                job.request.id, job.state, job.request.command, reservation, job.request.lane
+                "{} {} {} {} {}{}",
+                job.request.id,
+                job.state,
+                job.request.command,
+                reservation,
+                job.request.lane,
+                job.reason
+                    .as_ref()
+                    .map(|reason| format!(" | {reason}"))
+                    .unwrap_or_default()
+            );
+        }
+        for job in snapshot
+            .jobs
+            .iter()
+            .rev()
+            .filter(|job| job.terminal() && job.code.is_some_and(|code| code != 0))
+            .take(10)
+        {
+            println!(
+                "{} failed {} exit={} {} | {}",
+                job.request.id,
+                job.request.command,
+                job.code.unwrap_or(125),
+                job.request.lane,
+                job.reason.as_deref().unwrap_or("backend failed")
             );
         }
     }

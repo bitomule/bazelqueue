@@ -56,6 +56,8 @@ impl Store {
             server: None,
             code: None,
             cancel: false,
+            reason: None,
+            retiring_server: None,
         };
         self.connection.execute(
             "INSERT INTO jobs(id,data) VALUES(?1,?2)",

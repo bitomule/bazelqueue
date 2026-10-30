@@ -80,6 +80,120 @@ pub fn current_identity() -> Result<Identity> {
 pub fn alive(owner: &Identity) -> bool {
     identity(owner.pid).as_ref() == Some(owner)
 }
+
+/// Signal only the process whose birth identity was recorded, never a PID
+/// supplied by stale server metadata. Completion still requires observing exit.
+pub fn signal_verified(owner: &Identity, signal: i32) -> Result<bool> {
+    if !alive(owner) {
+        return Ok(false);
+    }
+    if unsafe { libc::kill(owner.pid as i32, signal) } != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(true)
+}
+
+#[cfg(test)]
+pub fn fixture_fifo(path: &Path) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+    // SAFETY: path is NUL-terminated; the private test directory owns this FIFO.
+    if unsafe { libc::mkfifo(path.as_ptr(), 0o600) } != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+/// Match only the recorded process, not a global scan of unrelated JVMs.
+pub fn server_matches(server: &crate::protocol::NativeServer) -> bool {
+    let mut system = System::new();
+    let pid = Pid::from_u32(server.identity.pid);
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing()
+            .with_cmd(UpdateKind::Always)
+            .with_user(UpdateKind::Always),
+    );
+    let Some(process) = system.process(pid) else {
+        return false;
+    };
+    process.user_id().is_some_and(|user| **user == uid())
+        && process.cmd().iter().any(|arg| {
+            arg == std::ffi::OsStr::new(&format!("--workspace_directory={}", server.workspace))
+        })
+        && process.cmd().iter().any(|arg| {
+            arg == std::ffi::OsStr::new(&format!("--output_base={}", server.output_base))
+        })
+        && alive(&server.identity)
+}
+
+/// None: still stopping. Some(false): a child exists; no descendant may be
+/// signalled from a process-table snapshot. Some(true): the stopped server is
+/// a leaf and cannot fork between this proof and its identity-checked signal.
+pub fn stopped_leaf(owner: &Identity) -> Result<Option<bool>> {
+    if !alive(owner) {
+        bail!("server identity changed during retirement");
+    }
+    if !stopped(owner.pid) {
+        return Ok(None);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut child: libc::pid_t = 0;
+        // SAFETY: libproc receives exactly one writable pid_t. We only ask
+        // whether any child exists, so a nonempty/truncated list means refuse.
+        let (count, error) = unsafe {
+            *libc::__error() = 0;
+            let count = libc::proc_listchildpids(
+                owner.pid as i32,
+                (&raw mut child).cast(),
+                std::mem::size_of_val(&child) as i32,
+            );
+            (count, *libc::__error())
+        };
+        if count < 0 || error != 0 {
+            bail!("native child enumeration unavailable");
+        }
+        if !alive(owner) || !stopped(owner.pid) {
+            bail!("server changed during leaf verification");
+        }
+        Ok(Some(count == 0))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let tasks = || -> Result<Vec<std::path::PathBuf>> {
+            let mut tasks = fs::read_dir(format!("/proc/{}/task", owner.pid))?
+                .map(|entry| entry.map(|entry| entry.path()))
+                .collect::<io::Result<Vec<_>>>()?;
+            tasks.sort();
+            Ok(tasks)
+        };
+        let before = tasks()?;
+        for task in &before {
+            let stat = fs::read_to_string(task.join("stat"))?;
+            let state = stat
+                .rsplit_once(')')
+                .context("invalid thread status")?
+                .1
+                .trim_start();
+            if !state.starts_with('T') {
+                return Ok(None);
+            }
+            if !fs::read_to_string(task.join("children"))?.trim().is_empty() {
+                return Ok(Some(false));
+            }
+        }
+        if before != tasks()? || !alive(owner) {
+            return Ok(None);
+        }
+        Ok(Some(true))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        bail!("native leaf verification unavailable");
+    }
+}
 pub fn uid() -> u32 {
     unsafe { libc::geteuid() }
 }

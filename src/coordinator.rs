@@ -2,7 +2,8 @@
 use crate::{
     config::{Config, Paths},
     platform,
-    protocol::{self, Event, Message, Snapshot},
+    protocol::{self, Event, Job, Message, Snapshot},
+    recovery::{self, Decision, NativeState, Observation as RecoveryObservation},
     resources::{Monitor, Sample},
     scheduler::{self, Capacity, Pressure},
     store::Store,
@@ -32,8 +33,9 @@ enum Input {
         connection: u64,
     },
     Recovered {
-        id: String,
-        idle: bool,
+        observed: Box<Job>,
+        connection: Option<u64>,
+        native: NativeState,
     },
 }
 
@@ -492,8 +494,16 @@ fn settle_receipts(paths: &Paths, store: &Store) -> Result<()> {
                 let Some((code, stopped)) = outcome else {
                     continue;
                 };
-                job.code = Some(code);
-                job.state = if stopped { "finished" } else { "quarantined" }.into();
+                let reason = crate::summary::load(paths, &id)
+                    .ok()
+                    .flatten()
+                    .and_then(|summary| summary.reason)
+                    .or_else(|| {
+                        let prior = job.reason.as_deref()?.split("; recovery pending:").next()?;
+                        (!prior.is_empty() && !prior.starts_with("recovery pending:"))
+                            .then(|| prior.to_owned())
+                    });
+                recovery::record_finish(job, code, stopped, reason);
                 store.save(job)?;
             }
             Some(job) => {
@@ -507,6 +517,200 @@ fn settle_receipts(paths: &Paths, store: &Store) -> Result<()> {
             None => {}
         }
         let _ = fs::remove_file(receipt);
+    }
+    Ok(())
+}
+
+async fn observe_native(job: &Job) -> NativeState {
+    if job.request.command == "exec" {
+        return NativeState::Gone;
+    }
+    // The known server does not depend on a global process scan: an unrelated
+    // Java process with inaccessible arguments must not strand this request.
+    if let Some(server) = job.server.as_ref() {
+        return crate::native_server::probe_known(server).await;
+    }
+    let Ok(servers) = platform::bazel_servers(&job.request.workspace) else {
+        return NativeState::Unknown;
+    };
+    if servers.is_empty() {
+        return NativeState::Gone;
+    }
+    for server in &servers {
+        match crate::native_server::probe(server).await {
+            NativeState::Idle => {}
+            NativeState::Unresponsive => return NativeState::Unknown,
+            state => return state,
+        }
+    }
+    NativeState::Idle
+}
+
+async fn apply_recovery(
+    paths: &Paths,
+    store: &Store,
+    observed: &Job,
+    connection: Option<u64>,
+    current_connection: Option<u64>,
+    native: NativeState,
+    unresponsive_for: Duration,
+) -> Result<()> {
+    let jobs = store.jobs()?;
+    let Some(mut job) = jobs
+        .iter()
+        .find(|job| job.request.id == observed.request.id)
+        .cloned()
+    else {
+        return Ok(());
+    };
+    if !recovery::current(observed, &job, connection, current_connection) {
+        return Ok(());
+    }
+    let observation = RecoveryObservation {
+        owner_alive: platform::alive(&job.request.owner),
+        child_alive: job.child.as_ref().is_some_and(platform::alive)
+            || job.retiring_server.as_ref().is_some_and(platform::alive),
+        native,
+        unresponsive_for,
+        other_owner: other_owner(&job, &jobs),
+    };
+    match recovery::decide(&job, observation) {
+        Decision::Finish(reason) => {
+            if job.code.is_none()
+                && let Ok(Some(summary)) = crate::summary::load(paths, &job.request.id)
+            {
+                job.code = Some(summary.exit_code);
+                job.reason = summary.reason;
+            }
+            recovery::finish(&mut job, reason);
+        }
+        Decision::Wait(reason) => {
+            let previous = job
+                .reason
+                .as_deref()
+                .unwrap_or("")
+                .split("; recovery pending:")
+                .next()
+                .unwrap_or("");
+            job.reason = Some(
+                if previous.is_empty() || previous.starts_with("recovery pending:") {
+                    format!("recovery pending: {reason}")
+                } else {
+                    format!("{previous}; recovery pending: {reason}")
+                },
+            );
+        }
+        Decision::StopServer => {
+            let server = job
+                .server
+                .as_ref()
+                .expect("recovery requires a recorded server");
+            if crate::native_server::can_retire(server)
+                .await
+                .unwrap_or(false)
+            {
+                job.retiring_server = Some(server.identity.clone());
+                job.reason = Some(
+                    "recovery pending: retiring unresponsive orphan server; verifying leaf".into(),
+                );
+            } else {
+                return Ok(());
+            }
+        }
+    }
+    store.save(&job)
+}
+
+fn other_owner(job: &Job, jobs: &[Job]) -> bool {
+    jobs.iter().any(|other| {
+        if other.request.id == job.request.id
+            || !(other.holds_capacity() || other.state == "run_phase")
+            || !other.request.shares_lane(&job.request)
+        {
+            return false;
+        }
+        let same_server = other
+            .server
+            .as_ref()
+            .zip(job.server.as_ref())
+            .is_some_and(|(a, b)| a.identity == b.identity && a.output_base == b.output_base);
+        !(other.state == "quarantined"
+            && same_server
+            && !platform::alive(&other.request.owner)
+            && !other.child.as_ref().is_some_and(platform::alive)
+            && !other.retiring_server.as_ref().is_some_and(platform::alive))
+    })
+}
+
+/// A persisted intent always repeats ownership and leaf verification, including
+/// after restart. It is never an unconditional permission to kill a PID list.
+fn advance_retirement(store: &Store, job: &mut Job) -> Result<()> {
+    let Some(owner) = job.retiring_server.clone() else {
+        return Ok(());
+    };
+    if !platform::alive(&owner) {
+        return Ok(());
+    }
+    let protected = platform::alive(&job.request.owner)
+        || job.child.as_ref().is_some_and(platform::alive)
+        || other_owner(job, &store.jobs()?);
+    let matches = job.server.as_ref().is_some_and(|server| {
+        server.identity == owner && crate::native_server::retirement_matches(server)
+    });
+    if !protected && matches {
+        platform::signal_verified(&owner, libc::SIGSTOP)?;
+        match platform::stopped_leaf(&owner) {
+            Ok(None) => return Ok(()),
+            Ok(Some(true))
+                if !other_owner(job, &store.jobs()?)
+                    && job
+                        .server
+                        .as_ref()
+                        .is_some_and(crate::native_server::retirement_matches) =>
+            {
+                // The actor has granted no new work while checking the leaf.
+                // Re-read all current owners before the final signal.
+                platform::signal_verified(&owner, libc::SIGKILL)?;
+                job.reason = Some(
+                    "recovery pending: stopped unresponsive orphan server; verifying exit".into(),
+                );
+                return store.save(job);
+            }
+            _ => {}
+        }
+    }
+    // Children or uncertain native evidence: resume the exact old process,
+    // preserve its reservation, and never signal any descendant.
+    platform::signal_verified(&owner, libc::SIGCONT)?;
+    job.retiring_server = None;
+    job.reason = Some(
+        "recovery pending: server has children or ownership is uncertain; retirement refused"
+            .into(),
+    );
+    store.save(job)
+}
+
+/// A previous coordinator's liveness observation is not authority for this one.
+/// Resume its exact stopped process, discard the intent, and require fresh
+/// probes/grace before any new retirement. No saved intent is replayed as kill.
+fn restore_retirements(store: &Store) -> Result<()> {
+    for mut job in store.jobs()? {
+        if let Some(owner) = job.retiring_server.take() {
+            if job.terminal() {
+                store.save(&job)?;
+                continue;
+            }
+            if job
+                .server
+                .as_ref()
+                .is_some_and(|server| server.identity == owner)
+            {
+                platform::signal_verified(&owner, libc::SIGCONT)?;
+            }
+            job.reason =
+                Some("recovery pending: interrupted retirement; rechecking native liveness".into());
+            store.save(&job)?;
+        }
     }
     Ok(())
 }
@@ -551,6 +755,7 @@ pub async fn run(paths: Paths) -> Result<()> {
         Err(_) => return Ok(()),
     };
     let store = Store::open(&paths)?;
+    restore_retirements(&store)?;
     let mut config = Config::load(&paths)?;
     if fs::symlink_metadata(&paths.socket).is_ok() {
         fs::remove_file(&paths.socket)?;
@@ -572,6 +777,7 @@ pub async fn run(paths: Paths) -> Result<()> {
     let mut resident = HashMap::<String, u64>::new();
     let mut tick = 0;
     let mut probing = std::collections::HashSet::new();
+    let mut unresponsive: HashMap<String, tokio::time::Instant> = HashMap::new();
     let mut deferred: HashMap<String, tokio::time::Instant> = HashMap::new();
     loop {
         let mut reschedule = false;
@@ -588,9 +794,13 @@ pub async fn run(paths: Paths) -> Result<()> {
                         if let Some(id)=connection_ids.remove(&connection)
                             && sessions.get(&id).is_some_and(|(current,_)|*current==connection) {sessions.remove(&id);notices.remove(&id);}
                     }
-                    Some(Input::Recovered {id,idle})=>{
-                        probing.remove(&id);
-                        if idle&& let Some(mut job)=store.jobs()?.into_iter().find(|job|job.request.id==id && job.state=="quarantined" && !platform::alive(&job.request.owner)) {job.state="cancelled".into();store.save(&job)?;}
+                    Some(Input::Recovered {observed,connection,native})=>{
+                        let id=&observed.request.id;
+                        probing.remove(id);
+                        let elapsed=if native==NativeState::Unresponsive {
+                            unresponsive.entry(id.clone()).or_insert_with(tokio::time::Instant::now).elapsed()
+                        }else {unresponsive.remove(id);Duration::ZERO};
+                        apply_recovery(&paths,&store,&observed,connection,sessions.get(id).map(|(connection,_)|*connection),native,elapsed).await?;
                     }
                     Some(Input::Message {connection,message:Message::Defer,reply})=> {
                         if let Some(id)=connection_ids.get(&connection).filter(|id|sessions.get(*id).is_some_and(|(current,_)|*current==connection))&& let Some(mut job)=store.jobs()?.into_iter().find(|job|&job.request.id==id && job.state=="preparing") {job.state="queued".into();store.save(&job)?;deferred.insert(id.clone(),tokio::time::Instant::now()+Duration::from_secs(1));notify(&reply,Event::Queued {position:store.jobs()?.iter().filter(|other|other.state=="queued" && other.sequence<=job.sequence).count(),reason:"native server is busy".into()});}
@@ -656,8 +866,15 @@ pub async fn run(paths: Paths) -> Result<()> {
                     scheduler::fit_queued(&mut job.request.budget, &config, mode);
                 }
                 if !platform::alive(&job.request.owner) {
+                    let retiring = job.retiring_server.is_some();
+                    advance_retirement(&store, job)?;
+                    if retiring && job.retiring_server.is_none() {
+                        unresponsive.remove(&job.request.id);
+                    }
                     if job.state == "queued" {
                         job.state = "cancelled".into();
+                        job.code = Some(130);
+                        job.reason = Some("guardian disappeared while queued".into());
                     } else if job.state == "run_phase" {
                         if let Some(child) =
                             job.child.as_ref().filter(|child| platform::alive(child))
@@ -671,13 +888,14 @@ pub async fn run(paths: Paths) -> Result<()> {
                         .as_ref()
                         .is_some_and(|server| platform::alive(&server.identity))
                         || job.child.as_ref().is_some_and(platform::alive)
+                        || job.retiring_server.as_ref().is_some_and(platform::alive)
                     {
                         job.state = "quarantined".into();
                     } else if ((job.state == "starting" || job.state == "preparing")
                         && job.child.is_none())
                         || job.request.command == "exec"
                     {
-                        job.state = "cancelled".into();
+                        recovery::finish(job, "guardian disappeared; owned execution ended");
                     } else {
                         job.state = "quarantined".into();
                     }
@@ -685,7 +903,6 @@ pub async fn run(paths: Paths) -> Result<()> {
                 }
                 if tick % 4 == 0
                     && job.state == "quarantined"
-                    && !platform::alive(&job.request.owner)
                     && job
                         .child
                         .as_ref()
@@ -693,25 +910,24 @@ pub async fn run(paths: Paths) -> Result<()> {
                     && !probing.contains(&job.request.id)
                 {
                     let id = job.request.id.clone();
-                    let workspace = job.request.workspace.clone();
+                    let observed = Box::new(job.clone());
+                    let connection = sessions.get(&id).map(|(connection, _)| *connection);
                     probing.insert(id.clone());
                     let sender = tx.clone();
                     tokio::spawn(async move {
-                        let outcome = async {
-                            let servers = platform::bazel_servers(&workspace)?;
-                            for server in servers {
-                                if !crate::native_server::idle(&server).await? {
-                                    return Ok::<_, anyhow::Error>(false);
-                                }
-                            }
-                            Ok(true)
-                        };
-                        let idle = tokio::time::timeout(Duration::from_secs(4), outcome)
-                            .await
-                            .ok()
-                            .and_then(Result::ok)
-                            .unwrap_or(false);
-                        let _ = sender.send(Input::Recovered { id, idle }).await;
+                        let native = tokio::time::timeout(
+                            Duration::from_secs(10),
+                            observe_native(&observed),
+                        )
+                        .await
+                        .unwrap_or(NativeState::Unknown);
+                        let _ = sender
+                            .send(Input::Recovered {
+                                observed,
+                                connection,
+                                native,
+                            })
+                            .await;
                     });
                 }
             }
@@ -1058,9 +1274,12 @@ fn handle(
                     job.child = Some(child);
                     job.state = "run_phase".into();
                 }
-                Message::Finish { code, stopped } => {
-                    job.code = Some(code);
-                    job.state = if stopped { "finished" } else { "quarantined" }.into();
+                Message::Finish {
+                    code,
+                    stopped,
+                    reason,
+                } => {
+                    recovery::record_finish(&mut job, code, stopped, reason);
                 }
                 _ => bail!("invalid lifecycle transition from {}", job.state),
             }
@@ -1099,6 +1318,156 @@ fn legacy_owners(store: &Store, config: &Config) -> Result<Vec<platform::Identit
 mod tests {
     use super::*;
     use crate::protocol::{Budget, Job, Request};
+
+    #[test]
+    fn duplicate_orphans_do_not_protect_the_same_server_but_live_owners_do() {
+        let fixture = Fixture::new();
+        let mut first = fixture.job("first", "quarantined");
+        let server = crate::protocol::NativeServer {
+            identity: platform::Identity {
+                pid: 1,
+                birth: "old".into(),
+            },
+            output_base: "lane".into(),
+            workspace: "workspace".into(),
+            version: "8.4.2".into(),
+        };
+        first.server = Some(server.clone());
+        let mut second = fixture.job("second", "quarantined");
+        second.server = Some(server);
+        assert!(!other_owner(&first, &[first.clone(), second.clone()]));
+        second.request.owner = platform::current_identity().unwrap();
+        assert!(other_owner(&first, &[first.clone(), second.clone()]));
+        second.request.owner = first.request.owner.clone();
+        second.child = Some(platform::current_identity().unwrap());
+        assert!(other_owner(&first, &[first.clone(), second.clone()]));
+        second.child = None;
+        second.server = None;
+        assert!(other_owner(&first, &[first.clone(), second]));
+    }
+
+    #[test]
+    fn restart_discards_retirement_authority_and_preserves_terminal_diagnoses() {
+        let fixture = Fixture::new();
+        let mut orphan = fixture.job("intent", "quarantined");
+        orphan.retiring_server = Some(orphan.request.owner.clone());
+        fixture.store.save(&orphan).unwrap();
+        let mut done = fixture.job("done", "finished");
+        done.retiring_server = Some(done.request.owner.clone());
+        done.reason = Some("exit=125; unresponsive orphan server exited".into());
+        fixture.store.save(&done).unwrap();
+        restore_retirements(&fixture.store).unwrap();
+        let restored = fixture.stored("intent");
+        assert_eq!(restored.state, "quarantined");
+        assert!(restored.retiring_server.is_none());
+        assert!(
+            restored
+                .reason
+                .unwrap()
+                .contains("rechecking native liveness")
+        );
+        assert_eq!(fixture.stored("done").reason, done.reason);
+        assert!(fixture.stored("done").retiring_server.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_recovered_orphan_is_durably_failed_and_duplicate_results_do_not_change_it() {
+        let fixture = Fixture::new();
+        let observed = fixture.job("orphan", "quarantined");
+        apply_recovery(
+            &fixture.paths,
+            &fixture.store,
+            &observed,
+            None,
+            None,
+            NativeState::Gone,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        let done = fixture.stored("orphan");
+        assert_eq!(done.state, "finished");
+        assert_eq!(done.code, Some(125));
+        assert!(!done.holds_capacity());
+        apply_recovery(
+            &fixture.paths,
+            &fixture.store,
+            &observed,
+            None,
+            None,
+            NativeState::Gone,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        assert_eq!(fixture.stored("orphan"), done);
+    }
+
+    #[tokio::test]
+    async fn a_reconnected_guardian_or_changed_job_rejects_late_recovery() {
+        let fixture = Fixture::new();
+        let observed = fixture.job("late", "quarantined");
+        apply_recovery(
+            &fixture.paths,
+            &fixture.store,
+            &observed,
+            Some(1),
+            Some(2),
+            NativeState::Idle,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        assert_eq!(fixture.stored("late"), observed);
+        let mut changed = observed.clone();
+        changed.child = Some(platform::current_identity().unwrap());
+        fixture.store.save(&changed).unwrap();
+        apply_recovery(
+            &fixture.paths,
+            &fixture.store,
+            &observed,
+            None,
+            None,
+            NativeState::Idle,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        assert_eq!(fixture.stored("late"), changed);
+    }
+
+    #[tokio::test]
+    async fn a_persisted_completion_summary_supplies_the_known_exit_after_guardian_loss() {
+        let fixture = Fixture::new();
+        let observed = fixture.job("summary", "quarantined");
+        let summary = crate::summary::Summary {
+            id: "summary".into(),
+            command: "build".into(),
+            workspace: "workspace".into(),
+            exit_code: 36,
+            exit_name: None,
+            reason: Some("disk full (No space left on device)".into()),
+            queued_ms: 0,
+            ran_ms: 0,
+            targets_reported: false,
+            failures: vec![],
+        };
+        crate::summary::save(&fixture.paths, &summary).unwrap();
+        apply_recovery(
+            &fixture.paths,
+            &fixture.store,
+            &observed,
+            None,
+            None,
+            NativeState::Idle,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        let done = fixture.stored("summary");
+        assert_eq!(done.code, Some(36));
+        assert!(done.reason.unwrap().contains("disk full"));
+    }
 
     struct Fixture {
         _root: tempfile::TempDir,
@@ -1167,6 +1536,52 @@ mod tests {
         }
         fn settle(&self) {
             settle_receipts(&self.paths, &self.store).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_late_receipt_replaces_pending_recovery_with_the_completion_diagnosis() {
+        for (code, pending, saved, expected) in [
+            (
+                36,
+                "recovery pending: native server is busy",
+                Some("disk full"),
+                Some("disk full"),
+            ),
+            (0, "recovery pending: native server is busy", None, None),
+            (
+                36,
+                "disk full; recovery pending: native server is busy",
+                None,
+                Some("disk full"),
+            ),
+        ] {
+            let fixture = Fixture::new();
+            let mut job = fixture.job("late-receipt", "quarantined");
+            job.reason = Some(pending.into());
+            fixture.store.save(&job).unwrap();
+            crate::summary::save(
+                &fixture.paths,
+                &crate::summary::Summary {
+                    id: job.request.id.clone(),
+                    command: "build".into(),
+                    workspace: "workspace".into(),
+                    exit_code: code,
+                    exit_name: None,
+                    reason: saved.map(str::to_owned),
+                    queued_ms: 0,
+                    ran_ms: 0,
+                    targets_reported: false,
+                    failures: vec![],
+                },
+            )
+            .unwrap();
+            fixture.write_receipt(&job.request.id, code, true);
+            fixture.settle();
+            let done = fixture.stored(&job.request.id);
+            assert_eq!(done.state, "finished");
+            assert_eq!(done.code, Some(code));
+            assert_eq!(done.reason.as_deref(), expected);
         }
     }
 

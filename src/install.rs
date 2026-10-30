@@ -789,9 +789,18 @@ pub async fn doctor(paths: &Paths) -> Result<()> {
             .filter(|job| job.state == "quarantined")
             .count();
         if count > 0 {
-            bail!(
-                "{count} quarantined reservations; supported servers are probed automatically without restart"
-            );
+            for job in snapshot
+                .jobs
+                .iter()
+                .filter(|job| job.state == "quarantined")
+            {
+                println!(
+                    "{}: {}",
+                    job.request.id,
+                    job.reason.as_deref().unwrap_or("native recovery pending")
+                );
+            }
+            bail!("{count} quarantined reservations; native recovery is running automatically");
         }
     }
     Ok(())
