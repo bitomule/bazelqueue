@@ -49,16 +49,25 @@ struct Cookie {
     cookie: String,
 }
 
-fn server_info(server: &NativeServer) -> Result<ServerInfo> {
-    if !matches!(server.version.as_str(), "8.4.2" | "9.2.0" | "unverified") {
-        bail!("unsupported native server protocol");
-    }
-    let path = Path::new(&server.output_base).join("server/server_info.rawproto");
+fn read_info(base: &str) -> Result<ServerInfo> {
+    let path = Path::new(base).join("server/server_info.rawproto");
     let file = fs::symlink_metadata(&path)?;
     if !file.is_file() || file.uid() != platform::uid() || file.len() > 65536 {
         bail!("native server identity file is not trustworthy");
     }
     let info = ServerInfo::decode(fs::read(path)?.as_slice())?;
+    let address: SocketAddr = info.address.parse()?;
+    if !address.ip().is_loopback() {
+        bail!("native server must listen on loopback");
+    }
+    Ok(info)
+}
+
+fn server_info(server: &NativeServer) -> Result<ServerInfo> {
+    if !matches!(server.version.as_str(), "8.4.2" | "9.2.0" | "unverified") {
+        bail!("unsupported native server protocol");
+    }
+    let info = read_info(&server.output_base)?;
     if info.pid <= 0 || platform::identity(info.pid as u32).as_ref() != Some(&server.identity) {
         bail!("native server identity changed");
     }
@@ -67,6 +76,40 @@ fn server_info(server: &NativeServer) -> Result<ServerInfo> {
         bail!("native server must listen on loopback");
     }
     Ok(info)
+}
+
+/// Follow only metadata for this known output base. A replacement may prove
+/// idleness, but it is never eligible for the old request's retirement.
+pub async fn probe_known(server: &NativeServer) -> NativeState {
+    if platform::alive(&server.identity) {
+        return probe(server).await;
+    }
+    let info = match read_info(&server.output_base) {
+        Ok(info) => info,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return NativeState::Gone;
+        }
+        _ => return NativeState::Unknown,
+    };
+    let Some(identity) = platform::identity(info.pid as u32) else {
+        return NativeState::Gone;
+    };
+    let replacement = NativeServer {
+        identity,
+        version: "unverified".into(),
+        ..server.clone()
+    };
+    if !platform::server_matches(&replacement) {
+        return NativeState::Unknown;
+    }
+    match probe(&replacement).await {
+        NativeState::Unresponsive => NativeState::Unknown,
+        state => state,
+    }
 }
 
 /// Ping is independent of Bazel's command lock. A busy command must never be
@@ -128,24 +171,23 @@ pub async fn probe(server: &NativeServer) -> NativeState {
 
 /// Called only after the coordinator has rechecked the orphan, its child,
 /// connection and all other lane owners. Do not target a rediscovered server.
-pub async fn unresponsive_tree(server: &NativeServer) -> Result<Option<Vec<platform::Identity>>> {
+pub async fn can_retire(server: &NativeServer) -> Result<bool> {
     if !matches!(server.version.as_str(), "8.4.2" | "9.2.0") {
-        return Ok(None);
+        return Ok(false);
     }
-    if !platform::bazel_servers(&server.workspace)?
-        .iter()
-        .any(|current| {
-            current.identity == server.identity && current.output_base == server.output_base
-        })
-    {
-        return Ok(None);
+    if !platform::server_matches(server) {
+        return Ok(false);
     }
     if probe(server).await != NativeState::Unresponsive {
-        return Ok(None);
+        return Ok(false);
     }
     // Re-read the metadata immediately before the identity-checked signal.
     server_info(server)?;
-    Ok(Some(platform::process_tree(&server.identity)?))
+    Ok(true)
+}
+
+pub fn retirement_matches(server: &NativeServer) -> bool {
+    server_info(server).is_ok() && platform::server_matches(server)
 }
 
 pub async fn idle(server: &NativeServer) -> Result<bool> {

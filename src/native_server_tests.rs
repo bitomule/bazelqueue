@@ -187,7 +187,7 @@ async fn reused_pid_and_changed_metadata_never_prove_idleness() {
     let (_root, mut server, _, task) = fixture(Mode::Idle).await;
     server.identity.birth = "reused".into();
     assert_eq!(probe(&server).await, NativeState::Unknown);
-    assert!(unresponsive_tree(&server).await.unwrap().is_none());
+    assert!(!can_retire(&server).await.unwrap());
     task.abort();
 }
 

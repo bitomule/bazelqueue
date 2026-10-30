@@ -83,7 +83,7 @@ waits. In a terminal, every position change is shown as it happens.
 | Situation | Queue behavior |
 |---|---|
 | Several agents use different worktrees | CPU and memory reservations determine which calls fit. Same-server calls keep FIFO order. |
-| Memory pressure rises | At warning, one build at a time runs with a reduced budget; at critical, new work waits. Healthy samples restore full capacity. |
+| Memory pressure rises | Warning keeps full capacity. Critical pressure or active swap thrashing admits one smaller build if real memory headroom permits; the next safe sample restores full admission. |
 | The caller disappears | Its owned backend is cancelled. Capacity is retained until completion or verified recovery. |
 | The coordinator restarts | Guardians reconnect without submitting the command a second time. |
 | `bazel run` finishes compiling | The target runs through Bazel's generated script. Compilation capacity is released; the target's process footprint remains tracked. |
@@ -92,8 +92,9 @@ Running builds never lose their reservation because a timer expired. Uncertain
 native work stays quarantined while recovery verifies its processes and server.
 Idle or terminated work releases its reservation and gets a final exit code and
 reason. A recorded orphan server that no longer answers its liveness RPC is
-stopped only after identity and ownership checks; its captured process tree stays
-accounted for until it exits. Busy servers keep their reservation. Recovery never
+stopped only after identity and ownership checks and a stopped-process check
+proves it has no children. A server with children is resumed and keeps its
+reservation. Busy servers keep their reservation. Recovery never
 retries the build. [Architecture and recovery](docs/architecture.md).
 
 ## Using it from an agent
@@ -208,15 +209,20 @@ ${EDITOR:-vi} ~/.local/state/bazelqueue/config.toml
 
 | Setting | Controls |
 |---|---|
-| `max_builds` | Concurrent invocations that have no estimate yet. Default: **1**, with parallel actions inside that build. |
+| `max_builds` | Target concurrency for large managed builds. Default: **2** (bounded by machine size); smaller estimated runs can share remaining capacity. |
 | `cpu_capacity` | The total CPU token budget shared by admitted builds. |
 | `memory_capacity_mib` | The total estimated invocation memory budget. |
 | `jobs` | The cap on actions Bazel keeps in flight, cache checks included. Default: **64**; the reserved CPUs, not this, limit what runs locally. |
 | `worker_instances` | Worker and multiplex-worker instance caps. |
+| `memory_safety_mib` | Free-memory margin, at least 5% of RAM. Default: **1024 MiB**. |
+| `swap_thrashing_mib_per_min` | Threshold that both swap-in and swap-out rates must exceed to reduce admission. Default: **64 MiB/min** each. |
 
 A lone supported build can receive the wide profile. Concurrent managed builds
 use smaller reservations; their budgets remain fixed once execution starts.
 Proven stricter direct numeric caller limits are preserved.
+New configurations leave one CPU free and reserve total RAM minus the safety
+margin. Existing configuration values are preserved on upgrade; set
+`max_builds = 2` to share a previously serial configuration.
 
 **Cache checks do not wait for CPUs.** Bazel counts every action against
 `--jobs`, including the ones it only looks up and downloads from the disk or
@@ -240,20 +246,32 @@ built (`--test_filter`, `--test_arg`, `--test_output`, `--test_env`,
 one history. A run with no history of its own reserves 1.25 times the median of
 the latest nine runs of the same command in the same repository. Estimated runs
 share the machine by CPU and memory instead of taking a `max_builds` slot, so
-several small test runs execute side by side. A run that kept most of its
-reservation busy asks for the whole machine next time, and a run in a repository
-with no history of its command keeps the share above. History lives in
+several small test runs execute side by side. A saturated run requests more next
+time, but a full-machine estimate is divided when other lanes are waiting.
+A run in a repository with no history of its command receives the same fair
+share. History lives in
 `estimates.json` in the state directory.
 
-**We kept the default at one build after measuring our workload.** We ran sixteen
-fresh Clang compilations on an 11-core M3 Pro with 18 GiB RAM: one admitted build
-took **22.179 s**; two took **22.105 s** and raised memory pressure to warning.
-These were single samples, which do not demonstrate a meaningful throughput gain.
-[Method, results and calibration command](docs/validation.md).
+**Warning is not a reason to slow a build down.** Under native warning pressure,
+sixteen fresh Clang compilations took **16.14 / 16.45 s** with 8 CPU / 9 GiB,
+versus **25.31 / 24.86 s** with 2 CPU / 2304 MiB. These are workload-specific
+measurements, not a throughput guarantee. [Method and admission research](docs/admission-measurements.md).
 
-Memory values are estimates, not hard OS quotas. A large action can exceed its
-prediction; pressure stops subsequent admission. Calibrate with your workload
-before increasing concurrency.
+Memory values are estimates, not hard OS quotas. Each admission checks real
+available memory after the safety margin and growth still promised to active
+reservations. Critical pressure or bidirectional swap thrashing reduces new
+managed work to one smaller build; opaque invocations wait. A high CPU load
+also holds new admission. Recovery takes effect on the next sample, even under
+warning. Existing grants remain unchanged. The legacy `pressure_recovery_samples`
+setting is accepted but no longer delays recovery.
+
+`bazelqueue status` and `status --json` show hourly utilization for the latest
+24 hours: observed time, time with a build running, reserved CPU and memory, and
+actual host CPU use. Parallel builds count once in busy time. Percentages use
+observed time; partial hours and restart/sampling gaps are not presented as full
+hours of idle time. Reserved capacity includes preparation and quarantine; host
+CPU includes other applications. Metrics begin with this version and survive
+coordinator restarts.
 
 | Environment variable | Use |
 |---|---|
@@ -283,11 +301,11 @@ For **v0.1.1**, the validation suite passed **65 checks**:
 
 | Layer | Checks | Evidence covered |
 |---|---:|---|
-| Unit | 14 | Scheduling, framing, configuration and persistent drain state. |
-| Process E2E | 17 | FIFO/rank, pressure, cancellation, restart, raw argument bytes and retained executables. |
+| Unit | 67 | Scheduling, resource samples, utilization, framing, configuration and persistent drain state. |
+| Process E2E | 29 | FIFO/rank, warning parallelism, pressure/swap recovery, cancellation, restart, raw argument bytes and retained executables. |
 | Installation | 17 | Interrupted setup, rollback, upgrades, original backups and shell activation. |
 | Interactive PTY | 3 | Terminal input, Ctrl-C and Ctrl-Z/fg in a real shell. |
-| Native Bazel | 7 × 2 versions | Parallel held actions, guardian loss, authenticated recovery and run handoff. |
+| Native Bazel | 9 × 2 versions | Parallel held actions under warning, guardian loss, authenticated recovery and run handoff. |
 
 We deleted the original frontend executable during a live build and restarted
 the coordinator; retained ownership and native run handoff still completed.

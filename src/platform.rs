@@ -92,6 +92,97 @@ pub fn signal_verified(owner: &Identity, signal: i32) -> Result<bool> {
     }
     Ok(true)
 }
+
+/// Match only the recorded process, not a global scan of unrelated JVMs.
+pub fn server_matches(server: &crate::protocol::NativeServer) -> bool {
+    let mut system = System::new();
+    let pid = Pid::from_u32(server.identity.pid);
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing()
+            .with_cmd(UpdateKind::Always)
+            .with_user(UpdateKind::Always),
+    );
+    let Some(process) = system.process(pid) else {
+        return false;
+    };
+    process.user_id().is_some_and(|user| **user == uid())
+        && process.cmd().iter().any(|arg| {
+            arg == std::ffi::OsStr::new(&format!("--workspace_directory={}", server.workspace))
+        })
+        && process.cmd().iter().any(|arg| {
+            arg == std::ffi::OsStr::new(&format!("--output_base={}", server.output_base))
+        })
+        && alive(&server.identity)
+}
+
+/// None: still stopping. Some(false): a child exists; no descendant may be
+/// signalled from a process-table snapshot. Some(true): the stopped server is
+/// a leaf and cannot fork between this proof and its identity-checked signal.
+pub fn stopped_leaf(owner: &Identity) -> Result<Option<bool>> {
+    if !alive(owner) {
+        bail!("server identity changed during retirement");
+    }
+    if !stopped(owner.pid) {
+        return Ok(None);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut child: libc::pid_t = 0;
+        // SAFETY: libproc receives exactly one writable pid_t. We only ask
+        // whether any child exists, so a nonempty/truncated list means refuse.
+        let (count, error) = unsafe {
+            *libc::__error() = 0;
+            let count = libc::proc_listchildpids(
+                owner.pid as i32,
+                (&raw mut child).cast(),
+                std::mem::size_of_val(&child) as i32,
+            );
+            (count, *libc::__error())
+        };
+        if count < 0 || error != 0 {
+            bail!("native child enumeration unavailable");
+        }
+        if !alive(owner) || !stopped(owner.pid) {
+            bail!("server changed during leaf verification");
+        }
+        Ok(Some(count == 0))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let tasks = || -> Result<Vec<std::path::PathBuf>> {
+            let mut tasks = fs::read_dir(format!("/proc/{}/task", owner.pid))?
+                .map(|entry| entry.map(|entry| entry.path()))
+                .collect::<io::Result<Vec<_>>>()?;
+            tasks.sort();
+            Ok(tasks)
+        };
+        let before = tasks()?;
+        for task in &before {
+            let stat = fs::read_to_string(task.join("stat"))?;
+            let state = stat
+                .rsplit_once(')')
+                .context("invalid thread status")?
+                .1
+                .trim_start();
+            if !state.starts_with('T') {
+                return Ok(None);
+            }
+            if !fs::read_to_string(task.join("children"))?.trim().is_empty() {
+                return Ok(Some(false));
+            }
+        }
+        if before != tasks()? || !alive(owner) {
+            return Ok(None);
+        }
+        Ok(Some(true))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        bail!("native leaf verification unavailable");
+    }
+}
 pub fn uid() -> u32 {
     unsafe { libc::geteuid() }
 }
@@ -208,6 +299,114 @@ pub fn pressure() -> Option<u32> {
     }
 }
 
+/// Stateful CPU sampling stays at the native boundary; the scheduler receives values only.
+#[derive(Default)]
+pub struct ResourceSampler {
+    system: System,
+    cpu_ready: bool,
+}
+
+impl ResourceSampler {
+    pub fn sample(&mut self, at_ms: u64) -> crate::resources::Sample {
+        self.system.refresh_memory();
+        self.system.refresh_cpu_usage();
+        let total_mib = self.system.total_memory() / 1_048_576;
+        let mut sample = crate::resources::Sample {
+            at_ms,
+            pressure: pressure(),
+            total_mib,
+            available_mib: (total_mib > 0).then(|| self.system.available_memory() / 1_048_576),
+            cpu_busy_percent: self
+                .cpu_ready
+                .then(|| f64::from(self.system.global_cpu_usage())),
+            load_per_cpu: Some(System::load_average().one / self.system.cpus().len().max(1) as f64),
+            ..Default::default()
+        };
+        self.cpu_ready = true;
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(percent) =
+                sysctl_u32(c"kern.memorystatus_level").filter(|value| *value <= 100)
+            {
+                sample.available_mib = Some(total_mib * u64::from(percent) / 100);
+            }
+            let mut stats: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
+            let mut count = libc::HOST_VM_INFO64_COUNT;
+            static HOST: std::sync::OnceLock<libc::mach_port_t> = std::sync::OnceLock::new();
+            #[allow(deprecated)]
+            let host = *HOST.get_or_init(|| unsafe { libc::mach_host_self() });
+            // SAFETY: stats has HOST_VM_INFO64_COUNT integer slots and host is a valid send right.
+            let result = unsafe {
+                libc::host_statistics64(
+                    host,
+                    libc::HOST_VM_INFO64,
+                    (&raw mut stats).cast(),
+                    &raw mut count,
+                )
+            };
+            if result == libc::KERN_SUCCESS && count == libc::HOST_VM_INFO64_COUNT {
+                // SAFETY: sysconf reads a system constant.
+                if let Ok(page) = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }) {
+                    sample.swap_in_bytes = Some(stats.swapins.saturating_mul(page));
+                    sample.swap_out_bytes = Some(stats.swapouts.saturating_mul(page));
+                    sample.compressor_mib =
+                        Some(u64::from(stats.compressor_page_count) * page / 1_048_576);
+                }
+            }
+            let mut swap: libc::xsw_usage = unsafe { std::mem::zeroed() };
+            let mut length = std::mem::size_of_val(&swap);
+            // SAFETY: swap has exactly length bytes; sysctl only writes that buffer.
+            if unsafe {
+                libc::sysctlbyname(
+                    c"vm.swapusage".as_ptr(),
+                    (&raw mut swap).cast(),
+                    &raw mut length,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            } == 0
+                && length == std::mem::size_of_val(&swap)
+            {
+                sample.swap_used_mib = Some(swap.xsu_used / 1_048_576);
+            }
+        }
+        #[cfg(target_os = "linux")]
+        if let Ok(vm) = fs::read_to_string("/proc/vmstat") {
+            let counter = |name: &str| {
+                vm.lines().find_map(|line| {
+                    let (key, value) = line.split_once(' ')?;
+                    (key == name)
+                        .then(|| value.trim().parse::<u64>().ok())
+                        .flatten()
+                })
+            };
+            // SAFETY: sysconf reads a system constant.
+            if let Ok(page) = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }) {
+                sample.swap_in_bytes = counter("pswpin").map(|value| value.saturating_mul(page));
+                sample.swap_out_bytes = counter("pswpout").map(|value| value.saturating_mul(page));
+            }
+        }
+        sample
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn sysctl_u32(name: &std::ffi::CStr) -> Option<u32> {
+    let mut value = 0_u32;
+    let mut length = std::mem::size_of_val(&value);
+    // SAFETY: value has exactly length bytes; name is NUL terminated.
+    let result = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            (&raw mut value).cast(),
+            &raw mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (result == 0 && length == std::mem::size_of_val(&value)).then_some(value)
+}
+
 pub fn process_memory(owners: &[Identity]) -> u64 {
     if owners.is_empty() {
         return 0;
@@ -241,34 +440,6 @@ pub fn process_memory(owners: &[Identity]) -> u64 {
         .filter_map(|pid| system.process(*pid))
         .map(|process| process.memory() / 1024 / 1024)
         .sum()
-}
-
-/// Capture birth identities before stopping an orphan server, so descendants
-/// cannot outlive it unnoticed even across a coordinator restart.
-pub fn process_tree(root: &Identity) -> Result<Vec<Identity>> {
-    let mut system = System::new();
-    system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
-    if !alive(root) || system.process(Pid::from_u32(root.pid)).is_none() {
-        bail!("native server process changed during recovery");
-    }
-    let mut tree = vec![root.clone()];
-    loop {
-        let before = tree.len();
-        for (pid, process) in system.processes() {
-            if process
-                .parent()
-                .is_some_and(|parent| tree.iter().any(|owner| owner.pid == parent.as_u32()))
-                && !tree.iter().any(|owner| owner.pid == pid.as_u32())
-                && let Some(owner) = identity(pid.as_u32())
-            {
-                tree.push(owner);
-            }
-        }
-        if tree.len() == before {
-            break;
-        }
-    }
-    Ok(tree)
 }
 
 /// CPU seconds a process tree has used: every live member's own time plus what

@@ -35,6 +35,14 @@ struct Seen {
     groups: Vec<Identity>,
     daemons: Vec<Identity>,
 }
+
+/// A failed assertion must not leave this test's native server/guardian stopped.
+struct ResumeOnDrop(Identity);
+impl Drop for ResumeOnDrop {
+    fn drop(&mut self) {
+        let _ = platform::signal_verified(&self.0, libc::SIGCONT);
+    }
+}
 impl Seen {
     fn record(&mut self, snapshot: &Snapshot) {
         fn add(list: &mut Vec<Identity>, identity: &Identity) {
@@ -386,6 +394,33 @@ fn a_failed_backend_is_terminal_and_visible_in_status() {
     let status = String::from_utf8(output.stdout).unwrap();
     assert!(status.contains("failed exec exit=36"), "{status}");
     assert!(status.contains("backend exited with code 36"), "{status}");
+    let store = bazelqueue::store::Store::open(&harness.paths).unwrap();
+    let mut job = store
+        .jobs()
+        .unwrap()
+        .into_iter()
+        .find(|job| job.code == Some(36))
+        .unwrap();
+    assert!(
+        bazelqueue::summary::load(&harness.paths, &job.request.id)
+            .unwrap()
+            .unwrap()
+            .reason
+            .is_none()
+    );
+    job.reason = Some("disk full writing completion receipt".into());
+    store.save(&job).unwrap();
+    let waited = harness
+        .command()
+        .args(["wait", &job.request.id])
+        .output()
+        .unwrap();
+    assert_eq!(waited.status.code(), Some(36));
+    assert!(
+        String::from_utf8(waited.stdout)
+            .unwrap()
+            .contains("disk full writing completion receipt")
+    );
 }
 
 #[test]
@@ -446,7 +481,7 @@ fn stdout_stdin_and_non_utf8_arguments_are_preserved() {
 fn critical_memory_pressure_blocks_and_recovery_resumes_the_queue() {
     let mut harness = Harness::new(1);
     fs::write(harness.paths.root.join("pressure"), "4").unwrap();
-    harness.wait(|s| s.pressure == "critical" && s.held);
+    harness.wait(|s| s.pressure == "critical" && s.constrained.is_some());
     let listener = harness.spawn_hold("a");
     harness.wait(|s| s.jobs.iter().any(|job| job.state == "queued"));
     fs::write(harness.paths.root.join("pressure"), "1").unwrap();
@@ -455,34 +490,88 @@ fn critical_memory_pressure_blocks_and_recovery_resumes_the_queue() {
 }
 
 #[test]
-fn warning_runs_one_job_with_the_reduced_budget_and_recovery_restores_parallelism() {
+fn warning_runs_parallel_jobs_at_full_capacity() {
     let mut harness = Harness::new(2);
+    harness.command().arg("drain").output().unwrap();
     fs::write(harness.paths.root.join("pressure"), "2").unwrap();
-    harness.wait(|s| s.pressure == "warning" && s.constrained.is_some());
+    harness.wait(|s| s.pressure == "warning" && s.constrained.is_none());
     let first = harness.spawn_hold("first");
-    let mut running = Harness::accepted(&first);
     let second = harness.spawn_hold("second");
-    let snapshot = harness.wait(|s| s.jobs.iter().any(|job| job.state == "queued"));
+    harness.wait(|s| s.jobs.iter().filter(|job| job.state == "queued").count() == 2);
+    harness.command().arg("resume").output().unwrap();
+    let mut running = Harness::accepted(&first);
+    let mut parallel = Harness::accepted(&second);
+    let snapshot =
+        harness.wait(|s| s.jobs.iter().filter(|job| job.state == "running").count() == 2);
     let active: Vec<_> = snapshot
         .jobs
         .iter()
         .filter(|job| job.holds_capacity())
         .collect();
-    assert_eq!(active.len(), 1);
-    assert_eq!(active[0].request.budget.cpu, 2);
-    assert_eq!(active[0].request.budget.memory_mib, 1024);
-    fs::write(harness.paths.root.join("pressure"), "1").unwrap();
-    let mut parallel = Harness::accepted(&second);
-    let snapshot = harness.wait(|s| s.jobs.iter().filter(|job| job.holds_capacity()).count() == 2);
-    let restored = snapshot
-        .jobs
-        .iter()
-        .find(|job| job.holds_capacity() && job.request.budget.cpu != 2)
-        .unwrap();
-    assert_eq!(restored.request.budget.cpu, 4);
-    assert_eq!(restored.request.budget.memory_mib, 2048);
+    assert_eq!(active.len(), 2);
+    assert!(
+        active
+            .iter()
+            .all(|job| job.request.budget.cpu == 4 && job.request.budget.memory_mib == 2048)
+    );
     running.write_all(b"F").unwrap();
     parallel.write_all(b"F").unwrap();
+}
+
+#[test]
+fn critical_reduces_new_work_and_warning_recovers_without_changing_a_grant() {
+    let mut harness = Harness::new(2);
+    fs::write(harness.paths.root.join("pressure"), "4").unwrap();
+    harness.wait(|s| s.constrained.is_some());
+    let first = harness.spawn_hold("first");
+    let mut running = Harness::accepted(&first);
+    let second = harness.spawn_hold("second");
+    let before = harness.wait(|s| s.jobs.iter().any(|job| job.state == "queued"));
+    let granted = before
+        .jobs
+        .iter()
+        .find(|job| job.state == "running")
+        .unwrap()
+        .request
+        .budget
+        .clone();
+    assert_eq!((granted.cpu, granted.memory_mib), (2, 1024));
+    assert!(second.accept().is_err());
+    fs::write(harness.paths.root.join("pressure"), "2").unwrap();
+    let mut parallel = Harness::accepted(&second);
+    let after = harness.wait(|s| s.jobs.iter().filter(|job| job.state == "running").count() == 2);
+    assert!(after.constrained.is_none());
+    assert!(
+        after
+            .jobs
+            .iter()
+            .any(|job| job.state == "running" && job.request.budget == granted)
+    );
+    running.write_all(b"F").unwrap();
+    parallel.write_all(b"F").unwrap();
+}
+
+#[test]
+fn injected_swap_rates_reduce_and_recover_while_warning_persists() {
+    let mut harness = Harness::new(2);
+    let sensor = harness.paths.root.join("resources.json");
+    let sample = |counter, at_ms| serde_json::json!({"at_ms":at_ms,"pressure":2,"total_mib":5120,"available_mib":5120,"swap_in_bytes":counter,"swap_out_bytes":counter});
+    platform::atomic_write(&sensor, &serde_json::to_vec(&sample(0_u64, 0)).unwrap()).unwrap();
+    harness.wait(|s| s.pressure == "warning" && s.constrained.is_none());
+    platform::atomic_write(
+        &sensor,
+        &serde_json::to_vec(&sample(1_u64 << 50, 1000)).unwrap(),
+    )
+    .unwrap();
+    harness
+        .wait(|s| s.resources.as_ref().and_then(|r| r.reason.as_deref()) == Some("swap thrashing"));
+    // Virtual time stays fixed until the test has observed the reduction.
+    platform::atomic_write(
+        &sensor,
+        &serde_json::to_vec(&sample(1_u64 << 50, 2000)).unwrap(),
+    )
+    .unwrap();
+    harness.wait(|s| s.pressure == "warning" && s.constrained.is_none());
 }
 
 #[test]
@@ -1076,6 +1165,7 @@ fn native_guardian_loss_holds_capacity_until_client_and_server_finish() {
     let job = &snapshot.jobs[0];
     let owner = job.request.owner.pid;
     let server = job.server.as_ref().unwrap().clone();
+    let _resume = ResumeOnDrop(server.identity.clone());
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1109,6 +1199,70 @@ fn native_guardian_loss_holds_capacity_until_client_and_server_finish() {
 #[ignore = "requires BAZELQUEUE_TEST_BAZEL; real Bazel in an isolated workspace"]
 fn native_unresponsive_orphan_finishes_and_admits_its_successor() {
     let mut harness = Harness::new(1);
+    native_workspace(&harness, "");
+    let mut args = native_args(&harness, "build");
+    args.push("//:hello".into());
+    assert!(
+        native_command(&harness, args)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let mut job = harness
+        .snapshot()
+        .unwrap()
+        .jobs
+        .into_iter()
+        .find(|job| job.server.is_some())
+        .unwrap();
+    let server = job.server.as_ref().unwrap().clone();
+    platform::signal_pid(server.identity.pid, libc::SIGSTOP);
+    // Simulate guardian death after client completion, before its durable result.
+    fs::remove_file(bazelqueue::summary::location(&harness.paths, &job.request.id).unwrap())
+        .unwrap();
+    job.state = "quarantined".into();
+    job.code = None;
+    job.reason = None;
+    bazelqueue::store::Store::open(&harness.paths)
+        .unwrap()
+        .save(&job)
+        .unwrap();
+    let successor = harness.spawn_hold("successor");
+    let mut admitted = Harness::accepted(&successor);
+    let recovered = harness.snapshot().unwrap();
+    assert_eq!(recovered.jobs[0].state, "finished");
+    assert_eq!(recovered.jobs[0].code, Some(125));
+    assert!(
+        recovered.jobs[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("unresponsive orphan server")
+    );
+    assert!(!platform::alive(&server.identity));
+    let output = harness.command().arg("status").output().unwrap();
+    let status = String::from_utf8(output.stdout).unwrap();
+    assert!(status.contains("failed build exit=125"), "{status}");
+    assert!(status.contains("unresponsive orphan server"));
+    let output = harness
+        .command()
+        .args(["wait", &job.request.id])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(125));
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("unresponsive orphan server")
+    );
+    admitted.write_all(b"F").unwrap();
+}
+
+#[test]
+#[ignore = "requires BAZELQUEUE_TEST_BAZEL; real Bazel in an isolated workspace"]
+fn native_idle_quarantine_releases_while_guardian_is_paused_and_ignores_late_finish() {
+    let mut harness = Harness::new(1);
     let socket = harness.root.path().join("action.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     native_workspace(
@@ -1130,39 +1284,74 @@ fn native_unresponsive_orphan_finishes_and_admits_its_successor() {
         .unwrap();
     harness.children.push(child);
     let mut action = Harness::accepted(&listener);
-    let running = harness.wait(|s| s.jobs.iter().any(|job| job.state == "running"));
-    let job = &running.jobs[0];
-    let server = job.server.as_ref().unwrap();
-    let tree = platform::process_tree(&server.identity).unwrap();
-    platform::signal_pid(server.identity.pid, libc::SIGSTOP);
-    platform::signal_pid(job.request.owner.pid, libc::SIGKILL);
-    platform::signal_pid(job.child.as_ref().unwrap().pid, libc::SIGKILL);
-    harness.wait(|s| s.jobs[0].state == "quarantined");
-    let successor = harness.spawn_hold("successor");
-    let mut admitted = Harness::accepted(&successor);
+    let mut job = harness
+        .wait(|s| s.jobs.iter().any(|job| job.state == "running"))
+        .jobs[0]
+        .clone();
+    platform::signal_pid(job.request.owner.pid, libc::SIGSTOP);
+    let _resume = ResumeOnDrop(job.request.owner.clone());
+    job.state = "quarantined".into();
+    bazelqueue::store::Store::open(&harness.paths)
+        .unwrap()
+        .save(&job)
+        .unwrap();
+    let next = harness.spawn_hold("next");
+    harness.wait(|s| s.jobs.iter().any(|job| job.state == "queued"));
+    assert!(next.accept().is_err());
+    assert!(platform::alive(job.child.as_ref().unwrap()));
+    action.write_all(b"F").unwrap();
+    let mut admitted = Harness::accepted(&next);
+    assert!(platform::alive(&job.request.owner));
     let recovered = harness.snapshot().unwrap();
     assert_eq!(recovered.jobs[0].state, "finished");
     assert_eq!(recovered.jobs[0].code, Some(125));
-    assert!(
-        recovered.jobs[0]
-            .reason
-            .as_deref()
-            .unwrap()
-            .contains("unresponsive orphan server")
-    );
-    assert!(tree.iter().all(|process| !platform::alive(process)));
-    assert_eq!(action.read(&mut [0]).unwrap(), 0);
-    let output = harness.command().arg("status").output().unwrap();
-    let status = String::from_utf8(output.stdout).unwrap();
-    assert!(status.contains("failed build exit=125"));
-    assert!(status.contains("unresponsive orphan server"));
+    platform::signal_pid(job.request.owner.pid, libc::SIGCONT);
+    assert!(harness.children[0].wait().unwrap().success());
+    let late = harness.snapshot().unwrap();
+    assert_eq!(late.jobs[0].state, "finished");
+    assert_eq!(late.jobs[0].code, Some(125));
     let output = harness
         .command()
         .args(["wait", &job.request.id])
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(125));
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("native server verified idle")
+    );
     admitted.write_all(b"F").unwrap();
+}
+
+#[test]
+fn retirement_leaf_proof_refuses_a_live_child_without_signalling_it() {
+    let root = tempfile::tempdir().unwrap();
+    let listener = UnixListener::bind(root.path().join("child.sock")).unwrap();
+    let mut parent = Command::new(env!("CARGO_BIN_EXE_fixture-backend"))
+        .arg("tree-hold")
+        .arg(listener.local_addr().unwrap().as_pathname().unwrap())
+        .spawn()
+        .unwrap();
+    let mut child = Harness::accepted(&listener);
+    let identity = platform::identity(parent.id()).unwrap();
+    let _resume = ResumeOnDrop(identity.clone());
+    platform::signal_verified(&identity, libc::SIGSTOP).unwrap();
+    loop {
+        if let Some(leaf) = platform::stopped_leaf(&identity).unwrap() {
+            assert!(!leaf);
+            break;
+        }
+        std::thread::yield_now();
+    }
+    child.write_all(b"F").unwrap();
+    platform::signal_verified(&identity, libc::SIGCONT).unwrap();
+    assert!(parent.wait().unwrap().success());
+    let stale = platform::Identity {
+        pid: std::process::id(),
+        birth: "stale".into(),
+    };
+    assert!(!platform::signal_verified(&stale, libc::SIGKILL).unwrap());
 }
 
 fn control(harness: &Harness, operation: &str) {
@@ -1182,6 +1371,8 @@ fn control(harness: &Harness, operation: &str) {
 #[ignore = "requires BAZELQUEUE_TEST_BAZEL; real concurrent native actions"]
 fn native_distinct_workspaces_execute_in_parallel_with_bounded_shares() {
     let mut harness = Harness::new(2);
+    fs::write(harness.paths.root.join("pressure"), "2").unwrap();
+    harness.wait(|s| s.pressure == "warning" && s.constrained.is_none());
     native_workspace(&harness, "");
     let mut config = Config::load(&harness.paths).unwrap();
     config.cpu_capacity = 7;
@@ -1233,7 +1424,7 @@ fn native_distinct_workspaces_execute_in_parallel_with_bounded_shares() {
             .filter(|job| job.state == "running")
             .map(|job| job.request.budget.cpu)
             .sum::<u32>(),
-        6
+        7
     );
     assert!(
         snapshot

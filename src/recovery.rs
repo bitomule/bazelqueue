@@ -59,11 +59,17 @@ pub fn finish(job: &mut Job, reason: &str) {
     job.state = "finished".into();
     let code = *job.code.get_or_insert(125);
     job.reason = Some(match job.reason.take() {
-        Some(previous) if previous.contains("stopped unresponsive orphan server") => {
-            format!("exit={code}; stopped unresponsive orphan server; {reason}")
+        Some(previous) if previous.contains("unresponsive orphan server") => {
+            format!("exit={code}; unresponsive orphan server exited; {reason}")
         }
         Some(previous) if !previous.starts_with("recovery pending:") => {
-            format!("{previous}; recovered: {reason}")
+            format!(
+                "{}; recovered: {reason}",
+                previous
+                    .split("; recovery pending:")
+                    .next()
+                    .unwrap_or(&previous)
+            )
         }
         _ => format!("exit={code}; recovered: {reason}"),
     });
@@ -137,6 +143,8 @@ mod tests {
                     legacy_active: false,
                     drained: false,
                     run_memory_mib: 0,
+                    new_memory_mib: 9216,
+                    reason: None,
                 };
                 assert!(scheduler::eligible(&jobs, &config, &capacity).is_empty());
                 let Decision::Finish(reason) = decide(&jobs[0], observation(native)) else {

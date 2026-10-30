@@ -143,6 +143,8 @@ impl Fixture {
                     }
                     "status" => Event::Snapshot {
                         snapshot: Snapshot {
+                            resources: None,
+                            utilization: Vec::new(),
                             daemon: platform::current_identity().unwrap(),
                             version: bazelqueue::coordinator::VERSION.into(),
                             executable: Some(env!("CARGO_BIN_EXE_bazelqueue").into()),

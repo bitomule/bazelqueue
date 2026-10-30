@@ -3,9 +3,11 @@ use crate::{
     config::{Config, Paths},
     platform,
     protocol::{self, Event, Job, Message, Snapshot},
-    recovery::{self, Decision, NativeState, Observation},
+    recovery::{self, Decision, NativeState, Observation as RecoveryObservation},
+    resources::{Monitor, Sample},
     scheduler::{self, Capacity, Pressure},
     store::Store,
+    utilization::{Observation, Utilization},
 };
 use anyhow::{Result, bail};
 use std::{
@@ -13,7 +15,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Stdio,
-    time::Duration,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     net::{UnixListener, UnixStream},
@@ -37,13 +39,40 @@ enum Input {
     },
 }
 
-fn sample_pressure(paths: &Paths) -> Option<u32> {
+fn sample_resources(
+    paths: &Paths,
+    config: &Config,
+    sampler: &mut platform::ResourceSampler,
+    at_ms: u64,
+) -> Sample {
     #[cfg(feature = "test-fixtures")]
-    if let Ok(value) = std::fs::read_to_string(paths.root.join("pressure")) {
-        return value.trim().parse().ok();
+    {
+        if let Ok(value) = fs::read_to_string(paths.root.join("resources.json")) {
+            let mut sample: Sample = serde_json::from_str(&value).unwrap_or_default();
+            sample.at_ms = serde_json::from_str::<serde_json::Value>(&value)
+                .ok()
+                .and_then(|value| value.get("at_ms").and_then(serde_json::Value::as_u64))
+                .unwrap_or(at_ms);
+            return sample;
+        }
+        if let Ok(value) = fs::read_to_string(paths.root.join("pressure")) {
+            let memory = config.memory_capacity_mib
+                + config
+                    .memory_safety_mib
+                    .max(config.memory_capacity_mib / 10);
+            return Sample {
+                at_ms,
+                pressure: value.trim().parse().ok(),
+                total_mib: memory,
+                available_mib: Some(memory),
+                swap_in_bytes: Some(0),
+                swap_out_bytes: Some(0),
+                ..Sample::default()
+            };
+        }
     }
-    let _ = paths;
-    platform::pressure()
+    let _ = (paths, config);
+    sampler.sample(at_ms)
 }
 
 async fn connection(stream: UnixStream, number: u64, send: mpsc::Sender<Input>) -> Result<()> {
@@ -495,42 +524,18 @@ async fn observe_native(job: &Job) -> NativeState {
     }
     // The known server does not depend on a global process scan: an unrelated
     // Java process with inaccessible arguments must not strand this request.
-    if let Some(server) = job
-        .server
-        .as_ref()
-        .filter(|server| platform::alive(&server.identity))
-    {
-        return crate::native_server::probe(server).await;
+    if let Some(server) = job.server.as_ref() {
+        return crate::native_server::probe_known(server).await;
     }
-    let Ok(mut servers) = platform::bazel_servers(&job.request.workspace) else {
+    let Ok(servers) = platform::bazel_servers(&job.request.workspace) else {
         return NativeState::Unknown;
     };
-    // Discovery must not silently drop a recorded live server.
-    if let Some(server) = job
-        .server
-        .as_ref()
-        .filter(|server| platform::alive(&server.identity))
-        && !servers
-            .iter()
-            .any(|found| found.identity == server.identity)
-    {
-        servers.push(server.clone());
-    }
     if servers.is_empty() {
         return NativeState::Gone;
     }
     for server in &servers {
         match crate::native_server::probe(server).await {
             NativeState::Idle => {}
-            NativeState::Unresponsive
-                if servers.len() == 1
-                    && job.server.as_ref().is_some_and(|recorded| {
-                        recorded.identity == server.identity
-                            && recorded.output_base == server.output_base
-                    }) =>
-            {
-                return NativeState::Unresponsive;
-            }
             NativeState::Unresponsive => return NativeState::Unknown,
             state => return state,
         }
@@ -558,10 +563,10 @@ async fn apply_recovery(
     if !recovery::current(observed, &job, connection, current_connection) {
         return Ok(());
     }
-    let observation = Observation {
+    let observation = RecoveryObservation {
         owner_alive: platform::alive(&job.request.owner),
         child_alive: job.child.as_ref().is_some_and(platform::alive)
-            || job.recovery_processes.iter().any(platform::alive),
+            || job.retiring_server.as_ref().is_some_and(platform::alive),
         native,
         unresponsive_for,
         other_owner: other_owner(&job, &jobs),
@@ -577,27 +582,34 @@ async fn apply_recovery(
             recovery::finish(&mut job, reason);
         }
         Decision::Wait(reason) => {
-            if job.code.is_some() {
-                return Ok(());
-            }
-            job.reason = Some(format!("recovery pending: {reason}"));
+            let previous = job
+                .reason
+                .as_deref()
+                .unwrap_or("")
+                .split("; recovery pending:")
+                .next()
+                .unwrap_or("");
+            job.reason = Some(
+                if previous.is_empty() || previous.starts_with("recovery pending:") {
+                    format!("recovery pending: {reason}")
+                } else {
+                    format!("{previous}; recovery pending: {reason}")
+                },
+            );
         }
         Decision::StopServer => {
             let server = job
                 .server
                 .as_ref()
                 .expect("recovery requires a recorded server");
-            if let Ok(Some(tree)) = crate::native_server::unresponsive_tree(server).await {
-                job.recovery_processes = tree;
+            if crate::native_server::can_retire(server)
+                .await
+                .unwrap_or(false)
+            {
+                job.retiring_server = Some(server.identity.clone());
                 job.reason = Some(
-                    "recovery pending: stopped unresponsive orphan server; verifying exit".into(),
+                    "recovery pending: retiring unresponsive orphan server; verifying leaf".into(),
                 );
-                // Commit the tree before signalling: a replacement coordinator
-                // must still account for every captured process until it exits.
-                store.save(&job)?;
-                for process in job.recovery_processes.iter().rev() {
-                    let _ = platform::signal_verified(process, libc::SIGKILL);
-                }
             } else {
                 return Ok(());
             }
@@ -623,8 +635,56 @@ fn other_owner(job: &Job, jobs: &[Job]) -> bool {
             && same_server
             && !platform::alive(&other.request.owner)
             && !other.child.as_ref().is_some_and(platform::alive)
-            && !other.recovery_processes.iter().any(platform::alive))
+            && !other.retiring_server.as_ref().is_some_and(platform::alive))
     })
+}
+
+/// A persisted intent always repeats ownership and leaf verification, including
+/// after restart. It is never an unconditional permission to kill a PID list.
+fn advance_retirement(store: &Store, job: &mut Job) -> Result<()> {
+    let Some(owner) = job.retiring_server.clone() else {
+        return Ok(());
+    };
+    if !platform::alive(&owner) {
+        return Ok(());
+    }
+    let protected = platform::alive(&job.request.owner)
+        || job.child.as_ref().is_some_and(platform::alive)
+        || other_owner(job, &store.jobs()?);
+    let matches = job.server.as_ref().is_some_and(|server| {
+        server.identity == owner && crate::native_server::retirement_matches(server)
+    });
+    if !protected && matches {
+        platform::signal_verified(&owner, libc::SIGSTOP)?;
+        match platform::stopped_leaf(&owner) {
+            Ok(None) => return Ok(()),
+            Ok(Some(true))
+                if !other_owner(job, &store.jobs()?)
+                    && job
+                        .server
+                        .as_ref()
+                        .is_some_and(crate::native_server::retirement_matches) =>
+            {
+                // The actor has granted no new work while checking the leaf.
+                // Re-read all current owners before the final signal.
+                platform::signal_verified(&owner, libc::SIGKILL)?;
+                job.reason = Some(
+                    "recovery pending: stopped unresponsive orphan server; verifying exit".into(),
+                );
+                return store.save(job);
+            }
+            _ => {}
+        }
+    }
+    // Children or uncertain native evidence: resume the exact old process,
+    // preserve its reservation, and never signal any descendant.
+    platform::signal_verified(&owner, libc::SIGCONT)?;
+    job.retiring_server = None;
+    job.reason = Some(
+        "recovery pending: server has children or ownership is uncertain; retirement refused"
+            .into(),
+    );
+    store.save(job)
 }
 
 fn notify(reply: &mpsc::Sender<Event>, event: Event) {
@@ -679,10 +739,13 @@ pub async fn run(paths: Paths) -> Result<()> {
     let mut notices: BTreeMap<String, (usize, String)> = BTreeMap::new();
     let mut count = 0_u64;
     let daemon = Daemon::current()?;
-    let mut healthy_samples = 0_u32;
-    let mut pressure = sample_pressure(&paths);
-    let mut last_known = pressure;
-    let mut mode = Pressure::from_samples(pressure, None, 0, config.pressure_recovery_samples);
+    let started = Instant::now();
+    let mut sampler = platform::ResourceSampler::default();
+    let mut monitor = Monitor::default();
+    monitor.update(sample_resources(&paths, &config, &mut sampler, 0), &config);
+    let mut usage = store.utilization()?;
+    let mut last_flush = Instant::now();
+    let mut resident = HashMap::<String, u64>::new();
     let mut tick = 0;
     let mut probing = std::collections::HashSet::new();
     let mut unresponsive: HashMap<String, tokio::time::Instant> = HashMap::new();
@@ -728,7 +791,7 @@ pub async fn run(paths: Paths) -> Result<()> {
                                 Err(error)=>{notify(&reply,Event::Error {message:error.to_string()});continue;},
                             }
                         }
-                        let result=handle(&paths,&store,&config,&daemon,pressure,mode,connection,message,&reply,&mut sessions,&mut connection_ids);
+                        let result=handle(&paths,&store,&config,&daemon,&monitor,&usage,connection,message,&reply,&mut sessions,&mut connection_ids);
                         if let Err(error)=result {notify(&reply,Event::Error {message:error.to_string()});}
                     }
                     None=>break,
@@ -739,18 +802,26 @@ pub async fn run(paths: Paths) -> Result<()> {
                 tick+=1;
                 if tick%4==0 {
                     if let Ok(updated)=Config::load(&paths) {config=updated;}
-                    pressure=sample_pressure(&paths);
-                    if pressure==Some(1) {healthy_samples=healthy_samples.saturating_add(1);} else {healthy_samples=0;}
-                    mode=Pressure::from_samples(pressure,last_known,healthy_samples,config.pressure_recovery_samples);
-                    if pressure.is_some() {last_known=pressure;}
+                    let sample=sample_resources(&paths, &config, &mut sampler, started.elapsed().as_millis() as u64);
+                    let sampled_jobs=store.jobs()?;
+                    crate::resources::refresh_resident(&sample,&mut resident,||sampled_jobs.iter().filter(|job|job.holds_build_capacity()).map(|job| {
+                        let owners:Vec<_>=job.child.iter().cloned().chain(job.server.iter().map(|server|server.identity.clone())).collect();
+                        (job.request.id.clone(),platform::process_memory(&owners))
+                    }).collect());
+                    monitor.update(sample, &config);
                 }
 
             }
             _=tokio::signal::ctrl_c()=>break,
         }
         if reschedule {
+            let mode = monitor.mode();
             settle_receipts(&paths, &store)?;
             let mut jobs = store.jobs()?;
+            let previous_budgets: HashMap<_, _> = jobs
+                .iter()
+                .map(|job| (job.sequence, job.request.budget.clone()))
+                .collect();
             for job in &mut jobs {
                 if job.terminal() {
                     continue;
@@ -761,17 +832,15 @@ pub async fn run(paths: Paths) -> Result<()> {
                         || job.request.budget.memory_mib > config.memory_capacity_mib)
                 {
                     job.request.budget = config.budget(!job.request.budget.exclusive);
-                    store.save(job)?;
                 }
-                if job.state == "queued"
-                    && job.metered()
-                    && scheduler::fit_queued(&mut job.request.budget, &config, mode)
-                {
-                    store.save(job)?;
+                if job.state == "queued" && job.metered() {
+                    scheduler::fit_queued(&mut job.request.budget, &config, mode);
                 }
                 if !platform::alive(&job.request.owner) {
-                    for process in job.recovery_processes.iter().rev() {
-                        let _ = platform::signal_verified(process, libc::SIGKILL);
+                    let retiring = job.retiring_server.is_some();
+                    advance_retirement(&store, job)?;
+                    if retiring && job.retiring_server.is_none() {
+                        unresponsive.remove(&job.request.id);
                     }
                     if job.state == "queued" {
                         job.state = "cancelled".into();
@@ -790,7 +859,7 @@ pub async fn run(paths: Paths) -> Result<()> {
                         .as_ref()
                         .is_some_and(|server| platform::alive(&server.identity))
                         || job.child.as_ref().is_some_and(platform::alive)
-                        || job.recovery_processes.iter().any(platform::alive)
+                        || job.retiring_server.as_ref().is_some_and(platform::alive)
                     {
                         job.state = "quarantined".into();
                     } else if ((job.state == "starting" || job.state == "preparing")
@@ -844,6 +913,10 @@ pub async fn run(paths: Paths) -> Result<()> {
                     && legacy_owners(&store, &config).map_or(true, |owners| !owners.is_empty()),
                 drained: store.drained()?,
                 run_memory_mib: platform::process_memory(&run_owners),
+                new_memory_mib: monitor
+                    .headroom(&config)
+                    .saturating_sub(crate::resources::promised_growth(&jobs, &resident)),
+                reason: monitor.signals.reason.clone(),
             };
             let limit = scheduler::admission_budget(&config, mode);
             let remaining_memory = limit.memory_mib.saturating_sub(capacity.run_memory_mib);
@@ -856,7 +929,6 @@ pub async fn run(paths: Paths) -> Result<()> {
                 }) {
                     job.request.budget.memory_mib =
                         job.request.budget.memory_mib.min(remaining_memory);
-                    store.save(job)?;
                 }
             }
             let candidates: Vec<_> = jobs
@@ -870,9 +942,19 @@ pub async fn run(paths: Paths) -> Result<()> {
                 })
                 .cloned()
                 .collect();
-            if let Some(job) =
-                scheduler::raise_lone_job(&candidates, &mut jobs, &limit, remaining_memory)
-            {
+            let mut profiled = candidates;
+            scheduler::allocate_queued(&mut profiled, &config, &capacity);
+            for updated in profiled.iter().filter(|job| job.state == "queued") {
+                if let Some(job) = jobs.iter_mut().find(|job| job.sequence == updated.sequence)
+                    && job.request.budget != updated.request.budget
+                {
+                    job.request.budget = updated.request.budget.clone();
+                }
+            }
+            for job in jobs.iter().filter(|job| {
+                job.state == "queued"
+                    && previous_budgets.get(&job.sequence) != Some(&job.request.budget)
+            }) {
                 store.save(job)?;
             }
             let candidates: Vec<_> = jobs
@@ -937,8 +1019,35 @@ pub async fn run(paths: Paths) -> Result<()> {
                 }
             }
             store.trim()?;
+            usage.observe(Observation {
+                monotonic_ms: started.elapsed().as_millis() as u64,
+                unix_ms: SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64,
+                busy: jobs
+                    .iter()
+                    .any(|job| job.metered() && job.state == "running"),
+                reserved_cpu_percent: jobs
+                    .iter()
+                    .filter(|job| job.holds_build_capacity())
+                    .map(|job| f64::from(job.request.budget.cpu))
+                    .sum::<f64>()
+                    * 100.0
+                    / f64::from(config.cpu_capacity),
+                reserved_memory_percent: jobs
+                    .iter()
+                    .filter(|job| job.holds_build_capacity())
+                    .map(|job| job.request.budget.memory_mib as f64)
+                    .sum::<f64>()
+                    * 100.0
+                    / config.memory_capacity_mib as f64,
+                host_cpu_percent: monitor.signals.sample.cpu_busy_percent,
+            });
+            if last_flush.elapsed() >= Duration::from_secs(1) {
+                store.save_utilization(&usage)?;
+                last_flush = Instant::now();
+            }
         }
     }
+    store.save_utilization(&usage)?;
     fs::remove_file(&paths.socket)?;
     Ok(())
 }
@@ -949,8 +1058,8 @@ fn handle(
     store: &Store,
     config: &Config,
     daemon: &Daemon,
-    pressure: Option<u32>,
-    mode: Pressure,
+    monitor: &Monitor,
+    usage: &Utilization,
     connection: u64,
     message: Message,
     reply: &mpsc::Sender<Event>,
@@ -1006,19 +1115,26 @@ fn handle(
                         version: daemon.version.clone(),
                         executable: daemon.executable.clone(),
                         drained: store.drained()?,
-                        pressure: pressure.map_or("unavailable".into(), |value| {
-                            match value {
-                                1 => "normal",
-                                2 => "warning",
-                                _ => "critical",
-                            }
-                            .into()
-                        }),
-                        constrained: (mode == Pressure::Constrained)
+                        pressure: monitor.signals.sample.pressure.map_or(
+                            "unavailable".into(),
+                            |value| {
+                                match value {
+                                    1 => "normal",
+                                    2 => "warning",
+                                    _ => "critical",
+                                }
+                                .into()
+                            },
+                        ),
+                        constrained: (monitor.mode() == Pressure::Constrained)
                             .then(|| config.constrained_budget()),
-                        held: mode == Pressure::Held,
+                        held: monitor.mode() == Pressure::Held,
                         cpu_capacity: config.cpu_capacity,
                         memory_capacity_mib: config.memory_capacity_mib,
+                        resources: Some(Box::new(monitor.signals.clone())),
+                        utilization: usage.visible_hours(
+                            SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64,
+                        ),
                         legacy: legacy_owners(store, config)?,
                         jobs: {
                             let jobs = store.jobs()?;
@@ -1178,6 +1294,33 @@ fn legacy_owners(store: &Store, config: &Config) -> Result<Vec<platform::Identit
 mod tests {
     use super::*;
     use crate::protocol::{Budget, Job, Request};
+
+    #[test]
+    fn duplicate_orphans_do_not_protect_the_same_server_but_live_owners_do() {
+        let fixture = Fixture::new();
+        let mut first = fixture.job("first", "quarantined");
+        let server = crate::protocol::NativeServer {
+            identity: platform::Identity {
+                pid: 1,
+                birth: "old".into(),
+            },
+            output_base: "lane".into(),
+            workspace: "workspace".into(),
+            version: "8.4.2".into(),
+        };
+        first.server = Some(server.clone());
+        let mut second = fixture.job("second", "quarantined");
+        second.server = Some(server);
+        assert!(!other_owner(&first, &[first.clone(), second.clone()]));
+        second.request.owner = platform::current_identity().unwrap();
+        assert!(other_owner(&first, &[first.clone(), second.clone()]));
+        second.request.owner = first.request.owner.clone();
+        second.child = Some(platform::current_identity().unwrap());
+        assert!(other_owner(&first, &[first.clone(), second.clone()]));
+        second.child = None;
+        second.server = None;
+        assert!(other_owner(&first, &[first.clone(), second]));
+    }
 
     #[tokio::test]
     async fn a_recovered_orphan_is_durably_failed_and_duplicate_results_do_not_change_it() {

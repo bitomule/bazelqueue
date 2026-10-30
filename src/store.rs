@@ -57,7 +57,7 @@ impl Store {
             code: None,
             cancel: false,
             reason: None,
-            recovery_processes: Vec::new(),
+            retiring_server: None,
         };
         self.connection.execute(
             "INSERT INTO jobs(id,data) VALUES(?1,?2)",
@@ -89,6 +89,24 @@ impl Store {
     }
     pub fn set_drained(&self, value: bool) -> Result<()> {
         self.connection.execute("INSERT INTO settings(key,value) VALUES('drained',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",params![value.to_string()])?;
+        Ok(())
+    }
+    pub fn utilization(&self) -> Result<crate::utilization::Utilization> {
+        let json: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT value FROM settings WHERE key='utilization'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(json
+            .map(|json| serde_json::from_str(&json))
+            .transpose()?
+            .unwrap_or_default())
+    }
+    pub fn save_utilization(&self, usage: &crate::utilization::Utilization) -> Result<()> {
+        self.connection.execute("INSERT INTO settings(key,value) VALUES('utilization',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![serde_json::to_string(usage)?])?;
         Ok(())
     }
     pub fn trim(&self) -> Result<()> {
