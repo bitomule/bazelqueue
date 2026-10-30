@@ -302,7 +302,7 @@ and any limitations are recorded in the validation evidence below.
 
 | Layer | Checks | Evidence covered |
 |---|---:|---|
-| Unit | 87 | Scheduling, injected recovery/liveness, resource samples, utilization, framing, configuration and persistent drain state. |
+| Unit | 88 | Scheduling, injected recovery/liveness, resource samples, utilization, framing, configuration and persistent drain state. |
 | Process E2E | 31 | FIFO/rank, warning parallelism, pressure/swap recovery, cancellation, restart, raw argument bytes, retained executables and failure diagnostics. |
 | Installation | 17 | Interrupted setup, rollback, upgrades, original backups and shell activation. |
 | Interactive PTY | 3 | Terminal input, Ctrl-C and Ctrl-Z/fg in a real shell. |

@@ -1221,6 +1221,7 @@ fn native_unresponsive_orphan_finishes_and_admits_its_successor() {
         .unwrap();
     let server = job.server.as_ref().unwrap().clone();
     platform::signal_pid(server.identity.pid, libc::SIGSTOP);
+    let _resume = ResumeOnDrop(server.identity.clone());
     // Simulate guardian death after client completion, before its durable result.
     fs::remove_file(bazelqueue::summary::location(&harness.paths, &job.request.id).unwrap())
         .unwrap();
@@ -1327,7 +1328,12 @@ fn native_idle_quarantine_releases_while_guardian_is_paused_and_ignores_late_fin
 
 #[test]
 fn retirement_leaf_proof_refuses_a_live_child_without_signalling_it() {
-    let root = tempfile::tempdir().unwrap();
+    // Unix socket paths have a small native bound; TMPDIR may be a long
+    // worktree path. Keep this isolated process fixture beside the harnesses.
+    let root = tempfile::Builder::new()
+        .prefix("bql-")
+        .tempdir_in("/private/tmp")
+        .unwrap();
     let listener = UnixListener::bind(root.path().join("child.sock")).unwrap();
     let mut parent = Command::new(env!("CARGO_BIN_EXE_fixture-backend"))
         .arg("tree-hold")

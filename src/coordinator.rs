@@ -494,12 +494,15 @@ fn settle_receipts(paths: &Paths, store: &Store) -> Result<()> {
                 let Some((code, stopped)) = outcome else {
                     continue;
                 };
-                let reason = job.reason.clone().or_else(|| {
-                    crate::summary::load(paths, &id)
-                        .ok()
-                        .flatten()
-                        .and_then(|summary| summary.reason)
-                });
+                let reason = crate::summary::load(paths, &id)
+                    .ok()
+                    .flatten()
+                    .and_then(|summary| summary.reason)
+                    .or_else(|| {
+                        let prior = job.reason.as_deref()?.split("; recovery pending:").next()?;
+                        (!prior.is_empty() && !prior.starts_with("recovery pending:"))
+                            .then(|| prior.to_owned())
+                    });
                 recovery::record_finish(job, code, stopped, reason);
                 store.save(job)?;
             }
@@ -1533,6 +1536,52 @@ mod tests {
         }
         fn settle(&self) {
             settle_receipts(&self.paths, &self.store).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_late_receipt_replaces_pending_recovery_with_the_completion_diagnosis() {
+        for (code, pending, saved, expected) in [
+            (
+                36,
+                "recovery pending: native server is busy",
+                Some("disk full"),
+                Some("disk full"),
+            ),
+            (0, "recovery pending: native server is busy", None, None),
+            (
+                36,
+                "disk full; recovery pending: native server is busy",
+                None,
+                Some("disk full"),
+            ),
+        ] {
+            let fixture = Fixture::new();
+            let mut job = fixture.job("late-receipt", "quarantined");
+            job.reason = Some(pending.into());
+            fixture.store.save(&job).unwrap();
+            crate::summary::save(
+                &fixture.paths,
+                &crate::summary::Summary {
+                    id: job.request.id.clone(),
+                    command: "build".into(),
+                    workspace: "workspace".into(),
+                    exit_code: code,
+                    exit_name: None,
+                    reason: saved.map(str::to_owned),
+                    queued_ms: 0,
+                    ran_ms: 0,
+                    targets_reported: false,
+                    failures: vec![],
+                },
+            )
+            .unwrap();
+            fixture.write_receipt(&job.request.id, code, true);
+            fixture.settle();
+            let done = fixture.stored(&job.request.id);
+            assert_eq!(done.state, "finished");
+            assert_eq!(done.code, Some(code));
+            assert_eq!(done.reason.as_deref(), expected);
         }
     }
 

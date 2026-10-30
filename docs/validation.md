@@ -159,3 +159,37 @@ guardian, and verify a stopped leaf server's exit before admitting its successor
 A child-process barrier checks that leaf verification refuses a nonleaf without
 signalling its child. Execution and ablation results are recorded with
 the PR and the committed validation ledger.
+
+The final ordinary `make all` run passed 88 unit tests, 31 process E2E tests,
+17 installation transaction tests and 3 PTY tests. The locked production release
+build and `musts validate` also passed. Two isolated ablations removed orphan
+retirement and restored receipt-before-message short-circuiting, respectively:
+both regressions passed before removal, failed without the fix, and passed after
+restoration. Three review rounds fixed seven findings; a separate directed
+verifier found none remaining. A further deterministic receipt interleaving
+failed with a pending recovery reason masking the saved disk-full diagnosis;
+preferring the completion summary and removing provisional waiting text fixed
+it. The review was orchestrated manually because this session had no workflow
+tool.
+
+All three new native contracts passed on both Bazel 8.4.2 and 9.2.0: recovery with
+a paused living guardian, fresh liveness checks after interrupted retirement,
+and termination/exit verification of an unresponsive orphan before successor
+admission. The complete local native runs were **11/12 on 8.4.2** and **10/12 on
+9.2.0**, so they are not represented as clean matrix runs. On 8.4.2, the existing
+parallel-action contract hit its 30-second action-start watchdog; an unchanged
+diagnostic copy subsequently passed (33.06 seconds total), as did a copy of main
+9f2bf16 (20.39 seconds total). On 9.2.0, the existing idle-probe contract found no
+recorded server after a successful build, and the hooks/parallel contract hit the
+action-start watchdog. The isolated idle-probe diagnostic then passed (21.97
+seconds). Neither deadlines nor assertions were relaxed. Native preparation's
+15-second probe and exclusive fallback are unchanged from main; these observations
+do not by themselves establish the cause of the intermittent failures. CI's
+complete native matrix remains a separate release gate.
+
+The ordinary suite also exposed an intermittent failure in the existing hot
+migration/restart contract: one run timed out with no coordinator snapshot
+(30/31 process E2E passed). Its diagnostic run passed unchanged in 1.46 seconds;
+the corresponding main contract passed in 1.60 seconds. Two earlier complete
+ordinary runs passed 31/31. The failed run is retained rather than counted as a
+clean pass, and no timeout or assertion was weakened.
