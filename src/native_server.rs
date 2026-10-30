@@ -60,7 +60,7 @@ fn read_info(base: &str) -> Result<ServerInfo> {
     let path = Path::new(base).join("server/server_info.rawproto");
     let mut file = fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() || metadata.uid() != platform::uid() || metadata.len() > 65536 {

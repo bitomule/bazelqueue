@@ -93,6 +93,17 @@ pub fn signal_verified(owner: &Identity, signal: i32) -> Result<bool> {
     Ok(true)
 }
 
+#[cfg(test)]
+pub fn fixture_fifo(path: &Path) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+    // SAFETY: path is NUL-terminated; the private test directory owns this FIFO.
+    if unsafe { libc::mkfifo(path.as_ptr(), 0o600) } != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
 /// Match only the recorded process, not a global scan of unrelated JVMs.
 pub fn server_matches(server: &crate::protocol::NativeServer) -> bool {
     let mut system = System::new();

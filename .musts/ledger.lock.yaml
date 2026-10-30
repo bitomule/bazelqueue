@@ -1,6 +1,7 @@
 version: 1
 satisfied:
 - {check: "root/clippy", scope_hash: "025799318d5429068bb6fabb48a66f9d8557e7f3f15f056d1bfbf0acf163c9fa"}
+- {check: "root/clippy", scope_hash: "074d829da9f24401e3e7bda909709b27f4243ad1d2a1382caf32fd9dc6f7c5ee"}
 - {check: "root/clippy", scope_hash: "251da1096d1474f3b1a41151de45eaa8ab36911676a04cb843847708fdbf82e5"}
 - {check: "root/clippy", scope_hash: "279a1a6474c1fb7011070e86807c727e009f55cba177e5110fc871a5a1500735"}
 - {check: "root/clippy", scope_hash: "2ae2f05d2348225227dedf7c259281cf2c1e76bd67baa9496d3bf09d2dd4c439"}
@@ -33,6 +34,7 @@ satisfied:
 - {check: "root/fmt", scope_hash: "2c45a836d3b7fafa8714a397a37c5d2961e6317c333cd78c25d957f881ca5da1"}
 - {check: "root/fmt", scope_hash: "2cc869903329535d133b67af11ea495fcd1b78a16fd4f69421fbf472169d06bf"}
 - {check: "root/fmt", scope_hash: "34b13332fa9ef9d0b0d26bf4c37a2e513a3d2603dbe035025716058bdf70abc0"}
+- {check: "root/fmt", scope_hash: "355fa6b770920c3a159f98cc8f31a7aced07a77d65989984237c5c20d45a9269"}
 - {check: "root/fmt", scope_hash: "3e8f40b95b46f673999f943f0c6834402705da0a962821d8a68b38f386752cce"}
 - {check: "root/fmt", scope_hash: "4f1a300c880df735581636b92e8b25002ace1f28975b1654ac32ecb01cd33fc9"}
 - {check: "root/fmt", scope_hash: "4fc5f40f050b3e79f8775d387da6206ba78f52ce7b11133cef4a422baaaf7bbf"}
@@ -55,6 +57,7 @@ satisfied:
 - {check: "root/ownership", scope_hash: "21425e25090541111b62defdf0bf7189557c4d0cd3ea3231f359a8a2ba2ee710"}
 - {check: "root/ownership", scope_hash: "2990adb1680a6c590a181e31632b28352df03f4292f568f7e099d551f2ba63e7"}
 - {check: "root/ownership", scope_hash: "3039d970aecc2fb53cf203add398d28af8852585d2ddca4f2623279ebafc51b3"}
+- {check: "root/ownership", scope_hash: "41961f06ed0facd4247d87bcfa6a06229d8e4da88b2f48f7353fecf5a899dc77"}
 - {check: "root/ownership", scope_hash: "5514917a932f03c1a89fc6ade193706ef45ed0ed767864db7a5b4ad449bb2a70"}
 - {check: "root/ownership", scope_hash: "65f44c19b8faa938c6511e19d7aa46096a0837f05310706e2ff5a48e7aa15b69"}
 - {check: "root/ownership", scope_hash: "6bb1fbef582b41f51578583af9ace598d3c835e40257a8e8cc16dfa374d0369b"}
@@ -81,6 +84,7 @@ satisfied:
 - {check: "root/unit", scope_hash: "61c2904b11f1454522452e1f66c58b58c70138f1c930dcff7852024f503ea22d"}
 - {check: "root/unit", scope_hash: "6883be4e1f56a1f47cd5334fb354c65efb354fbc5419db02f224b7bd0f574259"}
 - {check: "root/unit", scope_hash: "7a7d179cdec302281d6e8fcf701785e2a7718fdf555486e4948b6040982cbfe9"}
+- {check: "root/unit", scope_hash: "83c665b21da1b75d0ccc730991a2f472c39e18260bd5a0aad7b041ac66c9e3a6"}
 - {check: "root/unit", scope_hash: "861731ddbc96bb1690c6f210adc4eef66e202710f1f0b475f0fa8796030774ca"}
 - {check: "root/unit", scope_hash: "86f6c476533a7f6889a60a1d4f33a4e8d25bffc4b359a1ff2e5f7dd84d5fee70"}
 - {check: "root/unit", scope_hash: "95628530592b1102ac1c5336ebd255e260085c58fb3f4c36fbe1da4756177262"}

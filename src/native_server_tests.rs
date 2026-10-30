@@ -191,6 +191,14 @@ async fn reused_pid_and_changed_metadata_never_prove_idleness() {
     task.abort();
 }
 
+#[test]
+fn fifo_metadata_is_rejected_without_waiting_for_a_writer() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir(root.path().join("server")).unwrap();
+    platform::fixture_fifo(&root.path().join("server/server_info.rawproto")).unwrap();
+    assert!(read_info(root.path().to_str().unwrap()).is_err());
+}
+
 #[tokio::test]
 async fn timeouts_distinguish_a_hung_ping_from_a_responsive_server() {
     for (mode, expected) in [

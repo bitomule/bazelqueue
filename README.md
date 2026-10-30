@@ -297,15 +297,16 @@ nested calls are rejected to avoid waiting behind their own parent.
 
 ## Tested against actual process failures
 
-For **v0.1.1**, the validation suite passed **65 checks**:
+The current validation suite covers these contracts. Executed native results
+and any limitations are recorded in the validation evidence below.
 
 | Layer | Checks | Evidence covered |
 |---|---:|---|
-| Unit | 67 | Scheduling, resource samples, utilization, framing, configuration and persistent drain state. |
-| Process E2E | 29 | FIFO/rank, warning parallelism, pressure/swap recovery, cancellation, restart, raw argument bytes and retained executables. |
+| Unit | 87 | Scheduling, injected recovery/liveness, resource samples, utilization, framing, configuration and persistent drain state. |
+| Process E2E | 31 | FIFO/rank, warning parallelism, pressure/swap recovery, cancellation, restart, raw argument bytes, retained executables and failure diagnostics. |
 | Installation | 17 | Interrupted setup, rollback, upgrades, original backups and shell activation. |
 | Interactive PTY | 3 | Terminal input, Ctrl-C and Ctrl-Z/fg in a real shell. |
-| Native Bazel | 9 × 2 versions | Parallel held actions under warning, guardian loss, authenticated recovery and run handoff. |
+| Native Bazel | 12 per version | Parallel held actions under warning, paused guardians, interrupted retirement, orphan recovery and run handoff; matrix: 8.4.2 and 9.2.0. |
 
 We deleted the original frontend executable during a live build and restarted
 the coordinator; retained ownership and native run handoff still completed.

@@ -723,7 +723,9 @@ pub async fn wait(
                         }
                         summary.exit_code = code;
                     }
-                    if job.reason.is_some() {
+                    if job.reason.as_ref().is_some_and(|reason| {
+                        reason != &format!("backend exited with code {}", summary.exit_code)
+                    }) {
                         summary.reason = job.reason.clone();
                     }
                 }
