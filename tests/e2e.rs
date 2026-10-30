@@ -368,6 +368,27 @@ fn guardian_death_quarantines_a_still_running_child() {
 }
 
 #[test]
+fn a_failed_backend_is_terminal_and_visible_in_status() {
+    let harness = Harness::new(1);
+    let output = harness
+        .command()
+        .args([
+            "exec",
+            "--",
+            env!("CARGO_BIN_EXE_fixture-backend"),
+            "exit",
+            "36",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(36));
+    let output = harness.command().arg("status").output().unwrap();
+    let status = String::from_utf8(output.stdout).unwrap();
+    assert!(status.contains("failed exec exit=36"), "{status}");
+    assert!(status.contains("backend exited with code 36"), "{status}");
+}
+
+#[test]
 fn stdout_stdin_and_non_utf8_arguments_are_preserved() {
     let harness = Harness::new(1);
     let argument = OsString::from_vec(vec![0xff, b' ', b'\"', 0xfe]);
@@ -1082,6 +1103,66 @@ fn native_guardian_loss_holds_capacity_until_client_and_server_finish() {
             .block_on(bazelqueue::native_server::idle(&server))
             .unwrap()
     );
+}
+
+#[test]
+#[ignore = "requires BAZELQUEUE_TEST_BAZEL; real Bazel in an isolated workspace"]
+fn native_unresponsive_orphan_finishes_and_admits_its_successor() {
+    let mut harness = Harness::new(1);
+    let socket = harness.root.path().join("action.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    native_workspace(
+        &harness,
+        &format!(
+            "genrule(name=\"held\",outs=[\"held.txt\"],tags=[\"local\"],cmd=\"{} hold {}; echo done > $@\")",
+            env!("CARGO_BIN_EXE_fixture-backend"),
+            socket.display()
+        ),
+    );
+    let mut args = native_args(&harness, "build");
+    args.push("//:held".into());
+    let child = native_command(&harness, args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(
+            fs::File::create(harness.root.path().join("native.log")).unwrap(),
+        ))
+        .spawn()
+        .unwrap();
+    harness.children.push(child);
+    let mut action = Harness::accepted(&listener);
+    let running = harness.wait(|s| s.jobs.iter().any(|job| job.state == "running"));
+    let job = &running.jobs[0];
+    let server = job.server.as_ref().unwrap();
+    let tree = platform::process_tree(&server.identity).unwrap();
+    platform::signal_pid(server.identity.pid, libc::SIGSTOP);
+    platform::signal_pid(job.request.owner.pid, libc::SIGKILL);
+    platform::signal_pid(job.child.as_ref().unwrap().pid, libc::SIGKILL);
+    harness.wait(|s| s.jobs[0].state == "quarantined");
+    let successor = harness.spawn_hold("successor");
+    let mut admitted = Harness::accepted(&successor);
+    let recovered = harness.snapshot().unwrap();
+    assert_eq!(recovered.jobs[0].state, "finished");
+    assert_eq!(recovered.jobs[0].code, Some(125));
+    assert!(
+        recovered.jobs[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("unresponsive orphan server")
+    );
+    assert!(tree.iter().all(|process| !platform::alive(process)));
+    assert_eq!(action.read(&mut [0]).unwrap(), 0);
+    let output = harness.command().arg("status").output().unwrap();
+    let status = String::from_utf8(output.stdout).unwrap();
+    assert!(status.contains("failed build exit=125"));
+    assert!(status.contains("unresponsive orphan server"));
+    let output = harness
+        .command()
+        .args(["wait", &job.request.id])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(125));
+    admitted.write_all(b"F").unwrap();
 }
 
 fn control(harness: &Harness, operation: &str) {

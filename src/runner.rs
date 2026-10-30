@@ -181,6 +181,7 @@ impl Ledger {
             exit_code: code,
             targets_reported: parsed.is_some(),
             exit_name: parsed.as_ref().and_then(|events| events.exit_name.clone()),
+            reason: parsed.as_ref().and_then(|events| events.reason.clone()),
             failures: parsed.map(|events| events.failures).unwrap_or_default(),
             queued_ms: self
                 .granted
@@ -714,7 +715,15 @@ pub async fn wait(
         };
         let job = snapshot.jobs.iter().find(|job| job.request.id == id);
         if job.is_none_or(|job| job.terminal()) {
-            if let Some(summary) = summary::load(paths, &id)? {
+            if let Some(mut summary) = summary::load(paths, &id)? {
+                if let Some(job) = job.filter(|job| job.terminal()) {
+                    if let Some(code) = job.code {
+                        summary.exit_code = code;
+                    }
+                    if job.reason.is_some() {
+                        summary.reason = job.reason.clone();
+                    }
+                }
                 return Ok(summary);
             }
             let job = job.with_context(|| format!("unknown request {id}"))?;
@@ -724,6 +733,7 @@ pub async fn wait(
                 workspace: job.request.workspace.clone(),
                 exit_code: job.code.unwrap_or(130),
                 exit_name: (job.state == "cancelled").then(|| "CANCELLED".into()),
+                reason: job.reason.clone(),
                 queued_ms: 0,
                 ran_ms: 0,
                 targets_reported: false,
@@ -885,18 +895,77 @@ async fn finish(
             report!("{line}");
         }
     }
-    platform::atomic_write(
+    let receipt = platform::atomic_write(
         &paths.root.join(format!("receipt-{}", ledger.id)),
         &serde_json::to_vec(&(code, stopped))?,
-    )?;
-    let _ = protocol::send(stream, &Message::Finish { code, stopped }).await;
-    Ok(())
+    );
+    send_finish(code, stopped, summary.reason, stream, receipt).await
+}
+
+/// The journal and the socket are independent completion paths. In particular,
+/// ENOSPC writing a receipt must not suppress the lifecycle message.
+async fn send_finish(
+    code: i32,
+    stopped: bool,
+    mut reason: Option<String>,
+    stream: &mut protocol::Framed<UnixStream>,
+    receipt: Result<()>,
+) -> Result<()> {
+    if let Err(error) = &receipt {
+        report!("bazelqueue: completion receipt not saved: {error:#}");
+        if error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.raw_os_error() == Some(libc::ENOSPC))
+        }) {
+            reason = Some("disk full writing completion receipt".into());
+        }
+    }
+    let sent = protocol::send(
+        stream,
+        &Message::Finish {
+            code,
+            stopped,
+            reason,
+        },
+    )
+    .await;
+    if receipt.is_err() { sent } else { Ok(()) }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::Hook;
+
+    #[tokio::test]
+    async fn disk_full_writing_receipt_still_delivers_finish_with_original_exit() {
+        let (sender, receiver) = UnixStream::pair().unwrap();
+        let mut sender = protocol::Framed::new(sender);
+        let mut receiver = protocol::Framed::new(receiver);
+        send_finish(
+            36,
+            true,
+            None,
+            &mut sender,
+            Err(std::io::Error::from_raw_os_error(libc::ENOSPC).into()),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(protocol::receive::<_,Message>(&mut receiver).await.unwrap(),
+            Message::Finish {code:36,stopped:true,reason:Some(reason)} if reason=="disk full writing completion receipt")
+        );
+    }
+
+    #[tokio::test]
+    async fn saved_receipt_survives_a_closed_completion_socket() {
+        let (sender, receiver) = UnixStream::pair().unwrap();
+        drop(receiver);
+        send_finish(3, true, None, &mut protocol::Framed::new(sender), Ok(()))
+            .await
+            .unwrap();
+    }
     #[test]
     fn off_a_terminal_a_queued_request_prints_its_first_position_and_its_start_only() {
         let queued = |position| Event::Queued {

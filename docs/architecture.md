@@ -39,6 +39,31 @@ through Bazel's authenticated CommandServer RPC with block_for_lock=false. The
 cookie, current process birth identity, final command result and returned PID
 must agree. Unknown work keeps its reservation until evidence is available.
 
+Quarantine is a recovery state, not a terminal result. Recovery first verifies
+that the owned client has exited; a completed guardian can also supply that
+evidence without disappearing itself. An authenticated nonblocking info command
+distinguishes an idle server from a busy one. The independent authenticated Ping
+RPC distinguishes an unresponsive server from a command whose info probe failed.
+A responsive server with an unsuccessful or timed-out info probe is never killed.
+
+After ten seconds of repeated unresponsive observations, recovery may stop only
+the recorded server of an orphan request, with no live owned client or other
+active queue owner of that workspace/output base. It repeats the liveness probe,
+verifies the current PID/birth identity, private server metadata and discovered
+workspace/output base, and commits captured descendant identities before
+signalling them. Those identities retain the reservation across a coordinator
+restart until every captured process has exited. A replacement server is probed
+but never targeted as the old server. Async results are discarded if the job or
+its connection changed while probing. No timeout directly frees capacity.
+
+Recovery records `finished`, preserving any known exit code or using 125 when
+the result was lost, and a bounded diagnosis visible in status and wait. It does
+not resubmit the command. A disk-full receipt write cannot suppress the Finish
+message: the receipt and socket are independent completion paths. New optional
+reason/process fields default when old records are read; receipt tuples and the
+existing terminal states remain compatible. A journal write failure prevents
+new admission rather than allowing work without a durable reservation.
+
 The scheduler reserves CPU tokens and invocation memory, including overhead.
 A managed build or test with history reserves an estimate: the guardian samples
 the CPU time of its Bazel server's process tree (live members plus reaped

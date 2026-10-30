@@ -2,7 +2,8 @@
 use crate::{
     config::{Config, Paths},
     platform,
-    protocol::{self, Event, Message, Snapshot},
+    protocol::{self, Event, Job, Message, Snapshot},
+    recovery::{self, Decision, NativeState, Observation},
     scheduler::{self, Capacity, Pressure},
     store::Store,
 };
@@ -30,8 +31,9 @@ enum Input {
         connection: u64,
     },
     Recovered {
-        id: String,
-        idle: bool,
+        observed: Box<Job>,
+        connection: Option<u64>,
+        native: NativeState,
     },
 }
 
@@ -463,8 +465,13 @@ fn settle_receipts(paths: &Paths, store: &Store) -> Result<()> {
                 let Some((code, stopped)) = outcome else {
                     continue;
                 };
-                job.code = Some(code);
-                job.state = if stopped { "finished" } else { "quarantined" }.into();
+                let reason = job.reason.clone().or_else(|| {
+                    crate::summary::load(paths, &id)
+                        .ok()
+                        .flatten()
+                        .and_then(|summary| summary.reason)
+                });
+                recovery::record_finish(job, code, stopped, reason);
                 store.save(job)?;
             }
             Some(job) => {
@@ -480,6 +487,144 @@ fn settle_receipts(paths: &Paths, store: &Store) -> Result<()> {
         let _ = fs::remove_file(receipt);
     }
     Ok(())
+}
+
+async fn observe_native(job: &Job) -> NativeState {
+    if job.request.command == "exec" {
+        return NativeState::Gone;
+    }
+    // The known server does not depend on a global process scan: an unrelated
+    // Java process with inaccessible arguments must not strand this request.
+    if let Some(server) = job
+        .server
+        .as_ref()
+        .filter(|server| platform::alive(&server.identity))
+    {
+        return crate::native_server::probe(server).await;
+    }
+    let Ok(mut servers) = platform::bazel_servers(&job.request.workspace) else {
+        return NativeState::Unknown;
+    };
+    // Discovery must not silently drop a recorded live server.
+    if let Some(server) = job
+        .server
+        .as_ref()
+        .filter(|server| platform::alive(&server.identity))
+        && !servers
+            .iter()
+            .any(|found| found.identity == server.identity)
+    {
+        servers.push(server.clone());
+    }
+    if servers.is_empty() {
+        return NativeState::Gone;
+    }
+    for server in &servers {
+        match crate::native_server::probe(server).await {
+            NativeState::Idle => {}
+            NativeState::Unresponsive
+                if servers.len() == 1
+                    && job.server.as_ref().is_some_and(|recorded| {
+                        recorded.identity == server.identity
+                            && recorded.output_base == server.output_base
+                    }) =>
+            {
+                return NativeState::Unresponsive;
+            }
+            NativeState::Unresponsive => return NativeState::Unknown,
+            state => return state,
+        }
+    }
+    NativeState::Idle
+}
+
+async fn apply_recovery(
+    paths: &Paths,
+    store: &Store,
+    observed: &Job,
+    connection: Option<u64>,
+    current_connection: Option<u64>,
+    native: NativeState,
+    unresponsive_for: Duration,
+) -> Result<()> {
+    let jobs = store.jobs()?;
+    let Some(mut job) = jobs
+        .iter()
+        .find(|job| job.request.id == observed.request.id)
+        .cloned()
+    else {
+        return Ok(());
+    };
+    if !recovery::current(observed, &job, connection, current_connection) {
+        return Ok(());
+    }
+    let observation = Observation {
+        owner_alive: platform::alive(&job.request.owner),
+        child_alive: job.child.as_ref().is_some_and(platform::alive)
+            || job.recovery_processes.iter().any(platform::alive),
+        native,
+        unresponsive_for,
+        other_owner: other_owner(&job, &jobs),
+    };
+    match recovery::decide(&job, observation) {
+        Decision::Finish(reason) => {
+            if job.code.is_none()
+                && let Ok(Some(summary)) = crate::summary::load(paths, &job.request.id)
+            {
+                job.code = Some(summary.exit_code);
+                job.reason = summary.reason;
+            }
+            recovery::finish(&mut job, reason);
+        }
+        Decision::Wait(reason) => {
+            if job.code.is_some() {
+                return Ok(());
+            }
+            job.reason = Some(format!("recovery pending: {reason}"));
+        }
+        Decision::StopServer => {
+            let server = job
+                .server
+                .as_ref()
+                .expect("recovery requires a recorded server");
+            if let Ok(Some(tree)) = crate::native_server::unresponsive_tree(server).await {
+                job.recovery_processes = tree;
+                job.reason = Some(
+                    "recovery pending: stopped unresponsive orphan server; verifying exit".into(),
+                );
+                // Commit the tree before signalling: a replacement coordinator
+                // must still account for every captured process until it exits.
+                store.save(&job)?;
+                for process in job.recovery_processes.iter().rev() {
+                    let _ = platform::signal_verified(process, libc::SIGKILL);
+                }
+            } else {
+                return Ok(());
+            }
+        }
+    }
+    store.save(&job)
+}
+
+fn other_owner(job: &Job, jobs: &[Job]) -> bool {
+    jobs.iter().any(|other| {
+        if other.request.id == job.request.id
+            || !(other.holds_capacity() || other.state == "run_phase")
+            || !other.request.shares_lane(&job.request)
+        {
+            return false;
+        }
+        let same_server = other
+            .server
+            .as_ref()
+            .zip(job.server.as_ref())
+            .is_some_and(|(a, b)| a.identity == b.identity && a.output_base == b.output_base);
+        !(other.state == "quarantined"
+            && same_server
+            && !platform::alive(&other.request.owner)
+            && !other.child.as_ref().is_some_and(platform::alive)
+            && !other.recovery_processes.iter().any(platform::alive))
+    })
 }
 
 fn notify(reply: &mpsc::Sender<Event>, event: Event) {
@@ -540,6 +685,7 @@ pub async fn run(paths: Paths) -> Result<()> {
     let mut mode = Pressure::from_samples(pressure, None, 0, config.pressure_recovery_samples);
     let mut tick = 0;
     let mut probing = std::collections::HashSet::new();
+    let mut unresponsive: HashMap<String, tokio::time::Instant> = HashMap::new();
     let mut deferred: HashMap<String, tokio::time::Instant> = HashMap::new();
     loop {
         let mut reschedule = false;
@@ -556,9 +702,13 @@ pub async fn run(paths: Paths) -> Result<()> {
                         if let Some(id)=connection_ids.remove(&connection)
                             && sessions.get(&id).is_some_and(|(current,_)|*current==connection) {sessions.remove(&id);notices.remove(&id);}
                     }
-                    Some(Input::Recovered {id,idle})=>{
-                        probing.remove(&id);
-                        if idle&& let Some(mut job)=store.jobs()?.into_iter().find(|job|job.request.id==id && job.state=="quarantined" && !platform::alive(&job.request.owner)) {job.state="cancelled".into();store.save(&job)?;}
+                    Some(Input::Recovered {observed,connection,native})=>{
+                        let id=&observed.request.id;
+                        probing.remove(id);
+                        let elapsed=if native==NativeState::Unresponsive {
+                            unresponsive.entry(id.clone()).or_insert_with(tokio::time::Instant::now).elapsed()
+                        }else {unresponsive.remove(id);Duration::ZERO};
+                        apply_recovery(&paths,&store,&observed,connection,sessions.get(id).map(|(connection,_)|*connection),native,elapsed).await?;
                     }
                     Some(Input::Message {connection,message:Message::Defer,reply})=> {
                         if let Some(id)=connection_ids.get(&connection).filter(|id|sessions.get(*id).is_some_and(|(current,_)|*current==connection))&& let Some(mut job)=store.jobs()?.into_iter().find(|job|&job.request.id==id && job.state=="preparing") {job.state="queued".into();store.save(&job)?;deferred.insert(id.clone(),tokio::time::Instant::now()+Duration::from_secs(1));notify(&reply,Event::Queued {position:store.jobs()?.iter().filter(|other|other.state=="queued" && other.sequence<=job.sequence).count(),reason:"native server is busy".into()});}
@@ -620,8 +770,13 @@ pub async fn run(paths: Paths) -> Result<()> {
                     store.save(job)?;
                 }
                 if !platform::alive(&job.request.owner) {
+                    for process in job.recovery_processes.iter().rev() {
+                        let _ = platform::signal_verified(process, libc::SIGKILL);
+                    }
                     if job.state == "queued" {
                         job.state = "cancelled".into();
+                        job.code = Some(130);
+                        job.reason = Some("guardian disappeared while queued".into());
                     } else if job.state == "run_phase" {
                         if let Some(child) =
                             job.child.as_ref().filter(|child| platform::alive(child))
@@ -635,13 +790,14 @@ pub async fn run(paths: Paths) -> Result<()> {
                         .as_ref()
                         .is_some_and(|server| platform::alive(&server.identity))
                         || job.child.as_ref().is_some_and(platform::alive)
+                        || job.recovery_processes.iter().any(platform::alive)
                     {
                         job.state = "quarantined".into();
                     } else if ((job.state == "starting" || job.state == "preparing")
                         && job.child.is_none())
                         || job.request.command == "exec"
                     {
-                        job.state = "cancelled".into();
+                        recovery::finish(job, "guardian disappeared; owned execution ended");
                     } else {
                         job.state = "quarantined".into();
                     }
@@ -649,7 +805,6 @@ pub async fn run(paths: Paths) -> Result<()> {
                 }
                 if tick % 4 == 0
                     && job.state == "quarantined"
-                    && !platform::alive(&job.request.owner)
                     && job
                         .child
                         .as_ref()
@@ -657,25 +812,24 @@ pub async fn run(paths: Paths) -> Result<()> {
                     && !probing.contains(&job.request.id)
                 {
                     let id = job.request.id.clone();
-                    let workspace = job.request.workspace.clone();
+                    let observed = Box::new(job.clone());
+                    let connection = sessions.get(&id).map(|(connection, _)| *connection);
                     probing.insert(id.clone());
                     let sender = tx.clone();
                     tokio::spawn(async move {
-                        let outcome = async {
-                            let servers = platform::bazel_servers(&workspace)?;
-                            for server in servers {
-                                if !crate::native_server::idle(&server).await? {
-                                    return Ok::<_, anyhow::Error>(false);
-                                }
-                            }
-                            Ok(true)
-                        };
-                        let idle = tokio::time::timeout(Duration::from_secs(4), outcome)
-                            .await
-                            .ok()
-                            .and_then(Result::ok)
-                            .unwrap_or(false);
-                        let _ = sender.send(Input::Recovered { id, idle }).await;
+                        let native = tokio::time::timeout(
+                            Duration::from_secs(10),
+                            observe_native(&observed),
+                        )
+                        .await
+                        .unwrap_or(NativeState::Unknown);
+                        let _ = sender
+                            .send(Input::Recovered {
+                                observed,
+                                connection,
+                                native,
+                            })
+                            .await;
                     });
                 }
             }
@@ -975,9 +1129,17 @@ fn handle(
                     job.child = Some(child);
                     job.state = "run_phase".into();
                 }
-                Message::Finish { code, stopped } => {
-                    job.code = Some(code);
-                    job.state = if stopped { "finished" } else { "quarantined" }.into();
+                Message::Finish {
+                    code,
+                    stopped,
+                    reason,
+                } => {
+                    if !job.terminal() {
+                        recovery::record_finish(&mut job, code, stopped, reason);
+                    } else if job.code == Some(code) && reason.is_some() {
+                        // The receipt may have won the race with this message.
+                        job.reason = reason;
+                    }
                 }
                 _ => bail!("invalid lifecycle transition from {}", job.state),
             }
@@ -1016,6 +1178,105 @@ fn legacy_owners(store: &Store, config: &Config) -> Result<Vec<platform::Identit
 mod tests {
     use super::*;
     use crate::protocol::{Budget, Job, Request};
+
+    #[tokio::test]
+    async fn a_recovered_orphan_is_durably_failed_and_duplicate_results_do_not_change_it() {
+        let fixture = Fixture::new();
+        let observed = fixture.job("orphan", "quarantined");
+        apply_recovery(
+            &fixture.paths,
+            &fixture.store,
+            &observed,
+            None,
+            None,
+            NativeState::Gone,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        let done = fixture.stored("orphan");
+        assert_eq!(done.state, "finished");
+        assert_eq!(done.code, Some(125));
+        assert!(!done.holds_capacity());
+        apply_recovery(
+            &fixture.paths,
+            &fixture.store,
+            &observed,
+            None,
+            None,
+            NativeState::Gone,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        assert_eq!(fixture.stored("orphan"), done);
+    }
+
+    #[tokio::test]
+    async fn a_reconnected_guardian_or_changed_job_rejects_late_recovery() {
+        let fixture = Fixture::new();
+        let observed = fixture.job("late", "quarantined");
+        apply_recovery(
+            &fixture.paths,
+            &fixture.store,
+            &observed,
+            Some(1),
+            Some(2),
+            NativeState::Idle,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        assert_eq!(fixture.stored("late"), observed);
+        let mut changed = observed.clone();
+        changed.child = Some(platform::current_identity().unwrap());
+        fixture.store.save(&changed).unwrap();
+        apply_recovery(
+            &fixture.paths,
+            &fixture.store,
+            &observed,
+            None,
+            None,
+            NativeState::Idle,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        assert_eq!(fixture.stored("late"), changed);
+    }
+
+    #[tokio::test]
+    async fn a_persisted_completion_summary_supplies_the_known_exit_after_guardian_loss() {
+        let fixture = Fixture::new();
+        let observed = fixture.job("summary", "quarantined");
+        let summary = crate::summary::Summary {
+            id: "summary".into(),
+            command: "build".into(),
+            workspace: "workspace".into(),
+            exit_code: 36,
+            exit_name: None,
+            reason: Some("disk full (No space left on device)".into()),
+            queued_ms: 0,
+            ran_ms: 0,
+            targets_reported: false,
+            failures: vec![],
+        };
+        crate::summary::save(&fixture.paths, &summary).unwrap();
+        apply_recovery(
+            &fixture.paths,
+            &fixture.store,
+            &observed,
+            None,
+            None,
+            NativeState::Idle,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        let done = fixture.stored("summary");
+        assert_eq!(done.code, Some(36));
+        assert!(done.reason.unwrap().contains("disk full"));
+    }
 
     struct Fixture {
         _root: tempfile::TempDir,

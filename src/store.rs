@@ -56,6 +56,8 @@ impl Store {
             server: None,
             code: None,
             cancel: false,
+            reason: None,
+            recovery_processes: Vec::new(),
         };
         self.connection.execute(
             "INSERT INTO jobs(id,data) VALUES(?1,?2)",

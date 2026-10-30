@@ -89,8 +89,12 @@ waits. In a terminal, every position change is shown as it happens.
 | `bazel run` finishes compiling | The target runs through Bazel's generated script. Compilation capacity is released; the target's process footprint remains tracked. |
 
 Running builds never lose their reservation because a timer expired. Uncertain
-native work stays quarantined until an authenticated, nonblocking server probe
-verifies idleness. [Architecture and recovery](docs/architecture.md).
+native work stays quarantined while recovery verifies its processes and server.
+Idle or terminated work releases its reservation and gets a final exit code and
+reason. A recorded orphan server that no longer answers its liveness RPC is
+stopped only after identity and ownership checks; its captured process tree stays
+accounted for until it exits. Busy servers keep their reservation. Recovery never
+retries the build. [Architecture and recovery](docs/architecture.md).
 
 ## Using it from an agent
 
@@ -150,6 +154,13 @@ bazelqueue status --json     # Inspect it from a script or agent
 | `bazelqueue doctor` | Check the backend, telemetry and recovery state. |
 | `bazelqueue config show` | Print the effective configuration. |
 | `bazelqueue exec -- /absolute/backend ARGS...` | Queue a backend explicitly without PATH interception. |
+
+`status` also shows the ten most recent failed requests, with their exit code
+and reason. `status --json` includes those details in the retained job records.
+Recovered requests with no known result end with exit 125; `bazelqueue wait ID`
+reports that failure even if the guardian could not save a summary. Explicit
+disk-full evidence is shown as such; an environmental exit code alone is not
+treated as proof that the disk was full.
 
 <details>
 <summary>Upgrades and removal</summary>

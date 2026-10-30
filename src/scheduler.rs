@@ -274,6 +274,8 @@ mod tests {
             server: None,
             code: None,
             cancel: false,
+            reason: None,
+            recovery_processes: Vec::new(),
         }
     }
     fn capacity() -> Capacity {

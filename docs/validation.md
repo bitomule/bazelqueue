@@ -112,3 +112,30 @@ at the warning level throughout (87–100 % of samples, in both versions). The
 `--jobs=64` runs never reached critical and kept at least 21 % free; the
 v0.1.8 runs reached critical in 35 % of one warm run's samples and 18 % free.
 Swap grew 0.4–2.1 GiB per run in both.
+
+## Orphan quarantine and disk-full completion (30 October 2026)
+
+The live 0.1.8 coordinator (84301) held request
+`96533-1793367982921034000` in quarantine with 2 CPU / 2304 MiB. That consumed
+the entire warning budget, with requests queued and no managed build running.
+Its guardian 96533 and client 78122 were gone; server 78014 remained. Its output
+base's command log explicitly reported `No space left on device` during
+dependency extraction. Neither a completion receipt nor a saved summary existed.
+This does not establish why the guardian died.
+
+The same recovery path remained on freshly fetched main at f7d3cf6. A direct
+nonblocking `info server_pid release` query on the affected output base reported
+`Killed non-responsive server process (pid=78014)`. Bazel replaced that server;
+the coordinator then released the quarantine and status showed request
+`42696-1793368547389235000` running. No queue cancellation was sent. The cache
+volume had 10 GiB available at inspection time.
+
+The regression suite injects native liveness outcomes, guardian/client state,
+elapsed recovery time and ENOSPC without filling any real volume. It checks
+successor admission after recovery, preservation of real execution reservations,
+late results and reconnects, PID/birth mismatches, authenticated busy versus hung
+RPCs, and completion delivery when receipt storage fails. Native contracts use
+held actions and isolated HOME/state/output bases; they retain capacity for a
+busy server and verify that a stopped orphan server and its captured descendants
+exit before a successor starts. Execution and ablation results are recorded with
+the PR and the committed validation ledger.

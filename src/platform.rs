@@ -80,6 +80,18 @@ pub fn current_identity() -> Result<Identity> {
 pub fn alive(owner: &Identity) -> bool {
     identity(owner.pid).as_ref() == Some(owner)
 }
+
+/// Signal only the process whose birth identity was recorded, never a PID
+/// supplied by stale server metadata. Completion still requires observing exit.
+pub fn signal_verified(owner: &Identity, signal: i32) -> Result<bool> {
+    if !alive(owner) {
+        return Ok(false);
+    }
+    if unsafe { libc::kill(owner.pid as i32, signal) } != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(true)
+}
 pub fn uid() -> u32 {
     unsafe { libc::geteuid() }
 }
@@ -229,6 +241,34 @@ pub fn process_memory(owners: &[Identity]) -> u64 {
         .filter_map(|pid| system.process(*pid))
         .map(|process| process.memory() / 1024 / 1024)
         .sum()
+}
+
+/// Capture birth identities before stopping an orphan server, so descendants
+/// cannot outlive it unnoticed even across a coordinator restart.
+pub fn process_tree(root: &Identity) -> Result<Vec<Identity>> {
+    let mut system = System::new();
+    system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+    if !alive(root) || system.process(Pid::from_u32(root.pid)).is_none() {
+        bail!("native server process changed during recovery");
+    }
+    let mut tree = vec![root.clone()];
+    loop {
+        let before = tree.len();
+        for (pid, process) in system.processes() {
+            if process
+                .parent()
+                .is_some_and(|parent| tree.iter().any(|owner| owner.pid == parent.as_u32()))
+                && !tree.iter().any(|owner| owner.pid == pid.as_u32())
+                && let Some(owner) = identity(pid.as_u32())
+            {
+                tree.push(owner);
+            }
+        }
+        if tree.len() == before {
+            break;
+        }
+    }
+    Ok(tree)
 }
 
 /// CPU seconds a process tree has used: every live member's own time plus what

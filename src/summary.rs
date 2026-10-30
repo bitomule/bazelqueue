@@ -32,6 +32,8 @@ pub struct Summary {
     pub workspace: String,
     pub exit_code: i32,
     pub exit_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     pub queued_ms: u64,
     pub ran_ms: u64,
     /// Whether Bazel reported per-target results; false for unmanaged invocations.
@@ -42,6 +44,7 @@ pub struct Summary {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Events {
     pub exit_name: Option<String>,
+    pub reason: Option<String>,
     pub failures: Vec<Failure>,
 }
 
@@ -110,6 +113,19 @@ pub fn parse_events(text: &str) -> Events {
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
     {
         let id = event.get("id").cloned().unwrap_or(Value::Null);
+        // Store a fixed diagnosis, never arbitrary stderr or failure messages.
+        if [
+            event.pointer("/progress/stderr"),
+            event.pointer("/aborted/description"),
+            event.pointer("/finished/failureDetail/message"),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .any(|text| text.contains("No space left on device"))
+        {
+            events.reason = Some("disk full (No space left on device)".into());
+        }
         if let Some(result) = event.get("testResult")
             && let Some(name) = label(&id, &["testResult"])
             && let Some(log) = test_log(result.get("testActionOutput"))
@@ -211,6 +227,9 @@ impl Summary {
             duration(self.queued_ms),
             duration(self.ran_ms),
         );
+        if let Some(reason) = &self.reason {
+            first.push_str(&format!(" reason={reason}"));
+        }
         if self.targets_reported {
             first.push_str(&format!(" failed={}", self.failures.len()));
         } else {
@@ -325,6 +344,29 @@ pub fn prune(directory: &Path, keep: usize, now: SystemTime) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn explicit_disk_failure_is_reported_without_copying_stderr() {
+        let events = parse_events(
+            r#"{"progress":{"stderr":"private arguments then No space left on device"}}"#,
+        );
+        assert_eq!(
+            events.reason.as_deref(),
+            Some("disk full (No space left on device)")
+        );
+        assert!(
+            parse_events(r#"{"finished":{"exitCode":{"name":"LOCAL_ENVIRONMENTAL_ERROR"}}}"#)
+                .reason
+                .is_none()
+        );
+        let mut failed = summary(0);
+        failed.reason = events.reason;
+        assert!(failed.lines(None)[0].contains("reason=disk full"));
+        assert!(!failed.lines(None)[0].contains("private arguments"));
+        let mut old = serde_json::to_value(summary(0)).unwrap();
+        old.as_object_mut().unwrap().remove("reason");
+        assert_eq!(serde_json::from_value::<Summary>(old).unwrap().reason, None);
+    }
+
     fn summary(failures: usize) -> Summary {
         Summary {
             id: "7-1".into(),
@@ -332,6 +374,7 @@ mod tests {
             workspace: "/w".into(),
             exit_code: 3,
             exit_name: Some("TESTS_FAILED".into()),
+            reason: None,
             queued_ms: 192_000,
             ran_ms: 65_400,
             targets_reported: true,
