@@ -264,6 +264,42 @@ fn show(event: Event, json: bool) -> Result<()> {
         if let Some(skew) = coordinator::skew(&snapshot) {
             println!("warning: {skew}");
         }
+        if let Some(resources) = &snapshot.resources {
+            println!(
+                "Memory available {} MiB | swap in/out {}/{} MiB/min | {}",
+                resources
+                    .sample
+                    .available_mib
+                    .map_or("unknown".into(), |value| value.to_string()),
+                resources
+                    .swap_in_mib_per_min
+                    .map_or("unknown".into(), |rate| format!("{rate:.1}")),
+                resources
+                    .swap_out_mib_per_min
+                    .map_or("unknown".into(), |rate| format!("{rate:.1}")),
+                resources.reason.as_deref().unwrap_or("full admission")
+            );
+        }
+        for hour in &snapshot.utilization {
+            let observed = hour.observed_ms.max(1) as f64;
+            let cpu = if hour.host_cpu_observed_ms == 0 {
+                "unknown".into()
+            } else {
+                format!(
+                    "{:.1}%",
+                    hour.host_cpu_percent_ms / hour.host_cpu_observed_ms as f64
+                )
+            };
+            println!(
+                "{:02}:00 UTC | observed {:.1}s/3600s | busy {:.1}% | reserved CPU {:.1}% / memory {:.1}% | host CPU {}",
+                hour.start_unix_ms / 3_600_000 % 24,
+                observed / 1000.0,
+                hour.busy_ms as f64 * 100.0 / observed,
+                hour.reserved_cpu_percent_ms / observed,
+                hour.reserved_memory_percent_ms / observed,
+                cpu
+            );
+        }
         for owner in snapshot.legacy {
             println!("legacy {} draining", owner.pid);
         }

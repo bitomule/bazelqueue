@@ -46,8 +46,10 @@ remains active. The old slot TTL is not used to grant new capacity. Original
 scripts and symlink targets are backed up privately; caches and credentials are
 not moved into this repository.
 
-The initial production default is one expensive invocation. Calibrate before
-increasing max_builds. CPU and memory capacity are global; a concurrently admitted
+New configurations target two large invocations, leave one logical CPU free and
+keep a memory margin of at least 1024 MiB / 5%. Existing settings are preserved:
+an older max_builds=1 remains an explicit serial preference for large jobs until
+changed. CPU and memory capacity are global; a concurrently admitted
 job receives a share rather than independently claiming the whole host. Opaque
 requests remain exclusive. A lone supported job can use the wider profile.
 

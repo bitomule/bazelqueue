@@ -425,7 +425,7 @@ fn stdout_stdin_and_non_utf8_arguments_are_preserved() {
 fn critical_memory_pressure_blocks_and_recovery_resumes_the_queue() {
     let mut harness = Harness::new(1);
     fs::write(harness.paths.root.join("pressure"), "4").unwrap();
-    harness.wait(|s| s.pressure == "critical" && s.held);
+    harness.wait(|s| s.pressure == "critical" && s.constrained.is_some());
     let listener = harness.spawn_hold("a");
     harness.wait(|s| s.jobs.iter().any(|job| job.state == "queued"));
     fs::write(harness.paths.root.join("pressure"), "1").unwrap();
@@ -434,34 +434,88 @@ fn critical_memory_pressure_blocks_and_recovery_resumes_the_queue() {
 }
 
 #[test]
-fn warning_runs_one_job_with_the_reduced_budget_and_recovery_restores_parallelism() {
+fn warning_runs_parallel_jobs_at_full_capacity() {
     let mut harness = Harness::new(2);
+    harness.command().arg("drain").output().unwrap();
     fs::write(harness.paths.root.join("pressure"), "2").unwrap();
-    harness.wait(|s| s.pressure == "warning" && s.constrained.is_some());
+    harness.wait(|s| s.pressure == "warning" && s.constrained.is_none());
     let first = harness.spawn_hold("first");
-    let mut running = Harness::accepted(&first);
     let second = harness.spawn_hold("second");
-    let snapshot = harness.wait(|s| s.jobs.iter().any(|job| job.state == "queued"));
+    harness.wait(|s| s.jobs.iter().filter(|job| job.state == "queued").count() == 2);
+    harness.command().arg("resume").output().unwrap();
+    let mut running = Harness::accepted(&first);
+    let mut parallel = Harness::accepted(&second);
+    let snapshot =
+        harness.wait(|s| s.jobs.iter().filter(|job| job.state == "running").count() == 2);
     let active: Vec<_> = snapshot
         .jobs
         .iter()
         .filter(|job| job.holds_capacity())
         .collect();
-    assert_eq!(active.len(), 1);
-    assert_eq!(active[0].request.budget.cpu, 2);
-    assert_eq!(active[0].request.budget.memory_mib, 1024);
-    fs::write(harness.paths.root.join("pressure"), "1").unwrap();
-    let mut parallel = Harness::accepted(&second);
-    let snapshot = harness.wait(|s| s.jobs.iter().filter(|job| job.holds_capacity()).count() == 2);
-    let restored = snapshot
-        .jobs
-        .iter()
-        .find(|job| job.holds_capacity() && job.request.budget.cpu != 2)
-        .unwrap();
-    assert_eq!(restored.request.budget.cpu, 4);
-    assert_eq!(restored.request.budget.memory_mib, 2048);
+    assert_eq!(active.len(), 2);
+    assert!(
+        active
+            .iter()
+            .all(|job| job.request.budget.cpu == 4 && job.request.budget.memory_mib == 2048)
+    );
     running.write_all(b"F").unwrap();
     parallel.write_all(b"F").unwrap();
+}
+
+#[test]
+fn critical_reduces_new_work_and_warning_recovers_without_changing_a_grant() {
+    let mut harness = Harness::new(2);
+    fs::write(harness.paths.root.join("pressure"), "4").unwrap();
+    harness.wait(|s| s.constrained.is_some());
+    let first = harness.spawn_hold("first");
+    let mut running = Harness::accepted(&first);
+    let second = harness.spawn_hold("second");
+    let before = harness.wait(|s| s.jobs.iter().any(|job| job.state == "queued"));
+    let granted = before
+        .jobs
+        .iter()
+        .find(|job| job.state == "running")
+        .unwrap()
+        .request
+        .budget
+        .clone();
+    assert_eq!((granted.cpu, granted.memory_mib), (2, 1024));
+    assert!(second.accept().is_err());
+    fs::write(harness.paths.root.join("pressure"), "2").unwrap();
+    let mut parallel = Harness::accepted(&second);
+    let after = harness.wait(|s| s.jobs.iter().filter(|job| job.state == "running").count() == 2);
+    assert!(after.constrained.is_none());
+    assert!(
+        after
+            .jobs
+            .iter()
+            .any(|job| job.state == "running" && job.request.budget == granted)
+    );
+    running.write_all(b"F").unwrap();
+    parallel.write_all(b"F").unwrap();
+}
+
+#[test]
+fn injected_swap_rates_reduce_and_recover_while_warning_persists() {
+    let mut harness = Harness::new(2);
+    let sensor = harness.paths.root.join("resources.json");
+    let sample = |counter, at_ms| serde_json::json!({"at_ms":at_ms,"pressure":2,"total_mib":5120,"available_mib":5120,"swap_in_bytes":counter,"swap_out_bytes":counter});
+    platform::atomic_write(&sensor, &serde_json::to_vec(&sample(0_u64, 0)).unwrap()).unwrap();
+    harness.wait(|s| s.pressure == "warning" && s.constrained.is_none());
+    platform::atomic_write(
+        &sensor,
+        &serde_json::to_vec(&sample(1_u64 << 50, 1000)).unwrap(),
+    )
+    .unwrap();
+    harness
+        .wait(|s| s.resources.as_ref().and_then(|r| r.reason.as_deref()) == Some("swap thrashing"));
+    // Virtual time stays fixed until the test has observed the reduction.
+    platform::atomic_write(
+        &sensor,
+        &serde_json::to_vec(&sample(1_u64 << 50, 2000)).unwrap(),
+    )
+    .unwrap();
+    harness.wait(|s| s.pressure == "warning" && s.constrained.is_none());
 }
 
 #[test]
@@ -1101,6 +1155,8 @@ fn control(harness: &Harness, operation: &str) {
 #[ignore = "requires BAZELQUEUE_TEST_BAZEL; real concurrent native actions"]
 fn native_distinct_workspaces_execute_in_parallel_with_bounded_shares() {
     let mut harness = Harness::new(2);
+    fs::write(harness.paths.root.join("pressure"), "2").unwrap();
+    harness.wait(|s| s.pressure == "warning" && s.constrained.is_none());
     native_workspace(&harness, "");
     let mut config = Config::load(&harness.paths).unwrap();
     config.cpu_capacity = 7;
@@ -1152,7 +1208,7 @@ fn native_distinct_workspaces_execute_in_parallel_with_bounded_shares() {
             .filter(|job| job.state == "running")
             .map(|job| job.request.budget.cpu)
             .sum::<u32>(),
-        6
+        7
     );
     assert!(
         snapshot

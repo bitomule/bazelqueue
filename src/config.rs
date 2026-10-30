@@ -24,6 +24,8 @@ pub struct Config {
     pub managed: bool,
     pub pressure_recovery_samples: u32,
     pub constrained_divisor: u32,
+    pub memory_safety_mib: u64,
+    pub swap_thrashing_mib_per_min: u64,
     pub hooks: Vec<Hook>,
     pub legacy: Vec<platform::Identity>,
 }
@@ -39,21 +41,23 @@ pub struct Hook {
 impl Default for Config {
     fn default() -> Self {
         let cores = std::thread::available_parallelism().map_or(2, |n| n.get() as u32);
-        let cpu = ((cores * 3) / 4).max(1);
+        let cpu = cores.saturating_sub(1).max(1);
         let memory = platform::total_memory_mib().unwrap_or(8192);
-        let budget = (memory / 2).max(1024);
+        let budget = memory.saturating_sub(1024.max(memory / 20)).max(256);
         Self {
             backend: PathBuf::from("/opt/homebrew/opt/bazelisk/bin/bazelisk"),
             bazel_backend: None,
             cpu_capacity: cpu,
             memory_capacity_mib: budget,
-            max_builds: 1,
+            max_builds: 2.min(cpu as usize).min((budget / 256) as usize),
             jobs: 64,
             action_memory_mib: (budget * 2 / 3).max(256),
             worker_instances: 2,
             managed: true,
             pressure_recovery_samples: 3,
             constrained_divisor: 4,
+            memory_safety_mib: 1024,
+            swap_thrashing_mib_per_min: 64,
             hooks: Vec::new(),
             legacy: Vec::new(),
         }
@@ -89,6 +93,8 @@ impl Config {
             || self.worker_instances == 0
             || self.pressure_recovery_samples == 0
             || self.constrained_divisor == 0
+            || self.memory_safety_mib == 0
+            || self.swap_thrashing_mib_per_min == 0
         {
             bail!("resource capacities and concurrency must be positive");
         }
@@ -130,8 +136,7 @@ impl Config {
             },
         }
     }
-    /// One build under memory-pressure warning: a quarter of the default capacity is an
-    /// eighth of RAM, which fits inside XNU's gap between warning (50 %) and critical (35 %).
+    /// A single smaller invocation during critical pressure or active swap thrashing.
     pub fn constrained_budget(&self) -> Budget {
         Budget {
             cpu: (self.cpu_capacity / self.constrained_divisor).max(1),

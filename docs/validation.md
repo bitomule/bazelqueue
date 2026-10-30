@@ -29,7 +29,8 @@ No ordinary test touches the live ~/.alondra, Keychain, launchd, Pi or user shim
 Performance measurements must separate queue/IPC overhead, warm/cold builds,
 per-call latency, total makespan, memory pressure and swap activity. CPU-only
 utilization and a cached no-op build do not prove maximum compile throughput.
-Machine-specific calibration is stored locally, not shipped as a personal default.
+Raw machine-specific calibration is stored locally; published comparisons state
+their machine, workload and limitations.
 
 An opt-in compiler experiment is available in `tests/calibrate.py`. It compares
 one and two admitted builds across two isolated workspaces, using sixteen fresh
@@ -44,7 +45,8 @@ tests, and 7 real Bazel contracts on each of 8.4.2 and 9.2.0. The native
 contracts include simultaneous held actions in distinct workspaces and two
 queued builds completing while a run target remains alive.
 
-The compiler calibration performed one sample per profile:
+The original compiler calibration performed one sample per profile (historical
+evidence for the original default, superseded by the new admission policy):
 
 | CPU tokens | Concurrent builds | Total time | Native pressure before / after |
 | --- | --- | --- | --- |
@@ -55,9 +57,25 @@ The compiler calibration performed one sample per profile:
 These are total command times, including queue admission. The third sample
 started under memory pressure and waited for admission; it does not establish
 compiler speed. The first two samples do not demonstrate a meaningful throughput
-gain from simultaneous invocations. The local initial selection is 8 CPU tokens,
+gain from simultaneous invocations. The original local selection was 8 CPU tokens,
 9 GiB reserved memory and one build, with parallel actions inside that build.
 Other workloads should be calibrated before increasing invocation concurrency.
+
+The warning/full versus reduced ABBA experiment, research and limitations are in
+[Admission research and measurements](admission-measurements.md). New pure tests
+cover injected pressure, bidirectional swap rates, missing sensors, counter
+resets, pending memory growth, fair resource sharing and hourly utilization.
+Process E2E covers warning parallelism and recovery while grants remain fixed.
+The native parallel-action contract also runs under injected warning and uses
+all seven configured CPU tokens, including the uneven remainder.
+
+The admission change was validated with 67 unit tests, 29 process E2E tests,
+17 installation transaction tests and 3 PTY tests, plus nine native contracts
+per Bazel version. Seven review counterexamples failed before their fixes
+(four initial failures, one stale-memory failure and two follow-up failures),
+then passed. Separate ablations restoring the warning penalty and disabling
+resource sharing each failed the corresponding regression test. Two independent
+reviewers and a separate verifier completed three rounds with no findings left.
 
 A noisy native recovery contract emits 128 KiB of stderr. Its test consumer
 uses a file sink: an unread pipe can block the native client even after the

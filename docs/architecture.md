@@ -45,12 +45,48 @@ the CPU time of its Bazel server's process tree (live members plus reaped
 children, so workers, actions and tests all count) before and after the client
 runs, keyed by repository, command and the arguments that change what gets built;
 a run without its own history takes the median of its repository and command. Estimated reservations are
-bounded by summed CPU and memory rather than `max_builds`, admission stays first
-come first served, and warning pressure still admits one reduced build at a time.
+bounded by summed CPU and memory rather than `max_builds`. Large estimates share
+the remaining machine with other waiting lanes; a lone invocation can use the
+wide profile. CPU division assigns the remainder rather than losing a core.
+Admission stays first come first served among available lanes.
 Reservations stay immutable while executing. Profiles can broaden only before
-execution; lowering settings drains active work. Native memory-pressure warning
-admits one build at a time with a reduced budget; critical pressure stops new
-admission; healthy samples provide recovery hysteresis before full capacity. Historical swap usage does not permanently block builds.
+execution; lowering settings drains active work. Warning has the same admission
+capacity as normal. Critical pressure or swap-in AND swap-out rates above
+64 MiB/min admit at most one managed build with the configured reduced budget,
+subject to memory headroom. Opaque work waits in that mode. The next safe sample
+restores normal admission, including when native pressure remains warning.
+Historical swap occupancy and compressor size are diagnostic only. A known
+thrashing state survives missing/reset counters until valid rates prove recovery.
+
+Native samples arrive each second: macOS pressure and available percentage from
+sysctl, VM counters from host_statistics64, and CPU gauges. Memory falls back to
+sysinfo availability. Missing memory can reuse the last reading for five seconds,
+then holds admission. Swap counter resets, missing counters and non-increasing
+timestamps produce no rate. CPU load above four per logical core holds new
+admission until below three, without changing active reservations.
+
+The free-memory margin is max(memory_safety_mib, 5% RAM), initially 1024 MiB.
+Fresh admission headroom subtracts growth promised to active work:
+sum(max(reserved MiB - observed resident MiB, 0)). It then deducts every new grant.
+This avoids both counting resident memory twice and giving multiple starts the
+same still-free memory. The configured global budget remains an independent cap,
+including the memory of live run targets. Sampling and process-tree inspection
+stay outside the deterministic scheduler; tests inject both resources and time.
+When availability is reused, its original residency snapshot is reused too.
+Unused small-job shares are redistributed to larger waiting jobs before grants.
+Opaque invocations own the CPU lane exclusively and account for the lesser of
+real headroom and the configured memory remaining after run targets; their argv
+is unchanged, so this accounting estimate does not impose a native memory quota.
+
+Hourly utilization is persisted under the existing settings table, with no job
+format or schema-version change. It integrates state transitions and splits
+intervals at UTC hour boundaries. Busy time means at least one metered job in
+running; reservation use includes preparation, starting and quarantine. Host CPU
+is sampled separately. The latest 24 hourly buckets carry observed coverage;
+restart gaps, sample gaps above five seconds and clock jumps are unknown. New
+snapshot fields have serde defaults for compatible protocol-v1 upgrades.
+An accepted UTC watermark is persisted so clock rewinds cannot count an interval
+twice. Rejected forward jumps do not advance that watermark or prune history.
 
 Native info discovers actual output-base lanes before execution. Busy native
 servers yield preparation capacity rather than monopolizing the queue. Opaque
