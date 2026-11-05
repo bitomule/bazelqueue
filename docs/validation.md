@@ -87,6 +87,16 @@ consumed-output version must pass all busy/quarantine/idleness checks.
 directory. Ordinary Cargo checks therefore cannot replace a feature-enabled
 fixture executable while an E2E suite is using it.
 
+`make contract` needs the network only once per Bazel version. The native
+workspaces turn off rule autoloading, which would otherwise download
+rules_java, rules_shell, rules_python and rules_cc from GitHub into every
+fresh output base. The first native test seeds a module lockfile and a shared
+repository cache under `target/e2e/tmp` by building and testing once. Every
+later workspace reuses them and neither the registry nor GitHub is contacted.
+CI caches both directories. On 5 November 2026, with every download refused
+through a dead proxy, the 13 native tests passed against Bazel 8.4.2 and
+9.2.0. With the previous helpers they failed at registry resolution.
+
 Retained-image tests delete the original frontend executable after admission,
 restart the coordinator, and require unchanged ownership and successful native
 run handoff. A targeted SIGINT test addresses the frontend PID directly and
