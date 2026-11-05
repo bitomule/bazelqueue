@@ -304,7 +304,12 @@ fn show(event: Event, json: bool) -> Result<()> {
             println!("legacy {} draining", owner.pid);
         }
         for job in snapshot.jobs.iter().filter(|job| !job.terminal()) {
-            let reservation = if job.metered() {
+            let reservation = if job.holds_fast_capacity() {
+                format!(
+                    "{} CPU {} MiB fast lane",
+                    job.request.budget.cpu, job.request.budget.memory_mib
+                )
+            } else if job.metered() {
                 format!(
                     "{} CPU {} MiB",
                     job.request.budget.cpu, job.request.budget.memory_mib

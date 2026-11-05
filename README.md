@@ -83,6 +83,7 @@ waits. In a terminal, every position change is shown as it happens.
 | Situation | Queue behavior |
 |---|---|
 | Several agents use different worktrees | CPU and memory reservations determine which calls fit. Same-server calls keep FIFO order. |
+| A build or test has nothing to rebuild | Bazel's own up-to-date check runs in a small fast-lane slot; if it passes, the call starts at once instead of waiting behind other builds. |
 | Memory pressure rises | Warning keeps full capacity. Critical pressure or active swap thrashing admits one smaller build if real memory headroom permits; the next safe sample restores full admission. |
 | The caller disappears | Its owned backend is cancelled. Capacity is retained until completion or verified recovery. |
 | The coordinator restarts | Guardians reconnect without submitting the command a second time. |
@@ -216,6 +217,7 @@ ${EDITOR:-vi} ~/.local/state/bazelqueue/config.toml
 | `worker_instances` | Worker and multiplex-worker instance caps. |
 | `memory_safety_mib` | Free-memory margin, at least 5% of RAM. Default: **1024 MiB**. |
 | `swap_thrashing_mib_per_min` | Threshold that both swap-in and swap-out rates must exceed to reduce admission. Default: **64 MiB/min** each. |
+| `fast_lane_slots` | Up-to-date checks, and the runs they admit, that may proceed outside the build capacity at once. Default: **2**; `0` turns the fast lane off. |
 
 A lone supported build can receive the wide profile. Concurrent managed builds
 use smaller reservations; their budgets remain fixed once execution starts.
@@ -251,6 +253,20 @@ time, but a full-machine estimate is divided when other lanes are waiting.
 A run in a repository with no history of its command receives the same fair
 share. History lives in
 `estimates.json` in the state directory.
+
+**Builds with nothing to rebuild skip the queue.** A queued managed `build` or
+`test` in a workspace where Bazel already built successfully first asks Bazel
+itself, with `--check_up_to_date` or `--check_tests_up_to_date`, whether it would
+execute anything, unless earlier work waits in the same workspace. The check
+runs with the caller's arguments in a fast-lane slot
+of the worker count in CPUs and 1536 MiB, outside the build capacity but within
+real memory headroom, and never under critical pressure. Only exit code 0 counts:
+the call then starts at once in that slot and prints `bazelqueue: started ID at
+once: Bazel reports nothing to rebuild`. Tests Bazel never caches still run, at
+the slot's CPUs. Any other result, a busy server or a 30 second timeout keeps the
+call at its queue position, already prepared. Bazel's check only trusts the
+workspace's own action cache: results available only in a remote or disk cache
+still wait for a reservation. [Measurements](docs/admission-measurements.md#fast-lane-measurement-5-november-2026).
 
 **Warning is not a reason to slow a build down.** Under native warning pressure,
 sixteen fresh Clang compilations took **16.14 / 16.45 s** with 8 CPU / 9 GiB,

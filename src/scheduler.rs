@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 use crate::{
     config::Config,
-    protocol::{Admission, Budget, Job, Request},
+    protocol::{Admission, Budget, FastLane, Job, Request},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,7 +98,7 @@ pub fn allocate_queued(jobs: &mut [Job], config: &Config, capacity: &Capacity) {
         })
         .filter(|job| {
             !jobs.iter().any(|other| {
-                other.holds_build_capacity() && other.request.shares_lane(&job.request)
+                other.holds_metered_capacity() && other.request.shares_lane(&job.request)
             })
         })
         .map(|job| job.request.lane.clone())
@@ -212,7 +212,7 @@ pub fn eligible(jobs: &[Job], config: &Config, capacity: &Capacity) -> Vec<u64> 
             Admission::Maintenance
                 if !jobs
                     .iter()
-                    .filter(|other| other.holds_build_capacity())
+                    .filter(|other| other.holds_metered_capacity())
                     .map(|other| &other.request)
                     .chain(maintained.iter().copied())
                     .any(|other| other.shares_lane(&job.request)) =>
@@ -278,6 +278,9 @@ pub fn eligible(jobs: &[Job], config: &Config, capacity: &Capacity) -> Vec<u64> 
         if active
             .iter()
             .any(|other| other.request.lane == job.request.lane)
+            || jobs
+                .iter()
+                .any(|other| other.holds_fast_capacity() && other.request.shares_lane(&job.request))
             || maintained
                 .iter()
                 .any(|other| other.shares_lane(&job.request))
@@ -317,6 +320,54 @@ pub fn eligible(jobs: &[Job], config: &Config, capacity: &Capacity) -> Vec<u64> 
         chosen.push(job.sequence);
     }
     chosen
+}
+
+/// Queued fast-lane requests that may be checked now, ahead of the build queue.
+/// A check runs only where Bazel has built before: a first invocation in a
+/// workspace never passed one in the measured history.
+pub fn fast_lane(jobs: &[Job], config: &Config, capacity: &Capacity) -> Vec<u64> {
+    if capacity.drained || capacity.legacy_active || capacity.pressure != Pressure::Normal {
+        return Vec::new();
+    }
+    let memory = config.fast_budget().memory_mib;
+    let mut slots = jobs.iter().filter(|job| job.holds_fast_capacity()).count();
+    let mut fresh_memory = 0_u64;
+    let mut chosen: Vec<&Job> = Vec::new();
+    for job in jobs.iter().filter(|job| {
+        job.state == "queued"
+            && !job.cancel
+            && job.request.fast_lane
+            && !job.request.prepared
+            && job.fast == FastLane::Unchecked
+    }) {
+        if slots >= config.fast_lane_slots as usize
+            || fresh_memory.saturating_add(memory) > capacity.new_memory_mib
+        {
+            break;
+        }
+        let busy = jobs
+            .iter()
+            .filter(|other| {
+                other.holds_capacity()
+                    || (other.state == "queued" && !other.cancel && other.sequence < job.sequence)
+            })
+            .chain(chosen.iter().copied())
+            .any(|other| other.request.shares_lane(&job.request));
+        let built_before = jobs.iter().any(|other| {
+            other.sequence < job.sequence
+                && other.request.workspace == job.request.workspace
+                && matches!(other.request.command.as_str(), "build" | "test")
+                && other.state == "finished"
+                && other.code == Some(0)
+        });
+        if busy || !built_before {
+            continue;
+        }
+        slots += 1;
+        fresh_memory += memory;
+        chosen.push(job);
+    }
+    chosen.iter().map(|job| job.sequence).collect()
 }
 
 pub fn reason<'a>(job: &Job, jobs: &[Job], capacity: &'a Capacity) -> &'a str {
@@ -370,6 +421,7 @@ mod tests {
                 },
                 prepared: true,
                 workspace: lane.into(),
+                fast_lane: false,
             },
             state: state.into(),
             child: None,
@@ -378,6 +430,7 @@ mod tests {
             cancel: false,
             reason: None,
             retiring_server: None,
+            fast: Default::default(),
         }
     }
     fn capacity() -> Capacity {
@@ -832,5 +885,142 @@ mod tests {
         allocate_queued(&mut jobs, &config, &full);
         assert!(jobs[0].request.budget.memory_mib >= 256);
         assert!(eligible(&jobs, &config, &full).is_empty());
+    }
+
+    fn candidate(sequence: u64, lane: &str) -> Job {
+        let mut job = managed(sequence, lane);
+        job.request.prepared = false;
+        job.request.fast_lane = true;
+        job
+    }
+    fn built(sequence: u64, lane: &str, code: i32) -> Job {
+        let mut job = job(sequence, lane, 1, false, "finished");
+        job.code = Some(code);
+        job
+    }
+    #[test]
+    fn fast_lane_checks_pass_a_full_build_queue_where_bazel_built_before() {
+        let jobs = vec![
+            built(1, "w", 0),
+            job(2, "other", 8, false, "running"),
+            managed(3, "x"),
+            candidate(4, "w"),
+        ];
+        assert!(eligible(&jobs, &config(), &capacity()).is_empty());
+        assert_eq!(fast_lane(&jobs, &config(), &capacity()), vec![4]);
+    }
+    #[test]
+    fn fast_lane_waits_for_history_slots_memory_and_a_free_workspace() {
+        let config = config();
+        let both = vec![
+            built(1, "w", 0),
+            built(2, "v", 0),
+            candidate(3, "w"),
+            candidate(4, "v"),
+        ];
+        assert_eq!(fast_lane(&both, &config, &capacity()), vec![3, 4]);
+
+        let first_time = vec![built(1, "w", 1), candidate(2, "w"), candidate(3, "v")];
+        assert!(fast_lane(&first_time, &config, &capacity()).is_empty());
+
+        let single = Config {
+            fast_lane_slots: 1,
+            ..config.clone()
+        };
+        assert_eq!(fast_lane(&both, &single, &capacity()), vec![3]);
+        let off = Config {
+            fast_lane_slots: 0,
+            ..config.clone()
+        };
+        assert!(fast_lane(&both, &off, &capacity()).is_empty());
+
+        let mut checking = both.clone();
+        checking[2].state = "preparing".into();
+        checking[2].fast = FastLane::Checking {
+            queued: config.budget(true),
+        };
+        assert_eq!(fast_lane(&checking, &config, &capacity()), vec![4]);
+        assert!(fast_lane(&checking, &single, &capacity()).is_empty());
+
+        let mut declined = both.clone();
+        declined[2].fast = FastLane::Declined;
+        assert_eq!(fast_lane(&declined, &config, &capacity()), vec![4]);
+
+        let mut busy = both.clone();
+        busy.push(job(5, "w", 2, false, "running"));
+        assert_eq!(fast_lane(&busy, &config, &capacity()), vec![4]);
+
+        let one_slot_of_memory = Capacity {
+            new_memory_mib: config.fast_budget().memory_mib,
+            ..capacity()
+        };
+        assert_eq!(fast_lane(&both, &config, &one_slot_of_memory), vec![3]);
+        let no_memory = Capacity {
+            new_memory_mib: config.fast_budget().memory_mib - 1,
+            ..capacity()
+        };
+        assert!(fast_lane(&both, &config, &no_memory).is_empty());
+    }
+    #[test]
+    fn fast_lane_never_passes_earlier_work_queued_in_its_workspace() {
+        let mut declined = managed(2, "w");
+        declined.fast = FastLane::Declined;
+        for earlier in [
+            command(2, "w", "clean", "queued"),
+            declined,
+            candidate(2, "w"),
+        ] {
+            let jobs = vec![
+                built(1, "w", 0),
+                earlier,
+                candidate(3, "w"),
+                candidate(4, "v"),
+            ];
+            let chosen = fast_lane(&jobs, &config(), &capacity());
+            assert!(!chosen.contains(&3), "{chosen:?}");
+        }
+        let mut cancelled = command(2, "w", "clean", "queued");
+        cancelled.cancel = true;
+        let jobs = vec![built(1, "w", 0), cancelled, candidate(3, "w")];
+        assert_eq!(fast_lane(&jobs, &config(), &capacity()), vec![3]);
+    }
+    #[test]
+    fn fast_lane_stops_whenever_ordinary_admission_is_held_or_reduced() {
+        let jobs = vec![built(1, "w", 0), candidate(2, "w")];
+        for capacity in [
+            Capacity {
+                pressure: Pressure::Constrained,
+                ..capacity()
+            },
+            Capacity {
+                pressure: Pressure::Held,
+                ..capacity()
+            },
+            Capacity {
+                drained: true,
+                ..capacity()
+            },
+            Capacity {
+                legacy_active: true,
+                ..capacity()
+            },
+        ] {
+            assert!(fast_lane(&jobs, &config(), &capacity).is_empty());
+        }
+    }
+    #[test]
+    fn a_fast_lane_run_holds_its_workspace_but_not_the_build_capacity() {
+        let mut fast = job(1, "w", 2, false, "running");
+        fast.fast = FastLane::Admitted;
+        let jobs = vec![
+            fast.clone(),
+            job(2, "w", 8, false, "queued"),
+            job(3, "x", 8, false, "queued"),
+        ];
+        assert!(!fast.holds_build_capacity());
+        assert!(fast.holds_metered_capacity());
+        assert_eq!(eligible(&jobs, &config(), &capacity()), vec![3]);
+        let clean = vec![fast, command(2, "w", "clean", "queued")];
+        assert!(eligible(&clean, &config(), &capacity()).is_empty());
     }
 }

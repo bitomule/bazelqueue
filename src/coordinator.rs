@@ -2,7 +2,7 @@
 use crate::{
     config::{Config, Paths},
     platform,
-    protocol::{self, Event, Job, Message, Snapshot},
+    protocol::{self, Event, FastLane, Job, Message, Snapshot},
     recovery::{self, Decision, NativeState, Observation as RecoveryObservation},
     resources::{Monitor, Sample},
     scheduler::{self, Capacity, Pressure},
@@ -803,7 +803,7 @@ pub async fn run(paths: Paths) -> Result<()> {
                         apply_recovery(&paths,&store,&observed,connection,sessions.get(id).map(|(connection,_)|*connection),native,elapsed).await?;
                     }
                     Some(Input::Message {connection,message:Message::Defer,reply})=> {
-                        if let Some(id)=connection_ids.get(&connection).filter(|id|sessions.get(*id).is_some_and(|(current,_)|*current==connection))&& let Some(mut job)=store.jobs()?.into_iter().find(|job|&job.request.id==id && job.state=="preparing") {job.state="queued".into();store.save(&job)?;deferred.insert(id.clone(),tokio::time::Instant::now()+Duration::from_secs(1));notify(&reply,Event::Queued {position:store.jobs()?.iter().filter(|other|other.state=="queued" && other.sequence<=job.sequence).count(),reason:"native server is busy".into()});}
+                        if let Some(id)=connection_ids.get(&connection).filter(|id|sessions.get(*id).is_some_and(|(current,_)|*current==connection))&& let Some(mut job)=store.jobs()?.into_iter().find(|job|&job.request.id==id && job.state=="preparing") {job.state="queued".into();if let FastLane::Checking {queued}=&job.fast {job.request.budget=queued.clone();job.fast=FastLane::Declined;}store.save(&job)?;deferred.insert(id.clone(),tokio::time::Instant::now()+Duration::from_secs(1));notify(&reply,Event::Queued {position:store.jobs()?.iter().filter(|other|other.state=="queued" && other.sequence<=job.sequence).count(),reason:"native server is busy".into()});}
                     }
                     Some(Input::Message {connection,message,reply})=> {
                         if matches!(&message, Message::Control {operation,..} if operation=="retire") && daemon.retires() {
@@ -833,7 +833,7 @@ pub async fn run(paths: Paths) -> Result<()> {
                     if let Ok(updated)=Config::load(&paths) {config=updated;}
                     let sample=sample_resources(&paths, &config, &mut sampler, started.elapsed().as_millis() as u64);
                     let sampled_jobs=store.jobs()?;
-                    crate::resources::refresh_resident(&sample,&mut resident,||sampled_jobs.iter().filter(|job|job.holds_build_capacity()).map(|job| {
+                    crate::resources::refresh_resident(&sample,&mut resident,||sampled_jobs.iter().filter(|job|job.holds_metered_capacity()).map(|job| {
                         let owners:Vec<_>=job.child.iter().cloned().chain(job.server.iter().map(|server|server.identity.clone())).collect();
                         (job.request.id.clone(),platform::process_memory(&owners))
                     }).collect());
@@ -936,7 +936,7 @@ pub async fn run(paths: Paths) -> Result<()> {
                 .filter(|job| job.state == "run_phase")
                 .filter_map(|job| job.child.clone())
                 .collect();
-            let capacity = Capacity {
+            let mut capacity = Capacity {
                 pressure: mode,
                 legacy_active: jobs.iter().any(|job| job.state == "queued")
                     && legacy_owners(&store, &config).map_or(true, |owners| !owners.is_empty()),
@@ -947,6 +947,38 @@ pub async fn run(paths: Paths) -> Result<()> {
                     .saturating_sub(crate::resources::promised_growth(&jobs, &resident)),
                 reason: monitor.signals.reason.clone(),
             };
+            let connected = |job: &&Job| {
+                job.state != "queued"
+                    || (sessions.contains_key(&job.request.id)
+                        && deferred
+                            .get(&job.request.id)
+                            .is_none_or(|time| tokio::time::Instant::now() >= *time))
+            };
+            let candidates: Vec<_> = jobs.iter().filter(connected).cloned().collect();
+            for sequence in scheduler::fast_lane(&candidates, &config, &capacity) {
+                let job = jobs
+                    .iter_mut()
+                    .find(|job| job.sequence == sequence)
+                    .expect("scheduler returned an existing sequence");
+                job.fast = FastLane::Checking {
+                    queued: job.request.budget.clone(),
+                };
+                job.request.budget = config.fast_budget();
+                job.state = "preparing".into();
+                store.save(job)?;
+                capacity.new_memory_mib = capacity
+                    .new_memory_mib
+                    .saturating_sub(job.request.budget.memory_mib);
+                if let Some((_, reply)) = sessions.get(&job.request.id) {
+                    notify(
+                        reply,
+                        Event::Check {
+                            budget: job.request.budget.clone(),
+                        },
+                    );
+                }
+                notices.remove(&job.request.id);
+            }
             let limit = scheduler::admission_budget(&config, mode);
             let remaining_memory = limit.memory_mib.saturating_sub(capacity.run_memory_mib);
             if remaining_memory >= 256 && !jobs.iter().any(|job| job.holds_build_capacity()) {
@@ -960,17 +992,7 @@ pub async fn run(paths: Paths) -> Result<()> {
                         job.request.budget.memory_mib.min(remaining_memory);
                 }
             }
-            let candidates: Vec<_> = jobs
-                .iter()
-                .filter(|job| {
-                    job.state != "queued"
-                        || (sessions.contains_key(&job.request.id)
-                            && deferred
-                                .get(&job.request.id)
-                                .is_none_or(|time| tokio::time::Instant::now() >= *time))
-                })
-                .cloned()
-                .collect();
+            let candidates: Vec<_> = jobs.iter().filter(connected).cloned().collect();
             let mut profiled = candidates;
             scheduler::allocate_queued(&mut profiled, &config, &capacity);
             for updated in profiled.iter().filter(|job| job.state == "queued") {
@@ -986,17 +1008,7 @@ pub async fn run(paths: Paths) -> Result<()> {
             }) {
                 store.save(job)?;
             }
-            let candidates: Vec<_> = jobs
-                .iter()
-                .filter(|job| {
-                    job.state != "queued"
-                        || (sessions.contains_key(&job.request.id)
-                            && deferred
-                                .get(&job.request.id)
-                                .is_none_or(|time| tokio::time::Instant::now() >= *time))
-                })
-                .cloned()
-                .collect();
+            let candidates: Vec<_> = jobs.iter().filter(connected).cloned().collect();
             for sequence in scheduler::eligible(&candidates, &config, &capacity) {
                 let job = jobs
                     .iter_mut()
@@ -1117,6 +1129,12 @@ fn handle(
             connection_ids.insert(connection, job.request.id.clone());
             sessions.insert(job.request.id.clone(), (connection, reply.clone()));
             match job.state.as_str() {
+                "preparing" if matches!(job.fast, FastLane::Checking { .. }) => notify(
+                    reply,
+                    Event::Check {
+                        budget: job.request.budget.clone(),
+                    },
+                ),
                 "preparing" => notify(reply, Event::Prepare),
                 "starting" => notify(
                     reply,
@@ -1233,6 +1251,7 @@ fn handle(
                 notify(reply, Event::Cancel);
                 return Ok(());
             }
+            let mut granted = None;
             let ownership = match &other {
                 Message::Running { child }
                 | Message::Preparing { child }
@@ -1244,6 +1263,7 @@ fn handle(
                     lane,
                     server,
                     budget,
+                    up_to_date,
                 } if job.state == "preparing" => {
                     if budget.cpu == 0
                         || budget.memory_mib == 0
@@ -1252,11 +1272,28 @@ fn handle(
                     {
                         bail!("prepared budget cannot fit");
                     }
-                    job.request.budget = budget;
                     job.request.lane = lane;
                     job.request.prepared = true;
                     job.server = server;
-                    job.state = "queued".into();
+                    let admitting = monitor.mode() == Pressure::Normal
+                        && !store.drained()?
+                        && legacy_owners(store, config)?.is_empty();
+                    match (&job.fast, up_to_date) {
+                        (FastLane::Checking { .. }, Some(true)) if admitting => {
+                            job.fast = FastLane::Admitted;
+                            job.state = "starting".into();
+                            granted = Some(job.request.budget.clone());
+                        }
+                        (FastLane::Checking { .. }, _) => {
+                            job.fast = FastLane::Declined;
+                            job.request.budget = budget;
+                            job.state = "queued".into();
+                        }
+                        _ => {
+                            job.request.budget = budget;
+                            job.state = "queued".into();
+                        }
+                    }
                 }
                 Message::Preparing { child } if job.state == "preparing" => {
                     job.child = Some(child);
@@ -1295,6 +1332,9 @@ fn handle(
             } else {
                 notify(reply, Event::Ack);
             }
+            if let Some(budget) = granted {
+                notify(reply, Event::Grant { budget });
+            }
         }
     }
     Ok(())
@@ -1317,7 +1357,11 @@ fn legacy_owners(store: &Store, config: &Config) -> Result<Vec<platform::Identit
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{Budget, Job, Request};
+    use crate::{
+        protocol::{Budget, Job, Request},
+        resources::Monitor,
+        utilization::Utilization,
+    };
 
     #[test]
     fn duplicate_orphans_do_not_protect_the_same_server_but_live_owners_do() {
@@ -1451,6 +1495,7 @@ mod tests {
             ran_ms: 0,
             targets_reported: false,
             failures: vec![],
+            fast_lane: false,
         };
         crate::summary::save(&fixture.paths, &summary).unwrap();
         apply_recovery(
@@ -1510,6 +1555,7 @@ mod tests {
                     },
                     prepared: true,
                     workspace: "workspace".into(),
+                    fast_lane: false,
                 })
                 .unwrap();
             job.state = state.into();
@@ -1573,6 +1619,7 @@ mod tests {
                     ran_ms: 0,
                     targets_reported: false,
                     failures: vec![],
+                    fast_lane: false,
                 },
             )
             .unwrap();
@@ -1671,5 +1718,174 @@ mod tests {
         fixture.settle();
         assert!(fixture.receipt("running").exists());
         assert_eq!(fixture.stored("running").state, "running");
+    }
+
+    fn deliver(fixture: &Fixture, config: &Config, id: &str, message: Message) -> Vec<Event> {
+        deliver_under(fixture, config, &Monitor::default(), id, message)
+    }
+
+    fn deliver_under(
+        fixture: &Fixture,
+        config: &Config,
+        monitor: &Monitor,
+        id: &str,
+        message: Message,
+    ) -> Vec<Event> {
+        let (reply, mut events) = mpsc::channel(8);
+        let mut sessions = HashMap::from([(id.to_owned(), (1, reply.clone()))]);
+        let mut connection_ids = HashMap::from([(1, id.to_owned())]);
+        handle(
+            &fixture.paths,
+            &fixture.store,
+            config,
+            &Daemon::current().unwrap(),
+            monitor,
+            &Utilization::default(),
+            1,
+            message,
+            &reply,
+            &mut sessions,
+            &mut connection_ids,
+        )
+        .unwrap();
+        drop(reply);
+        drop(sessions);
+        let mut received = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            received.push(event);
+        }
+        received
+    }
+
+    fn fast_config() -> Config {
+        Config {
+            cpu_capacity: 8,
+            memory_capacity_mib: 16384,
+            ..Config::default()
+        }
+    }
+
+    fn checking(fixture: &Fixture, config: &Config, id: &str) -> Job {
+        let mut job = fixture.job(id, "preparing");
+        job.request.prepared = false;
+        job.request.fast_lane = true;
+        job.fast = FastLane::Checking {
+            queued: job.request.budget.clone(),
+        };
+        job.request.budget = config.fast_budget();
+        fixture.store.save(&job).unwrap();
+        job
+    }
+
+    fn prepared(up_to_date: Option<bool>) -> Message {
+        Message::Prepared {
+            lane: "output-base".into(),
+            server: None,
+            budget: Budget {
+                cpu: 4,
+                memory_mib: 2048,
+                exclusive: false,
+                estimate: None,
+            },
+            up_to_date,
+        }
+    }
+
+    #[test]
+    fn an_up_to_date_check_starts_at_once_in_its_fast_lane_slot() {
+        let fixture = Fixture::new();
+        let config = fast_config();
+        checking(&fixture, &config, "fresh");
+        let events = deliver(&fixture, &config, "fresh", prepared(Some(true)));
+        assert!(matches!(
+            events.as_slice(),
+            [Event::Ack, Event::Grant { budget }] if *budget == config.fast_budget()
+        ));
+        let job = fixture.stored("fresh");
+        assert_eq!(job.state, "starting");
+        assert_eq!(job.fast, FastLane::Admitted);
+        assert_eq!(job.request.lane, "output-base");
+        assert!(job.holds_fast_capacity() && !job.holds_build_capacity());
+    }
+
+    #[test]
+    fn a_stale_check_returns_to_its_queue_position_with_its_own_budget() {
+        let fixture = Fixture::new();
+        let config = fast_config();
+        let original = checking(&fixture, &config, "stale");
+        for up_to_date in [Some(false), None] {
+            let mut job = fixture.stored("stale");
+            job.state = "preparing".into();
+            job.fast = FastLane::Checking {
+                queued: job.request.budget.clone(),
+            };
+            fixture.store.save(&job).unwrap();
+            let events = deliver(&fixture, &config, "stale", prepared(up_to_date));
+            assert!(matches!(events.as_slice(), [Event::Ack]));
+            let job = fixture.stored("stale");
+            assert_eq!(job.state, "queued");
+            assert_eq!(job.sequence, original.sequence);
+            assert_eq!(job.fast, FastLane::Declined);
+            assert!(job.request.prepared);
+            assert_eq!(job.request.budget.cpu, 4);
+        }
+    }
+
+    #[test]
+    fn a_passed_check_waits_in_the_queue_once_admission_is_held_or_draining() {
+        let fixture = Fixture::new();
+        let config = fast_config();
+        let mut pressured = Monitor::default();
+        pressured.signals.reason = Some("memory pressure (critical)".into());
+        checking(&fixture, &config, "pressured");
+        let events = deliver_under(
+            &fixture,
+            &config,
+            &pressured,
+            "pressured",
+            prepared(Some(true)),
+        );
+        assert!(matches!(events.as_slice(), [Event::Ack]));
+        assert_eq!(fixture.stored("pressured").fast, FastLane::Declined);
+
+        checking(&fixture, &config, "drained");
+        fixture.store.set_drained(true).unwrap();
+        let events = deliver(&fixture, &config, "drained", prepared(Some(true)));
+        assert!(matches!(events.as_slice(), [Event::Ack]));
+        let job = fixture.stored("drained");
+        assert_eq!(job.state, "queued");
+        assert_eq!(job.fast, FastLane::Declined);
+    }
+
+    #[test]
+    fn an_up_to_date_answer_without_a_fast_lane_check_never_skips_the_queue() {
+        let fixture = Fixture::new();
+        let config = fast_config();
+        fixture.job("ordinary", "preparing");
+        let events = deliver(&fixture, &config, "ordinary", prepared(Some(true)));
+        assert!(matches!(events.as_slice(), [Event::Ack]));
+        let job = fixture.stored("ordinary");
+        assert_eq!(job.state, "queued");
+        assert_eq!(job.fast, FastLane::Unchecked);
+    }
+
+    #[test]
+    fn a_reconnecting_guardian_resumes_its_fast_lane_check() {
+        let fixture = Fixture::new();
+        let config = fast_config();
+        let mut job = checking(&fixture, &config, "again");
+        job.request.owner = platform::current_identity().unwrap();
+        fixture.store.save(&job).unwrap();
+        let events = deliver(
+            &fixture,
+            &config,
+            "again",
+            Message::Register {
+                request: job.request,
+            },
+        );
+        assert!(
+            matches!(events.as_slice(), [Event::Check { budget }] if *budget == config.fast_budget())
+        );
     }
 }

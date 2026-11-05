@@ -58,6 +58,7 @@ impl Store {
             cancel: false,
             reason: None,
             retiring_server: None,
+            fast: Default::default(),
         };
         self.connection.execute(
             "INSERT INTO jobs(id,data) VALUES(?1,?2)",

@@ -78,3 +78,54 @@ Use a new output directory. It retains results.json with raw native samples,
 profiles, logs and queue state. The benchmark shuts down only its own coordinator
 and isolated Bazel server. A relative queue path avoids Unix socket path limits
 inside long task worktree paths.
+
+## Fast-lane measurement, 5 November 2026
+
+Alondra at `origin/main`, the 22 patterns of its `musts run` (99 targets, 78
+tests), Bazel 8.4.2 through bazelqueue, in a throwaway clone with its own output
+base. RSS is the Bazel server's resident memory.
+
+| Situation | Result | Wall time | Analysis | Peak RSS |
+|---|---|---|---|---|
+| Warm server, local action cache current | exit 0 | 3.5–4.8 s | 0.1–0.2 s | 0.70 GB |
+| Cold server, local action cache current | exit 0 | 10.5–14.4 s | 4.7–7.4 s | 0.81 GB |
+| Cold server, empty local action cache | exit 1 | 11.9 s | 4.7 s | 0.89 GB |
+| New output base | exit 1 | 34 s | 19.8 s | — |
+| One edited file, warm server | exit 1 | 3.3–3.8 s | 0.4 s | — |
+
+The run that follows reuses the analysis (0.09–0.2 s). A different
+`--invocation_policy` budget keeps the analysis cache and `--noblock_for_lock`
+keeps the server, but a different worker count restarts the persistent worker
+pool, so the check uses the run's worker count.
+
+Only the local action cache counts. With a new output base and full BuildBuddy
+and disk caches the check failed with 891 misses; the run right after had 923
+remote and 767 disk cache hits. `--remote_cache=` and `bazel clean` give the same
+failure. The check passes even when tests Bazel never caches exist; the run then
+executes them (three in Alondra, 4 actions, about 5.7 s). Alternating `build` and
+`test` in one output base changes the configuration and fails the check.
+
+Exit 0 means up to date. Exit 1 (BUILD_FAILURE) means something would execute,
+reported in the BEP as `failureDetail.execution.code = ACTION_NOT_UP_TO_DATE`, but
+a real build error also exits 1. Exit 9 means the output base is locked by
+another command. Only 0 admits.
+
+bazelqueue's own records cannot replay this: 500 jobs (about 15 hours) and 200
+summaries without arguments or executed actions. BuildBuddy received every
+invocation: 4,648 completed builds and tests from 22 October to 5 November. An
+invocation would have passed when its only local action cache misses were
+unconditional test executions and nothing ran locally, remotely or from the disk
+cache.
+
+| Group | n | Would pass | Remote or disk cache only | Local work |
+|---|---|---|---|---|
+| `musts run` (almost all Alondra) | 1,084 | 13 % | 51 % | 36 % |
+| All tests | 3,623 | 10 % | 41 % | 49 % |
+| All builds | 1,025 | 16 % | 35 % | 49 % |
+
+The first invocation in a workspace passed 0 of 42 `musts run` (6 of 407 overall),
+hence the history requirement. After a successful invocation at most 120 s
+earlier, 30 % passed; later, 13 %. Runs after a passing check took a median of
+14 s (p75 79 s, p90 223 s) because of uncached tests. At the median queue wait of
+863 s, the 139 passing `musts run` amount to about 33 hours of agent waiting in
+two weeks; about 88 % of checks fail, each costing 3–14 s in its slot.

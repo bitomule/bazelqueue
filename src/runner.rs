@@ -98,6 +98,7 @@ struct Notices {
     verbose: bool,
     hint: bool,
     queued: Option<Instant>,
+    fast_lane: bool,
 }
 
 /// Agents read this line in their captured output at the moment they would
@@ -114,6 +115,7 @@ impl Notices {
             verbose,
             hint: reported && !verbose,
             queued: None,
+            fast_lane: false,
         }
     }
     fn lines(&mut self, event: &Event, now: Instant) -> Vec<String> {
@@ -131,6 +133,10 @@ impl Notices {
                 )),
                 Some(_) => None,
             },
+            Event::Grant { .. } if self.fast_lane => Some(format!(
+                "bazelqueue: started {} at once: Bazel reports nothing to rebuild",
+                self.id
+            )),
             Event::Grant { .. } => Some(match self.queued {
                 Some(since) => format!(
                     "bazelqueue: started {} after {} in queue",
@@ -163,6 +169,7 @@ struct Ledger {
     granted: Option<Instant>,
     events: Option<(PathBuf, bool)>,
     report: bool,
+    fast_lane: bool,
 }
 
 impl Ledger {
@@ -191,6 +198,7 @@ impl Ledger {
             ran_ms: self
                 .granted
                 .map_or(0, |granted| now.duration_since(granted).as_millis() as u64),
+            fast_lane: self.fast_lane,
         }
     }
 }
@@ -337,6 +345,53 @@ async fn probe(
     )))
 }
 
+const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Asks Bazel, under the fast-lane reservation, whether the invocation would
+/// execute anything. Only exit code 0 counts as up to date; any other result,
+/// including a busy server or a timeout, sends the request to the queue. None
+/// means the request was cancelled.
+async fn up_to_date(
+    paths: &Paths,
+    request: &Request,
+    stream: &mut protocol::Framed<UnixStream>,
+    backend: &PathBuf,
+    invocation: &bazel::Invocation,
+    budget: &Budget,
+    config: &Config,
+) -> Result<Option<bool>> {
+    let (mut child, mut permit, identity) = owned_executor(
+        backend,
+        bazel::check_arguments(invocation, budget, config),
+        true,
+        Some(&request.id),
+    )
+    .await?;
+    if !authorize(paths, request, stream, &identity, "preparing").await? {
+        drop(permit);
+        child.wait().await?;
+        return Ok(None);
+    }
+    permit.write_all(b"G").await?;
+    drop(permit);
+    let mut stdout = child.stdout.take().context("check stdout missing")?;
+    let finished = async {
+        tokio::io::copy(&mut stdout, &mut tokio::io::sink()).await?;
+        child.wait().await
+    };
+    match timeout(CHECK_TIMEOUT, finished).await {
+        Ok(status) => Ok(Some(status?.code() == Some(0))),
+        Err(_) => {
+            let _ = platform::signal_group(identity.pid, libc::SIGINT);
+            if timeout(Duration::from_secs(5), child.wait()).await.is_err() {
+                let _ = platform::signal_group(identity.pid, libc::SIGKILL);
+                child.wait().await?;
+            }
+            Ok(Some(false))
+        }
+    }
+}
+
 pub async fn guardian(backend: PathBuf, args: Vec<OsString>, generic: bool) -> Result<ExitStatus> {
     let paths = Paths::discover()?;
     let config = Config::load(&paths)?;
@@ -371,6 +426,7 @@ pub async fn guardian(backend: PathBuf, args: Vec<OsString>, generic: bool) -> R
             .unwrap_or_else(|| initial_budget(&config, &invocation, generic)),
         prepared: generic || immediate || invocation.command_index.is_none(),
         workspace: workspace.to_string_lossy().into_owned(),
+        fast_lane: !generic && config.fast_lane_slots > 0 && bazel::checkable(&invocation),
     };
     if generic {
         #[cfg(feature = "test-fixtures")]
@@ -396,6 +452,7 @@ pub async fn guardian(backend: PathBuf, args: Vec<OsString>, generic: bool) -> R
         granted: None,
         events: None,
         report: !immediate,
+        fast_lane: false,
     };
     let mut notices = Notices::new(&id, ledger.report);
     let mut stream = registration(&paths, &request).await?;
@@ -419,7 +476,11 @@ pub async fn guardian(backend: PathBuf, args: Vec<OsString>, generic: bool) -> R
         };
         notices.show(&event);
         match event {
-            Event::Prepare => {
+            Event::Prepare | Event::Check { .. } => {
+                let check = match &event {
+                    Event::Check { budget } => Some(budget.clone()),
+                    _ => None,
+                };
                 if !run_hooks(
                     &config,
                     &paths,
@@ -461,6 +522,33 @@ pub async fn guardian(backend: PathBuf, args: Vec<OsString>, generic: bool) -> R
                         request.lane = server.output_base.clone();
                     }
                 }
+                let up_to_date = if let Some(budget) = check {
+                    if !invocation.managed || !bazel::checkable(&invocation) {
+                        Some(false)
+                    } else {
+                        match up_to_date(
+                            &paths,
+                            &request,
+                            &mut stream,
+                            &backend,
+                            &invocation,
+                            &budget,
+                            &config,
+                        )
+                        .await?
+                        {
+                            Some(passed) => Some(passed),
+                            None => {
+                                finish(&paths, &ledger, 130, true, &mut stream).await?;
+                                return Ok(ExitStatus::from_raw(libc::SIGINT));
+                            }
+                        }
+                    }
+                } else {
+                    None
+                };
+                ledger.fast_lane = up_to_date == Some(true);
+                notices.fast_lane = ledger.fast_lane;
                 request.prepared = true;
                 request.budget = estimate::budget(&config, &invocation, &history)
                     .filter(|_| !generic)
@@ -473,6 +561,7 @@ pub async fn guardian(backend: PathBuf, args: Vec<OsString>, generic: bool) -> R
                         lane: request.lane.clone(),
                         server: server.clone(),
                         budget: request.budget.clone(),
+                        up_to_date,
                     },
                 )
                 .await?;
@@ -588,6 +677,7 @@ pub async fn guardian(backend: PathBuf, args: Vec<OsString>, generic: bool) -> R
     };
     drop(terminal);
     if !cancelled
+        && !ledger.fast_lane
         && status.signal().is_none()
         && let Some((server, before, started)) = &measured
         && let Some(after) = platform::tree_cpu_seconds(server)
@@ -743,6 +833,7 @@ pub async fn wait(
                 ran_ms: 0,
                 targets_reported: false,
                 failures: Vec::new(),
+                fast_lane: false,
             });
         }
         sleep(Duration::from_secs(1)).await;
@@ -987,6 +1078,7 @@ mod tests {
             verbose: false,
             hint: true,
             queued: None,
+            fast_lane: false,
         };
         let mut printed = Vec::new();
         for (offset, event) in [queued(3), queued(2), queued(1), grant.clone()]

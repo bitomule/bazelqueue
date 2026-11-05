@@ -127,6 +127,20 @@ commands (info, query, cquery, aquery, help, version, canonicalize-flags,
 analyze-profile, dump, license) are unmetered and admitted at once; Bazel's own
 server lock still orders them within one output base. clean and shutdown are
 unmetered maintenance: they wait only for their own workspace and output base.
+A queued managed build or test may be checked once in a fast-lane slot before
+its turn: at most `fast_lane_slots` at a time, each reserving the worker count in
+CPUs (so Bazel's persistent worker pool keeps its size) and 1536 MiB of real
+headroom, outside the build capacity. A slot is never granted while admission is
+held, reduced, draining or legacy work drains, while the workspace's lane is busy
+or earlier work waits in it, or before a build or test of that workspace has
+finished successfully. The coordinator sends the slot's budget with the check. In the
+slot the guardian runs the hooks and the info probe, then the caller's invocation
+with `--noblock_for_lock`, the up-to-date check flag and no build event outputs,
+as an owned executor behind the same permit barrier. Only exit code 0 admits, and only while
+admission is still normal: the request moves straight to starting in its slot
+and does not record an estimate. Anything else returns it, prepared and with its own budget, to its
+original queue position; a busy server returns it unprepared. Fast-lane state is
+an optional job field, so older journals and coordinators keep the ordinary path.
 Preflight hooks run inside the request's own reservation, one invocation at a
 time under a host-wide hook lock. Existing project wrappers
 are preserved; managed nested requests are rejected instead of deadlocking behind
