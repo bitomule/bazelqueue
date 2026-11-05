@@ -20,7 +20,7 @@ pub fn promised_growth(
     resident: &std::collections::HashMap<String, u64>,
 ) -> u64 {
     jobs.iter()
-        .filter(|job| job.holds_build_capacity())
+        .filter(|job| job.holds_metered_capacity())
         .fold(0_u64, |total, job| {
             total.saturating_add(
                 job.request

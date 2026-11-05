@@ -1,12 +1,58 @@
 use std::{
-    env,
+    env, fs,
     io::{Read, Write},
     os::unix::{ffi::OsStrExt, net::UnixStream},
+    path::Path,
     process,
 };
 
+/// Stands in for Bazel: `info` names a server, an up-to-date check exits with the
+/// code in `check`, and every check or run is appended to `log`.
+fn bazel(state: &Path, arguments: &[String]) {
+    let record = |line: &str| {
+        let mut log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(state.join("log"))
+            .unwrap();
+        writeln!(log, "{line}").unwrap();
+    };
+    if arguments.iter().any(|arg| arg == "info") {
+        println!("output_base: {}", state.join("output_base").display());
+        println!(
+            "server_pid: {}",
+            fs::read_to_string(state.join("server_pid")).unwrap().trim()
+        );
+        println!("release: release 8.4.2");
+        return;
+    }
+    if arguments
+        .iter()
+        .any(|arg| arg == "--check_up_to_date" || arg == "--check_tests_up_to_date")
+    {
+        record("check");
+        process::exit(
+            fs::read_to_string(state.join("check")).map_or(1, |code| code.trim().parse().unwrap()),
+        );
+    }
+    record("run");
+    if let Ok(socket) = fs::read_to_string(state.join("hold")) {
+        let mut connection = UnixStream::connect(socket.trim()).unwrap();
+        connection.write_all(b"R").unwrap();
+        let mut release = [0; 1];
+        connection.read_exact(&mut release).unwrap();
+    }
+}
+
 fn main() {
     let arguments: Vec<_> = env::args_os().skip(1).collect();
+    if let Some(state) = env::var_os("BAZELQUEUE_FIXTURE_BAZEL") {
+        let arguments: Vec<_> = arguments
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        return bazel(Path::new(&state), &arguments);
+    }
     match arguments.first().and_then(|arg| arg.to_str()) {
         Some("tree-hold") => {
             let status = process::Command::new(env::current_exe().unwrap())

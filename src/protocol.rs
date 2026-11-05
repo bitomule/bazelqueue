@@ -68,6 +68,9 @@ pub struct Request {
     pub budget: Budget,
     pub prepared: bool,
     pub workspace: String,
+    /// The guardian can ask Bazel whether this build or test is already up to date.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fast_lane: bool,
 }
 
 /// How a request is admitted. Only metered requests consume build capacity; the
@@ -120,6 +123,9 @@ pub enum Message {
         lane: String,
         server: Option<NativeServer>,
         budget: Budget,
+        /// Whether Bazel's up-to-date check passed; only a fast-lane check sets it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        up_to_date: Option<bool>,
     },
     Defer,
     Running {
@@ -156,6 +162,28 @@ pub struct Job {
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retiring_server: Option<Identity>,
+    #[serde(default, skip_serializing_if = "FastLane::is_unchecked")]
+    pub fast: FastLane,
+}
+
+/// A fast-lane request is checked once, in a slot outside the build capacity.
+/// An up-to-date one keeps that slot to run; any other keeps its queue position.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FastLane {
+    #[default]
+    Unchecked,
+    Checking {
+        queued: Budget,
+    },
+    Admitted,
+    Declined,
+}
+
+impl FastLane {
+    pub fn is_unchecked(&self) -> bool {
+        *self == FastLane::Unchecked
+    }
 }
 
 impl Job {
@@ -168,8 +196,15 @@ impl Job {
     pub fn metered(&self) -> bool {
         self.request.admission() == Admission::Metered
     }
-    pub fn holds_build_capacity(&self) -> bool {
+    /// Metered work in a fast-lane slot: its memory counts, its CPU is outside the build capacity.
+    pub fn holds_fast_capacity(&self) -> bool {
+        self.holds_capacity() && matches!(self.fast, FastLane::Checking { .. } | FastLane::Admitted)
+    }
+    pub fn holds_metered_capacity(&self) -> bool {
         self.holds_capacity() && self.metered()
+    }
+    pub fn holds_build_capacity(&self) -> bool {
+        self.holds_metered_capacity() && !self.holds_fast_capacity()
     }
     pub fn terminal(&self) -> bool {
         matches!(self.state.as_str(), "finished" | "cancelled")
@@ -202,16 +237,37 @@ pub struct Snapshot {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
-    Hello { protocol: u32 },
-    Queued { position: usize, reason: String },
+    Hello {
+        protocol: u32,
+    },
+    Queued {
+        position: usize,
+        reason: String,
+    },
     Prepare,
-    Grant { budget: Budget },
-    Resume { state: String },
+    /// Prepare, then ask Bazel, within this fast-lane budget, whether the
+    /// invocation has anything to execute.
+    Check {
+        budget: Budget,
+    },
+    Grant {
+        budget: Budget,
+    },
+    Resume {
+        state: String,
+    },
     Cancel,
     Ack,
-    Owned { child: Identity, state: String },
-    Snapshot { snapshot: Snapshot },
-    Error { message: String },
+    Owned {
+        child: Identity,
+        state: String,
+    },
+    Snapshot {
+        snapshot: Snapshot,
+    },
+    Error {
+        message: String,
+    },
 }
 
 pub async fn send<W: AsyncWrite + Unpin, T: Serialize>(writer: &mut W, value: &T) -> Result<()> {

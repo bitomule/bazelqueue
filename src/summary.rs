@@ -39,6 +39,9 @@ pub struct Summary {
     /// Whether Bazel reported per-target results; false for unmanaged invocations.
     pub targets_reported: bool,
     pub failures: Vec<Failure>,
+    /// Started at once because Bazel reported nothing to rebuild.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fast_lane: bool,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -386,6 +389,7 @@ mod tests {
                     log: Some(format!("/logs/{index}/test.log")),
                 })
                 .collect(),
+            fast_lane: false,
         }
     }
 

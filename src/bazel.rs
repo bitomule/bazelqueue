@@ -385,6 +385,52 @@ pub fn probe_arguments(invocation: &Invocation) -> Vec<OsString> {
     args
 }
 
+/// A managed build or test whose caller did not already ask for a check or skip the build.
+pub fn checkable(invocation: &Invocation) -> bool {
+    invocation.managed
+        && matches!(invocation.command.as_deref(), Some("build" | "test"))
+        && !invocation
+            .args
+            .iter()
+            .take_while(|arg| arg.as_os_str() != OsStr::new("--"))
+            .any(|arg| {
+                let text = arg.to_string_lossy();
+                text.contains("check_up_to_date")
+                    || text.contains("check_tests_up_to_date")
+                    || text.starts_with("--nobuild")
+                    || text.starts_with("--build=")
+            })
+}
+
+/// The caller's own invocation, asked only whether Bazel would execute anything.
+/// It fails at once instead of waiting for a busy server, and publishes no build
+/// events, so neither the caller's event file nor its build event service sees it.
+pub fn check_arguments(invocation: &Invocation, budget: &Budget, config: &Config) -> Vec<OsString> {
+    let mut args = arguments(invocation, budget, config, None);
+    args.insert(0, "--noblock_for_lock".into());
+    let position = args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(args.len());
+    let check = if invocation.command.as_deref() == Some("test") {
+        "--check_tests_up_to_date"
+    } else {
+        "--check_up_to_date"
+    };
+    args.splice(
+        position..position,
+        [
+            check,
+            "--bes_backend=",
+            "--build_event_json_file=",
+            "--build_event_binary_file=",
+            "--build_event_text_file=",
+        ]
+        .map(OsString::from),
+    );
+    args
+}
+
 pub fn parse_info(stdout: &[u8]) -> Option<(PathBuf, u32)> {
     let text = std::str::from_utf8(stdout).ok()?;
     let mut base = None;
@@ -616,6 +662,61 @@ mod tests {
                 ),
                 args
             );
+        }
+    }
+
+    #[test]
+    fn up_to_date_checks_reuse_the_run_arguments_and_publish_no_events() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("MODULE.bazel"), "").unwrap();
+        std::fs::write(root.path().join(".bazelversion"), "8.4.2").unwrap();
+        let config = Config::default();
+        let invocation = |args: &[&str]| {
+            inspect(
+                args.iter().map(OsString::from).collect(),
+                root.path(),
+                &config,
+            )
+        };
+        let budget = config.fast_budget();
+        let test = invocation(&["--host_jvm_args=-Xmx1g", "test", "//:x", "--", "-//:y"]);
+        let run = arguments(&test, &budget, &config, None);
+        let check = check_arguments(&test, &budget, &config);
+        let expected: Vec<OsString> = ["--noblock_for_lock"]
+            .map(OsString::from)
+            .into_iter()
+            .chain(run[..run.len() - 2].iter().cloned())
+            .chain(
+                [
+                    "--check_tests_up_to_date",
+                    "--bes_backend=",
+                    "--build_event_json_file=",
+                    "--build_event_binary_file=",
+                    "--build_event_text_file=",
+                    "--",
+                    "-//:y",
+                ]
+                .map(OsString::from),
+            )
+            .collect();
+        assert_eq!(check, expected);
+        let build = check_arguments(&invocation(&["build", "//:x"]), &budget, &config);
+        assert!(build.contains(&OsString::from("--check_up_to_date")));
+        assert!(!build.contains(&OsString::from("--check_tests_up_to_date")));
+
+        assert!(checkable(&invocation(&["build", "//:x"])));
+        assert!(checkable(&invocation(&["test", "//:x", "--", "--nobuild"])));
+        for args in [
+            &["run", "//:x"][..],
+            &["coverage", "//:x"],
+            &["query", "//:x"],
+            &["build", "--nobuild", "//:x"],
+            &["build", "--build=false", "//:x"],
+            &["build", "--check_up_to_date", "//:x"],
+            &["test", "--check_tests_up_to_date", "//:x"],
+            &["build", "--jobs=0", "//:x"],
+        ] {
+            assert!(!checkable(&invocation(args)), "{args:?}");
         }
     }
 }

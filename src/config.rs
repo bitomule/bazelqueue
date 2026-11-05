@@ -10,6 +10,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Peak resident memory of Alondra's Bazel server during an up-to-date check was 0.7-0.9 GiB.
+const FAST_LANE_MEMORY_MIB: u64 = 1536;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -26,6 +29,8 @@ pub struct Config {
     pub constrained_divisor: u32,
     pub memory_safety_mib: u64,
     pub swap_thrashing_mib_per_min: u64,
+    /// Up-to-date checks and the runs they admit at once; 0 turns the fast lane off.
+    pub fast_lane_slots: u32,
     pub hooks: Vec<Hook>,
     pub legacy: Vec<platform::Identity>,
 }
@@ -58,6 +63,7 @@ impl Default for Config {
             constrained_divisor: 4,
             memory_safety_mib: 1024,
             swap_thrashing_mib_per_min: 64,
+            fast_lane_slots: 2,
             hooks: Vec::new(),
             legacy: Vec::new(),
         }
@@ -143,6 +149,16 @@ impl Config {
             memory_mib: (self.memory_capacity_mib / u64::from(self.constrained_divisor))
                 .max(1024)
                 .min(self.memory_capacity_mib),
+            exclusive: false,
+            estimate: None,
+        }
+    }
+    /// A Bazel server analysing or running cached work. Its CPU matches the worker
+    /// count of an ordinary run, so the check never restarts the persistent workers.
+    pub fn fast_budget(&self) -> Budget {
+        Budget {
+            cpu: self.worker_instances.min(self.cpu_capacity).max(1),
+            memory_mib: FAST_LANE_MEMORY_MIB.min(self.memory_capacity_mib),
             exclusive: false,
             estimate: None,
         }

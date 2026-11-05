@@ -960,6 +960,162 @@ fn setup_keeps_a_current_coordinator() {
     assert_eq!(harness.snapshot().unwrap().daemon, previous.daemon);
 }
 
+/// A workspace whose `bazel` is the fixture standing in for Bazel 8.4.2.
+fn emulated_workspace(harness: &Harness, name: &str) -> PathBuf {
+    let workspace = harness.root.path().join(name);
+    let state = harness.root.path().join(format!("{name}-bazel"));
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&state).unwrap();
+    fs::write(workspace.join("MODULE.bazel"), "").unwrap();
+    fs::write(workspace.join(".bazelversion"), "8.4.2\n").unwrap();
+    fs::write(state.join("server_pid"), std::process::id().to_string()).unwrap();
+    state
+}
+fn emulated_bazel(harness: &Harness, name: &str, args: &[&str]) -> Command {
+    let shim = harness.root.path().join("bazel");
+    if !shim.exists() {
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_bazelqueue"), &shim).unwrap();
+    }
+    let mut command = Command::new(shim);
+    command
+        .args(args)
+        .env("BAZELQUEUE_HOME", &harness.paths.root)
+        .env("HOME", harness.root.path())
+        .env(
+            "BAZELQUEUE_FIXTURE_BAZEL",
+            harness.root.path().join(format!("{name}-bazel")),
+        )
+        .current_dir(harness.root.path().join(name))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    command
+}
+fn emulated_log(state: &std::path::Path) -> Vec<String> {
+    fs::read_to_string(state.join("log"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+fn finished_ok(command: &mut Command) -> String {
+    let output = command.output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(output.status.success(), "{stderr}");
+    stderr
+}
+
+#[test]
+fn an_up_to_date_build_starts_at_once_while_the_queue_is_full() {
+    let mut harness = Harness::new(1);
+    fs::write(
+        harness.paths.root.join("resources.json"),
+        r#"{"pressure":1,"total_mib":65536,"available_mib":32768,"swap_in_bytes":0,"swap_out_bytes":0}"#,
+    )
+    .unwrap();
+    let busy = emulated_workspace(&harness, "busy");
+    let fresh = emulated_workspace(&harness, "fresh");
+    fs::write(fresh.join("check"), "0").unwrap();
+
+    let first = finished_ok(&mut emulated_bazel(&harness, "fresh", &["build", "//:x"]));
+    assert_eq!(
+        emulated_log(&fresh),
+        ["run"],
+        "no check before Bazel built here"
+    );
+    assert!(!first.contains("at once"));
+
+    let holder = UnixListener::bind(harness.root.path().join("busy.sock")).unwrap();
+    fs::write(
+        busy.join("hold"),
+        holder
+            .local_addr()
+            .unwrap()
+            .as_pathname()
+            .unwrap()
+            .as_os_str()
+            .as_encoded_bytes(),
+    )
+    .unwrap();
+    let child = emulated_bazel(&harness, "busy", &["build", "//:x"])
+        .spawn()
+        .unwrap();
+    harness.children.push(child);
+    let mut running = Harness::accepted(&holder);
+
+    let fast = emulated_bazel(&harness, "fresh", &["build", "//:x"])
+        .spawn()
+        .unwrap();
+    let snapshot = harness.wait(|s| {
+        s.jobs.iter().any(|job| {
+            job.fast == bazelqueue::protocol::FastLane::Admitted
+                && job.state == "finished"
+                && job.code == Some(0)
+        })
+    });
+    assert!(
+        snapshot
+            .jobs
+            .iter()
+            .any(|job| job.state == "running" && job.request.workspace.ends_with("busy")),
+        "the build holding the queue was still running"
+    );
+    let output = fast.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("at once: Bazel reports nothing to rebuild"),
+        "{stderr}"
+    );
+    assert_eq!(emulated_log(&fresh), ["run", "check", "run"]);
+    let summaries: Vec<bazelqueue::summary::Summary> =
+        fs::read_dir(harness.paths.root.join("runs"))
+            .unwrap()
+            .filter_map(|entry| fs::read(entry.unwrap().path()).ok())
+            .filter_map(|bytes| serde_json::from_slice(&bytes).ok())
+            .collect();
+    assert_eq!(
+        summaries.iter().filter(|summary| summary.fast_lane).count(),
+        1
+    );
+
+    fs::write(fresh.join("check"), "1").unwrap();
+    let mut stale = emulated_bazel(&harness, "fresh", &["build", "//:x"])
+        .spawn()
+        .unwrap();
+    let declined = harness.wait(|s| {
+        s.jobs.iter().any(|job| {
+            job.state == "queued" && job.fast == bazelqueue::protocol::FastLane::Declined
+        })
+    });
+    assert_eq!(emulated_log(&fresh), ["run", "check", "run", "check"]);
+    let waiting = declined
+        .jobs
+        .iter()
+        .find(|job| job.state == "queued")
+        .unwrap();
+    assert!(
+        waiting.request.prepared,
+        "a declined check keeps its preparation"
+    );
+    running.write_all(b"F").unwrap();
+    assert!(stale.wait().unwrap().success());
+    assert_eq!(
+        emulated_log(&fresh),
+        ["run", "check", "run", "check", "run"]
+    );
+
+    let mut config = Config::load(&harness.paths).unwrap();
+    config.fast_lane_slots = 0;
+    config.save(&harness.paths).unwrap();
+    fs::write(fresh.join("check"), "0").unwrap();
+    finished_ok(&mut emulated_bazel(&harness, "fresh", &["build", "//:x"]));
+    assert_eq!(
+        emulated_log(&fresh),
+        ["run", "check", "run", "check", "run", "run"],
+        "no fast lane slots means no check"
+    );
+}
+
 fn native_backend() -> PathBuf {
     PathBuf::from(
         std::env::var_os("BAZELQUEUE_TEST_BAZEL")
@@ -1050,6 +1206,72 @@ fn native_build_and_authenticated_idle_probe() {
         runtime
             .block_on(bazelqueue::native_server::idle(server))
             .unwrap()
+    );
+}
+
+#[test]
+#[ignore = "requires BAZELQUEUE_TEST_BAZEL; real Bazel in an isolated workspace"]
+fn native_up_to_date_build_skips_a_full_queue_and_an_edited_one_waits() {
+    let mut harness = Harness::new(1);
+    fs::write(
+        harness.paths.root.join("resources.json"),
+        r#"{"pressure":1,"total_mib":65536,"available_mib":32768,"swap_in_bytes":0,"swap_out_bytes":0}"#,
+    )
+    .unwrap();
+    native_workspace(&harness, "");
+    let build = |harness: &Harness| {
+        let mut args = native_args(harness, "build");
+        args.push("//:hello".into());
+        native_command(harness, args)
+    };
+    let first = build(&harness).output().unwrap();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+
+    let holder = harness.spawn_hold("holder");
+    let mut running = Harness::accepted(&holder);
+    let fast = build(&harness).stderr(Stdio::piped()).spawn().unwrap();
+    harness.wait(|s| {
+        s.jobs
+            .iter()
+            .any(|job| job.fast == bazelqueue::protocol::FastLane::Admitted && job.terminal())
+    });
+    let output = fast.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("at once: Bazel reports nothing to rebuild"),
+        "{stderr}"
+    );
+
+    fs::write(
+        harness.root.path().join("workspace/BUILD.bazel"),
+        "genrule(name=\"hello\",outs=[\"hello.txt\"],cmd=\"echo edited > $@\")\n",
+    )
+    .unwrap();
+    let edited = build(&harness).stderr(Stdio::piped()).spawn().unwrap();
+    harness.wait(|s| {
+        s.jobs.iter().any(|job| {
+            job.state == "queued" && job.fast == bazelqueue::protocol::FastLane::Declined
+        })
+    });
+    running.write_all(b"F").unwrap();
+    let output = edited.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(!stderr.contains("at once"), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(harness.root.path().join("workspace/bazel-bin/hello.txt")).unwrap(),
+        "edited\n"
+    );
+    assert!(
+        native_command(&harness, native_args(&harness, "shutdown"))
+            .status()
+            .unwrap()
+            .success()
     );
 }
 
