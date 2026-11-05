@@ -64,4 +64,11 @@ jobs:
           chmod +x "$RUNNER_TEMP/bazel"
           echo "BAZELQUEUE_TEST_BAZEL=$RUNNER_TEMP/bazel" >> "$GITHUB_ENV"
           echo "BAZELQUEUE_TEST_VERSION=$BAZEL_VERSION" >> "$GITHUB_ENV"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            target/e2e/tmp/bazel-repository-cache
+            target/e2e/tmp/bazel-lockfiles
+          key: bazel-fetch-${{ runner.os }}-${{ matrix.bazel }}-${{ hashFiles('tests/e2e.rs') }}
+          restore-keys: bazel-fetch-${{ runner.os }}-${{ matrix.bazel }}-
       - run: make contract

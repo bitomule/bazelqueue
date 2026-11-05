@@ -14,7 +14,7 @@ use std::{
         ffi::OsStringExt,
         net::{UnixListener, UnixStream},
     },
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
@@ -1122,8 +1122,86 @@ fn native_backend() -> PathBuf {
             .expect("set BAZELQUEUE_TEST_BAZEL to the real Bazel/Bazelisk executable"),
     )
 }
+const NATIVE_MODULE: &str = "module(name=\"queue_contract\")\n";
+
+fn native_shared() -> &'static Path {
+    Path::new(env!("CARGO_TARGET_TMPDIR"))
+}
+fn native_fetch_args() -> [OsString; 2] {
+    [
+        format!(
+            "--repository_cache={}",
+            native_shared().join("bazel-repository-cache").display()
+        )
+        .into(),
+        "--incompatible_autoload_externally=".into(),
+    ]
+}
+fn native_version() -> String {
+    std::env::var("BAZELQUEUE_TEST_VERSION").unwrap_or_else(|_| "8.4.2".into())
+}
+/// The module lockfile of the native workspace, resolved once per Bazel version by a test run
+/// that also fills the shared repository cache (Bazel 9 tests need rules_shell). With both a
+/// fresh workspace builds and tests without the registry or GitHub.
+fn native_lockfile() -> PathBuf {
+    let lockfile = native_shared()
+        .join("bazel-lockfiles")
+        .join(format!("{}.lock", native_version()));
+    if lockfile.exists() {
+        return lockfile;
+    }
+    let seed = tempfile::Builder::new()
+        .prefix("bqe-seed-")
+        .tempdir_in("/private/tmp")
+        .unwrap();
+    let workspace = seed.path().join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    fs::write(workspace.join("MODULE.bazel"), NATIVE_MODULE).unwrap();
+    fs::write(
+        workspace.join(".bazelversion"),
+        format!("{}\n", native_version()),
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("seed.bzl"),
+        "def _impl(ctx):\n    out = ctx.actions.declare_file(\"seed.sh\")\n    ctx.actions.write(out, \"#!/bin/sh\\n\", is_executable = True)\n    return [DefaultInfo(executable = out)]\n\nseed_test = rule(_impl, test = True)\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("BUILD.bazel"),
+        "load(\":seed.bzl\", \"seed_test\")\nseed_test(name=\"seed\")\n",
+    )
+    .unwrap();
+    let startup = [
+        OsString::from("--ignore_all_rc_files"),
+        format!("--output_user_root={}", seed.path().join("cache").display()).into(),
+        "--max_idle_secs=5".into(),
+    ];
+    let built = Command::new(native_backend())
+        .args(&startup)
+        .arg("test")
+        .args(native_fetch_args())
+        .arg("//:seed")
+        .current_dir(&workspace)
+        .status()
+        .unwrap();
+    Command::new(native_backend())
+        .args(&startup)
+        .arg("shutdown")
+        .current_dir(&workspace)
+        .status()
+        .unwrap();
+    assert!(built.success(), "seeding the native module lockfile failed");
+    fs::create_dir_all(lockfile.parent().unwrap()).unwrap();
+    let partial = lockfile.with_extension("partial");
+    fs::copy(workspace.join("MODULE.bazel.lock"), &partial).unwrap();
+    fs::rename(&partial, &lockfile).unwrap();
+    lockfile
+}
+/// Rule autoloading would fetch rules_java, rules_shell, rules_python and rules_cc from GitHub
+/// for every fresh output base; without it the workspace needs only `platforms`, cached once.
 fn native_args(harness: &Harness, command: &str) -> Vec<OsString> {
-    vec![
+    let mut args: Vec<OsString> = vec![
         "--ignore_all_rc_files".into(),
         format!(
             "--output_user_root={}",
@@ -1133,22 +1211,20 @@ fn native_args(harness: &Harness, command: &str) -> Vec<OsString> {
         "--host_jvm_args=-Xmx256m".into(),
         "--max_idle_secs=10".into(),
         command.into(),
-    ]
+    ];
+    if command != "shutdown" {
+        args.extend(native_fetch_args());
+    }
+    args
 }
 fn native_workspace(harness: &Harness, extra: &str) {
     let workspace = harness.root.path().join("workspace");
     fs::create_dir_all(&workspace).unwrap();
-    fs::write(
-        workspace.join("MODULE.bazel"),
-        "module(name=\"queue_contract\")\n",
-    )
-    .unwrap();
+    fs::write(workspace.join("MODULE.bazel"), NATIVE_MODULE).unwrap();
+    fs::copy(native_lockfile(), workspace.join("MODULE.bazel.lock")).unwrap();
     fs::write(
         workspace.join(".bazelversion"),
-        format!(
-            "{}\n",
-            std::env::var("BAZELQUEUE_TEST_VERSION").unwrap_or_else(|_| "8.4.2".into())
-        ),
+        format!("{}\n", native_version()),
     )
     .unwrap();
     fs::write(
@@ -1194,10 +1270,7 @@ fn native_build_and_authenticated_idle_probe() {
         .iter()
         .find_map(|job| job.server.as_ref())
         .unwrap();
-    assert_eq!(
-        server.version,
-        std::env::var("BAZELQUEUE_TEST_VERSION").unwrap_or_else(|_| "8.4.2".into())
-    );
+    assert_eq!(server.version, native_version());
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1661,11 +1734,13 @@ fn native_distinct_workspaces_execute_in_parallel_with_bounded_shares() {
     for label in ["one", "two"] {
         let workspace = harness.root.path().join(label);
         fs::create_dir(&workspace).unwrap();
-        fs::copy(
-            harness.root.path().join("workspace/MODULE.bazel"),
-            workspace.join("MODULE.bazel"),
-        )
-        .unwrap();
+        for file in ["MODULE.bazel", "MODULE.bazel.lock"] {
+            fs::copy(
+                harness.root.path().join("workspace").join(file),
+                workspace.join(file),
+            )
+            .unwrap();
+        }
         fs::copy(
             harness.root.path().join("workspace/.bazelversion"),
             workspace.join(".bazelversion"),
