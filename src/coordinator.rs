@@ -1757,6 +1757,14 @@ mod tests {
         received
     }
 
+    fn fast_config() -> Config {
+        Config {
+            cpu_capacity: 8,
+            memory_capacity_mib: 16384,
+            ..Config::default()
+        }
+    }
+
     fn checking(fixture: &Fixture, config: &Config, id: &str) -> Job {
         let mut job = fixture.job(id, "preparing");
         job.request.prepared = false;
@@ -1786,7 +1794,7 @@ mod tests {
     #[test]
     fn an_up_to_date_check_starts_at_once_in_its_fast_lane_slot() {
         let fixture = Fixture::new();
-        let config = Config::default();
+        let config = fast_config();
         checking(&fixture, &config, "fresh");
         let events = deliver(&fixture, &config, "fresh", prepared(Some(true)));
         assert!(matches!(
@@ -1803,7 +1811,7 @@ mod tests {
     #[test]
     fn a_stale_check_returns_to_its_queue_position_with_its_own_budget() {
         let fixture = Fixture::new();
-        let config = Config::default();
+        let config = fast_config();
         let original = checking(&fixture, &config, "stale");
         for up_to_date in [Some(false), None] {
             let mut job = fixture.stored("stale");
@@ -1826,7 +1834,7 @@ mod tests {
     #[test]
     fn a_passed_check_waits_in_the_queue_once_admission_is_held_or_draining() {
         let fixture = Fixture::new();
-        let config = Config::default();
+        let config = fast_config();
         let mut pressured = Monitor::default();
         pressured.signals.reason = Some("memory pressure (critical)".into());
         checking(&fixture, &config, "pressured");
@@ -1852,7 +1860,7 @@ mod tests {
     #[test]
     fn an_up_to_date_answer_without_a_fast_lane_check_never_skips_the_queue() {
         let fixture = Fixture::new();
-        let config = Config::default();
+        let config = fast_config();
         fixture.job("ordinary", "preparing");
         let events = deliver(&fixture, &config, "ordinary", prepared(Some(true)));
         assert!(matches!(events.as_slice(), [Event::Ack]));
@@ -1864,7 +1872,7 @@ mod tests {
     #[test]
     fn a_reconnecting_guardian_resumes_its_fast_lane_check() {
         let fixture = Fixture::new();
-        let config = Config::default();
+        let config = fast_config();
         let mut job = checking(&fixture, &config, "again");
         job.request.owner = platform::current_identity().unwrap();
         fixture.store.save(&job).unwrap();
