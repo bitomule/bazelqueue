@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.11](https://github.com/bitomule/bazelqueue/compare/v0.1.10...v0.1.11) - 2026-11-05
+
+### Added
+
+- start up-to-date builds and tests at once through a fast lane ([#23](https://github.com/bitomule/bazelqueue/pull/23))
+
+### Internal
+
+- run the native Bazel contract without GitHub or the registry ([#25](https://github.com/bitomule/bazelqueue/pull/25))
+
 ## [0.1.10](https://github.com/bitomule/bazelqueue/compare/v0.1.9...v0.1.10) - 2026-10-30
 
 ### Changed
