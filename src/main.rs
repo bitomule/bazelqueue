@@ -266,17 +266,28 @@ fn show(event: Event, json: bool) -> Result<()> {
         }
         if let Some(resources) = &snapshot.resources {
             println!(
-                "Memory available {} MiB | swap in/out {}/{} MiB/min | {}",
+                "Memory available {} MiB | swap used {} MiB, growth {} MiB/min | swap in/out {}/{} MiB/min | disk free {} MiB | {}",
                 resources
                     .sample
                     .available_mib
                     .map_or("unknown".into(), |value| value.to_string()),
+                resources
+                    .sample
+                    .swap_used_mib
+                    .map_or("unknown".into(), |value| value.to_string()),
+                resources
+                    .swap_growth_mib_per_min
+                    .map_or("unknown".into(), |rate| format!("{rate:.1}")),
                 resources
                     .swap_in_mib_per_min
                     .map_or("unknown".into(), |rate| format!("{rate:.1}")),
                 resources
                     .swap_out_mib_per_min
                     .map_or("unknown".into(), |rate| format!("{rate:.1}")),
+                resources
+                    .sample
+                    .disk_free_mib
+                    .map_or("unknown".into(), |value| value.to_string()),
                 resources.reason.as_deref().unwrap_or("full admission")
             );
         }

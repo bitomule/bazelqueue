@@ -44,6 +44,7 @@ fn sample_resources(
     config: &Config,
     sampler: &mut platform::ResourceSampler,
     at_ms: u64,
+    jobs: &[Job],
 ) -> Sample {
     #[cfg(feature = "test-fixtures")]
     {
@@ -67,12 +68,22 @@ fn sample_resources(
                 available_mib: Some(memory),
                 swap_in_bytes: Some(0),
                 swap_out_bytes: Some(0),
+                swap_used_mib: Some(0),
+                disk_free_mib: Some(config.disk_safety_mib),
                 ..Sample::default()
             };
         }
     }
-    let _ = (paths, config);
-    sampler.sample(at_ms)
+    let _ = config;
+    let mut sample = sampler.sample(at_ms);
+    let lanes: std::collections::BTreeSet<_> = jobs
+        .iter()
+        .filter(|job| !job.terminal())
+        .map(|job| Path::new(&job.request.lane))
+        .collect();
+    sample.disk_free_mib =
+        platform::free_disk_mib(std::iter::once(paths.root.as_path()).chain(lanes));
+    sample
 }
 
 async fn connection(stream: UnixStream, number: u64, send: mpsc::Sender<Input>) -> Result<()> {
@@ -771,8 +782,12 @@ pub async fn run(paths: Paths) -> Result<()> {
     let started = Instant::now();
     let mut sampler = platform::ResourceSampler::default();
     let mut monitor = Monitor::default();
-    monitor.update(sample_resources(&paths, &config, &mut sampler, 0), &config);
+    monitor.update(
+        sample_resources(&paths, &config, &mut sampler, 0, &store.jobs()?),
+        &config,
+    );
     let mut usage = store.utilization()?;
+    let mut lane_memory = store.lane_memory()?;
     let mut last_flush = Instant::now();
     let mut resident = HashMap::<String, u64>::new();
     let mut tick = 0;
@@ -831,12 +846,14 @@ pub async fn run(paths: Paths) -> Result<()> {
                 tick+=1;
                 if tick%4==0 {
                     if let Ok(updated)=Config::load(&paths) {config=updated;}
-                    let sample=sample_resources(&paths, &config, &mut sampler, started.elapsed().as_millis() as u64);
                     let sampled_jobs=store.jobs()?;
-                    crate::resources::refresh_resident(&sample,&mut resident,||sampled_jobs.iter().filter(|job|job.holds_metered_capacity()).map(|job| {
+                    let sample=sample_resources(&paths, &config, &mut sampler, started.elapsed().as_millis() as u64, &sampled_jobs);
+                    crate::resources::refresh_resident(&sample,&mut resident,||sampled_jobs.iter().filter(|job|job.holds_metered_capacity() || (job.state=="queued" && job.server.is_some())).map(|job| {
                         let owners:Vec<_>=job.child.iter().cloned().chain(job.server.iter().map(|server|server.identity.clone())).collect();
                         (job.request.id.clone(),platform::process_memory(&owners))
                     }).collect());
+                    let builds=sampled_jobs.iter().filter(|job|job.holds_build_capacity() && job.request.prepared).filter_map(|job|Some((job.request.id.clone(),job.request.lane.clone(),*resident.get(&job.request.id)?)));
+                    if lane_memory.observe(builds) {store.save_lane_memory(&lane_memory)?;}
                     monitor.update(sample, &config);
                 }
 
@@ -945,6 +962,7 @@ pub async fn run(paths: Paths) -> Result<()> {
                 new_memory_mib: monitor
                     .headroom(&config)
                     .saturating_sub(crate::resources::promised_growth(&jobs, &resident)),
+                resident_mib: resident.clone(),
                 reason: monitor.signals.reason.clone(),
             };
             let connected = |job: &&Job| {
@@ -995,6 +1013,9 @@ pub async fn run(paths: Paths) -> Result<()> {
             let candidates: Vec<_> = jobs.iter().filter(connected).cloned().collect();
             let mut profiled = candidates;
             scheduler::allocate_queued(&mut profiled, &config, &capacity);
+            scheduler::raise_to_measured(&mut profiled, &config, &capacity, |lane| {
+                lane_memory.needed_mib(lane)
+            });
             for updated in profiled.iter().filter(|job| job.state == "queued") {
                 if let Some(job) = jobs.iter_mut().find(|job| job.sequence == updated.sequence)
                     && job.request.budget != updated.request.budget
@@ -1162,17 +1183,12 @@ fn handle(
                         version: daemon.version.clone(),
                         executable: daemon.executable.clone(),
                         drained: store.drained()?,
-                        pressure: monitor.signals.sample.pressure.map_or(
-                            "unavailable".into(),
-                            |value| {
-                                match value {
-                                    1 => "normal",
-                                    2 => "warning",
-                                    _ => "critical",
-                                }
-                                .into()
-                            },
-                        ),
+                        pressure: monitor
+                            .signals
+                            .sample
+                            .memory_pressure()
+                            .map_or("unavailable", |level| level.name())
+                            .into(),
                         constrained: (monitor.mode() == Pressure::Constrained)
                             .then(|| config.constrained_budget()),
                         held: monitor.mode() == Pressure::Held,
@@ -1275,7 +1291,7 @@ fn handle(
                     job.request.lane = lane;
                     job.request.prepared = true;
                     job.server = server;
-                    let admitting = monitor.mode() == Pressure::Normal
+                    let admitting = monitor.mode() != Pressure::Held
                         && !store.drained()?
                         && legacy_owners(store, config)?.is_empty();
                     match (&job.fast, up_to_date) {
@@ -1836,7 +1852,7 @@ mod tests {
         let fixture = Fixture::new();
         let config = fast_config();
         let mut pressured = Monitor::default();
-        pressured.signals.reason = Some("memory pressure (critical)".into());
+        pressured.signals.limit = Some(crate::resources::Limit::PressureCritical);
         checking(&fixture, &config, "pressured");
         let events = deliver_under(
             &fixture,

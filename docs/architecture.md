@@ -82,28 +82,51 @@ the remaining machine with other waiting lanes; a lone invocation can use the
 wide profile. CPU division assigns the remainder rather than losing a core.
 Admission stays first come first served among available lanes.
 Reservations stay immutable while executing. Profiles can broaden only before
-execution; lowering settings drains active work. Warning has the same admission
-capacity as normal. Critical pressure or swap-in AND swap-out rates above
-64 MiB/min admit at most one managed build with the configured reduced budget,
-subject to memory headroom. Opaque work waits in that mode. The next safe sample
-restores normal admission, including when native pressure remains warning.
-Historical swap occupancy and compressor size are diagnostic only. A known
-thrashing state survives missing/reset counters until valid rates prove recovery.
+execution; lowering settings drains active work. Monitor reports one typed
+`Limit`; the display reason derives from it and no decision reads text. Warning
+pressure admits at most one managed build with the configured reduced budget,
+subject to memory headroom, and opaque work waits. Swapping, critical pressure,
+low disk, CPU overload and any memory, swap or disk sensor without data hold
+new metered admission. The next safe sample restores normal admission.
 
-Native samples arrive each second: macOS pressure and available percentage from
-sysctl, VM counters from host_statistics64, and CPU gauges. Memory falls back to
-sysinfo availability. Missing memory can reuse the last reading for five seconds,
-then holds admission. Swap counter resets, missing counters and non-increasing
-timestamps produce no rate. CPU load above four per logical core holds new
-admission until below three, without changing active reservations.
+Native samples arrive each second: macOS pressure from sysctl, memory and swap
+counters from host_statistics64, swap occupancy from vm.swapusage, and CPU gauges.
+Free memory is free + file-backed + purgeable pages, without counting speculative
+pages twice. kern.memorystatus_level is not used: it includes active anonymous
+pages, and reported 6819 MiB when only 2527 MiB could be had without compressing
+or swapping. The kernel returns fewer host_statistics64 fields than current
+headers declare, so the sampler requires only those it reads. Disk space comes
+from statvfs on the state directory and each live job's lane, keeping the lowest.
+
+Swapping means swap-out or occupancy growth above swap_thrashing_mib_per_min across
+a 60-second window, so pauses between bursts are not recovery and a burst
+right after start is not a sustained rate. Swap-in alone and
+old occupancy with no growth are not limits. Recovery needs both rates; a reset
+counter, a missing reading or a non-increasing timestamp produces no rate and
+leaves a known swapping state in place. Until the first rates exist, and five
+seconds after the last ones, admission holds. Missing memory can reuse the last
+reading for five seconds, then holds admission. CPU load above four per logical
+core holds new admission until below three, without changing active reservations.
 
 The free-memory margin is max(memory_safety_mib, 5% RAM), initially 1024 MiB.
 Fresh admission headroom subtracts growth promised to active work:
 sum(max(reserved MiB - observed resident MiB, 0)). It then deducts every new grant.
 This avoids both counting resident memory twice and giving multiple starts the
 same still-free memory. The configured global budget remains an independent cap,
-including the memory of live run targets. Sampling and process-tree inspection
-stay outside the deterministic scheduler; tests inject both resources and time.
+including the memory of live run targets, and sums each active job as the larger
+of its reservation and its measured tree. Reservations themselves stay immutable.
+
+Resident memory covers the job's child and Bazel server with their descendants.
+LaneMemory keeps the peak of the latest three builds per output base in the
+settings table, and fast-lane runs do not count. A queued build's reservation
+is raised to that peak plus a quarter, at least the fast-lane budget within its
+max_builds share, capped by what admission could grant. A start takes from
+headroom only what its live server has not already taken. A build that does not
+fit real headroom waits. Only with no metered job holding
+capacity and admission not held may the first queued build exceed headroom, also
+under warning: free memory is cautious, since macOS can still compress, and the
+swap signal stops anything after it. Sampling and process-tree inspection stay outside the deterministic
+scheduler; tests inject resources, residency and time.
 When availability is reused, its original residency snapshot is reused too.
 Unused small-job shares are redistributed to larger waiting jobs before grants.
 Opaque invocations own the CPU lane exclusively and account for the lesser of
@@ -131,13 +154,13 @@ A queued managed build or test may be checked once in a fast-lane slot before
 its turn: at most `fast_lane_slots` at a time, each reserving the worker count in
 CPUs (so Bazel's persistent worker pool keeps its size) and 1536 MiB of real
 headroom, outside the build capacity. A slot is never granted while admission is
-held, reduced, draining or legacy work drains, while the workspace's lane is busy
+held, draining or legacy work drains, while the workspace's lane is busy
 or earlier work waits in it, or before a build or test of that workspace has
 finished successfully. The coordinator sends the slot's budget with the check. In the
 slot the guardian runs the hooks and the info probe, then the caller's invocation
 with `--noblock_for_lock`, the up-to-date check flag and no build event outputs,
 as an owned executor behind the same permit barrier. Only exit code 0 admits, and only while
-admission is still normal: the request moves straight to starting in its slot
+admission is not held: the request moves straight to starting in its slot
 and does not record an estimate. Anything else returns it, prepared and with its own budget, to its
 original queue position; a busy server returns it unprepared. Fast-lane state is
 an optional job field, so older journals and coordinators keep the ordinary path.

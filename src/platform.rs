@@ -336,11 +336,7 @@ impl ResourceSampler {
         self.cpu_ready = true;
         #[cfg(target_os = "macos")]
         {
-            if let Some(percent) =
-                sysctl_u32(c"kern.memorystatus_level").filter(|value| *value <= 100)
-            {
-                sample.available_mib = Some(total_mib * u64::from(percent) / 100);
-            }
+            sample.available_mib = None;
             let mut stats: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
             let mut count = libc::HOST_VM_INFO64_COUNT;
             static HOST: std::sync::OnceLock<libc::mach_port_t> = std::sync::OnceLock::new();
@@ -355,9 +351,18 @@ impl ResourceSampler {
                     &raw mut count,
                 )
             };
-            if result == libc::KERN_SUCCESS && count == libc::HOST_VM_INFO64_COUNT {
+            if result == libc::KERN_SUCCESS && vm_counters_returned(count) {
                 // SAFETY: sysconf reads a system constant.
                 if let Ok(page) = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }) {
+                    sample.available_mib = Some(
+                        reclaimable_pages(
+                            stats.free_count,
+                            stats.speculative_count,
+                            stats.external_page_count,
+                            stats.purgeable_count,
+                        ) * page
+                            / 1_048_576,
+                    );
                     sample.swap_in_bytes = Some(stats.swapins.saturating_mul(page));
                     sample.swap_out_bytes = Some(stats.swapouts.saturating_mul(page));
                     sample.compressor_mib =
@@ -393,6 +398,7 @@ impl ResourceSampler {
             };
             // SAFETY: sysconf reads a system constant.
             if let Ok(page) = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }) {
+                sample.swap_used_mib = Some(self.system.used_swap() / 1_048_576);
                 sample.swap_in_bytes = counter("pswpin").map(|value| value.saturating_mul(page));
                 sample.swap_out_bytes = counter("pswpout").map(|value| value.saturating_mul(page));
             }
@@ -401,21 +407,36 @@ impl ResourceSampler {
     }
 }
 
+/// The kernel fills the fields it knows, fewer than a newer header declares.
 #[cfg(target_os = "macos")]
-fn sysctl_u32(name: &std::ffi::CStr) -> Option<u32> {
-    let mut value = 0_u32;
-    let mut length = std::mem::size_of_val(&value);
-    // SAFETY: value has exactly length bytes; name is NUL terminated.
-    let result = unsafe {
-        libc::sysctlbyname(
-            name.as_ptr(),
-            (&raw mut value).cast(),
-            &raw mut length,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    (result == 0 && length == std::mem::size_of_val(&value)).then_some(value)
+fn vm_counters_returned(count: libc::mach_msg_type_number_t) -> bool {
+    let needed = std::mem::offset_of!(libc::vm_statistics64, internal_page_count)
+        / std::mem::size_of::<libc::integer_t>();
+    count as usize >= needed
+}
+
+/// Memory macOS can hand over without compressing or swapping: free pages, file
+/// cache and purgeable pages. `free` includes `speculative`, and so does `file_backed`.
+#[cfg(any(target_os = "macos", test))]
+fn reclaimable_pages(free: u32, speculative: u32, file_backed: u32, purgeable: u32) -> u64 {
+    u64::from(free.saturating_sub(speculative)) + u64::from(file_backed) + u64::from(purgeable)
+}
+
+/// Lowest free space, for this user, on the file systems of `paths`.
+/// A path that does not exist (yet) says nothing about the disk.
+// statvfs field widths differ between macOS and Linux.
+#[allow(clippy::unnecessary_cast)]
+pub fn free_disk_mib<'a>(paths: impl IntoIterator<Item = &'a Path>) -> Option<u64> {
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+            let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
+            // SAFETY: path is NUL terminated and stats is a writable statvfs.
+            (unsafe { libc::statvfs(path.as_ptr(), &raw mut stats) } == 0)
+                .then(|| (stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64) / 1_048_576)
+        })
+        .min()
 }
 
 pub fn process_memory(owners: &[Identity]) -> u64 {
@@ -869,6 +890,39 @@ pub fn stopped(pid: u32) -> bool {
     {
         let _ = pid;
         false
+    }
+}
+
+#[cfg(test)]
+mod sensor_tests {
+    use super::*;
+    #[test]
+    fn free_memory_leaves_out_pages_apps_are_using() {
+        // Measured on an 18 GiB Mac whose kernel level claimed 6819 MiB available.
+        assert_eq!(reclaimable_pages(20265, 16221, 150_500, 7189), 161_733);
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn this_mac_reports_swap_and_real_free_memory() {
+        let sample = ResourceSampler::default().sample(0);
+        assert!(sample.swap_in_bytes.is_some());
+        assert!(sample.swap_out_bytes.is_some());
+        assert!(sample.swap_used_mib.is_some());
+        assert!(sample.compressor_mib.is_some());
+        assert!(
+            sample
+                .available_mib
+                .is_some_and(|free| free < sample.total_mib)
+        );
+    }
+    #[test]
+    fn free_disk_is_the_lowest_of_the_paths_that_exist() {
+        let root = tempfile::tempdir().unwrap();
+        let free = free_disk_mib([root.path()]);
+        assert!(free.is_some_and(|free| free > 0));
+        let missing = root.path().join("output-base-not-created-yet");
+        assert_eq!(free_disk_mib([missing.as_path()]), None);
+        assert!(free_disk_mib([missing.as_path(), root.path()]).is_some());
     }
 }
 
