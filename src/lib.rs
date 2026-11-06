@@ -10,6 +10,7 @@ pub mod recovery;
 pub mod resources;
 pub mod runner;
 pub mod scheduler;
+pub mod stall;
 pub mod store;
 pub mod summary;
 pub mod utilization;

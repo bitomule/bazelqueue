@@ -42,6 +42,9 @@ pub struct Summary {
     /// Started at once because Bazel reported nothing to rebuild.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub fast_lane: bool,
+    /// Present when bazelqueue cut the job because it stopped progressing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stall: Option<crate::stall::Stall>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -348,6 +351,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_stalled_job_reads_as_a_time_failure() {
+        let stalled = Summary {
+            exit_code: crate::stall::EXIT_CODE,
+            exit_name: Some(crate::stall::EXIT_NAME.into()),
+            reason: Some("no progress for 600s".into()),
+            stall: Some(crate::stall::Stall {
+                silent_ms: 600_000,
+                cpu_ms: 100,
+                children: 0,
+                clients: Some(0),
+            }),
+            ..summary(0)
+        };
+        assert!(stalled.lines(None)[0].contains("exit=124 TIMEOUT"));
+        let json = serde_json::to_value(&stalled).unwrap();
+        assert_eq!(json["stall"]["silent_ms"], 600_000);
+    }
+
+    #[test]
     fn explicit_disk_failure_is_reported_without_copying_stderr() {
         let events = parse_events(
             r#"{"progress":{"stderr":"private arguments then No space left on device"}}"#,
@@ -390,6 +412,7 @@ mod tests {
                 })
                 .collect(),
             fast_lane: false,
+            stall: None,
         }
     }
 

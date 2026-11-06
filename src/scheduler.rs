@@ -544,6 +544,8 @@ mod tests {
             retiring_server: None,
             fast: Default::default(),
             passed: 0,
+            progress: None,
+            stall: None,
         }
     }
     fn capacity() -> Capacity {

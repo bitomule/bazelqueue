@@ -32,6 +32,8 @@ pub struct Config {
     pub disk_safety_mib: u64,
     /// Up-to-date checks and the runs they admit at once; 0 turns the fast lane off.
     pub fast_lane_slots: u32,
+    /// Minutes without Bazel output, events or CPU before a job is cut; 0 turns detection off.
+    pub stall_minutes: u32,
     pub hooks: Vec<Hook>,
     pub legacy: Vec<platform::Identity>,
 }
@@ -66,6 +68,7 @@ impl Default for Config {
             swap_thrashing_mib_per_min: 64,
             disk_safety_mib: 10240,
             fast_lane_slots: 2,
+            stall_minutes: 10,
             hooks: Vec::new(),
             legacy: Vec::new(),
         }
@@ -116,6 +119,9 @@ impl Config {
             bail!("action memory must fit the invocation memory budget");
         }
         Ok(())
+    }
+    pub fn stall_window_ms(&self) -> u64 {
+        u64::from(self.stall_minutes) * 60_000
     }
     pub fn budget(&self, managed: bool) -> Budget {
         Budget {
