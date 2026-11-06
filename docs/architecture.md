@@ -99,7 +99,8 @@ headers declare, so the sampler requires only those it reads. Disk space comes
 from statvfs on the state directory and each live job's lane, keeping the lowest.
 
 Swapping means swap-out or occupancy growth above swap_thrashing_mib_per_min across
-a 60-second window, so pauses between bursts are not recovery. Swap-in alone and
+a 60-second window, so pauses between bursts are not recovery and a burst
+right after start is not a sustained rate. Swap-in alone and
 old occupancy with no growth are not limits. Recovery needs both rates; a reset
 counter, a missing reading or a non-increasing timestamp produces no rate and
 leaves a known swapping state in place. Until the first rates exist, and five
@@ -118,12 +119,13 @@ of its reservation and its measured tree. Reservations themselves stay immutable
 Resident memory covers the job's child and Bazel server with their descendants.
 LaneMemory keeps the peak of the latest three builds per output base in the
 settings table, and fast-lane runs do not count. A queued build's reservation
-is raised to that peak plus a quarter, or to the fast-lane budget within its
-max_builds share until one exists, capped by what admission could grant. The
-budget that does not fit real headroom waits. Only with no metered job holding
-capacity and normal mode may the first queued build exceed headroom: free memory
-is cautious, since macOS can still compress, and the swap signal stops anything
-after it. Sampling and process-tree inspection stay outside the deterministic
+is raised to that peak plus a quarter, at least the fast-lane budget within its
+max_builds share, capped by what admission could grant. A start takes from
+headroom only what its live server has not already taken. A build that does not
+fit real headroom waits. Only with no metered job holding
+capacity and admission not held may the first queued build exceed headroom, also
+under warning: free memory is cautious, since macOS can still compress, and the
+swap signal stops anything after it. Sampling and process-tree inspection stay outside the deterministic
 scheduler; tests inject resources, residency and time.
 When availability is reused, its original residency snapshot is reused too.
 Unused small-job shares are redistributed to larger waiting jobs before grants.
@@ -152,13 +154,13 @@ A queued managed build or test may be checked once in a fast-lane slot before
 its turn: at most `fast_lane_slots` at a time, each reserving the worker count in
 CPUs (so Bazel's persistent worker pool keeps its size) and 1536 MiB of real
 headroom, outside the build capacity. A slot is never granted while admission is
-held, reduced, draining or legacy work drains, while the workspace's lane is busy
+held, draining or legacy work drains, while the workspace's lane is busy
 or earlier work waits in it, or before a build or test of that workspace has
 finished successfully. The coordinator sends the slot's budget with the check. In the
 slot the guardian runs the hooks and the info probe, then the caller's invocation
 with `--noblock_for_lock`, the up-to-date check flag and no build event outputs,
 as an owned executor behind the same permit barrier. Only exit code 0 admits, and only while
-admission is still normal: the request moves straight to starting in its slot
+admission is not held: the request moves straight to starting in its slot
 and does not record an estimate. Anything else returns it, prepared and with its own budget, to its
 original queue position; a busy server returns it unprepared. Fast-lane state is
 an optional job field, so older journals and coordinators keep the ordinary path.

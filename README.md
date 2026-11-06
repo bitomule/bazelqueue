@@ -282,17 +282,17 @@ promised to active reservations.
 | Free disk below `disk_safety_mib` | Wait |
 | A memory, swap or disk sensor without data | Wait |
 | High CPU load | Wait |
-| Warning pressure | One smaller build at a time |
+| Warning pressure | One smaller build at a time; up-to-date checks still run |
 | Old swap that no longer grows, swap-in alone | No effect |
 
 Reservations follow measurements too. A running job counts as the larger of its
 reservation and the resident memory of its Bazel server and children. Each output
 base remembers the peak of its latest three builds, and a new build there reserves
-that peak plus a quarter, or 1536 MiB within its share until one was measured. A
-build that does not fit waits for free memory instead of starting on a token
-reservation. With no build running and a stable machine, one build may start
-below that figure, so that large apps cannot stop the queue for good. Under
-warning, reduced admission costs speed: sixteen Clang compilations took 25 s with
+that peak plus a quarter, never less than 1536 MiB within its share. A live server
+needs only what it will still grow. A build that does not fit waits for free memory instead of starting on a token
+reservation. With no build running and nothing holding admission, one build may
+start below that figure, also under warning, so that large apps cannot stop the
+queue for good. Under warning, reduced admission costs speed: sixteen Clang compilations took 25 s with
 2 CPU / 2304 MiB against 16 s with 8 CPU / 9 GiB. [Method and admission research](docs/admission-measurements.md).
 
 Recovery takes effect on the next safe sample. Existing grants remain unchanged.

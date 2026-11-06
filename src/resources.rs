@@ -126,7 +126,8 @@ pub struct Signals {
 const SWAP_WINDOW_MS: u64 = 60_000;
 const SENSOR_REUSE_MS: u64 = 5000;
 
-/// Readings of one swap sensor over the window. A rate needs two readings in it.
+/// Readings of one swap sensor over the window. A rate needs two readings in it, and
+/// always spreads over the whole window: a burst just after start is not a sustained rate.
 #[derive(Default)]
 struct SwapWindow(std::collections::VecDeque<(u64, u64)>);
 
@@ -146,7 +147,7 @@ impl SwapWindow {
         }
         let (first, start) = *self.0.front()?;
         (first < at_ms)
-            .then(|| value.saturating_sub(start) as f64 * 60_000.0 / (at_ms - first) as f64)
+            .then(|| value.saturating_sub(start) as f64 * 60_000.0 / SWAP_WINDOW_MS as f64)
     }
 
     /// A counter never falls unless it restarted, and no rate may span that.
@@ -368,24 +369,33 @@ mod tests {
             ..sample(at_ms, 2, 0)
         };
         let mut monitor = Monitor::default();
-        for second in 0..=30 {
+        for second in 0..=60 {
             monitor.update(measured(second * 1000, 9000 + second * 17), &config);
         }
         assert_eq!(monitor.signals.limit, Some(Limit::Swapping));
         assert_eq!(monitor.mode(), Pressure::Held);
         assert_eq!(monitor.signals.swap_growth_mib_per_min, Some(1020.0));
-        let plateau = 9000 + 30 * 17;
-        monitor.update(measured(61_000, plateau), &config);
-        assert_eq!(monitor.signals.limit, Some(Limit::Swapping));
+        let plateau = 9000 + 60 * 17;
         monitor.update(measured(91_000, plateau), &config);
+        assert_eq!(monitor.signals.limit, Some(Limit::Swapping));
+        monitor.update(measured(121_000, plateau), &config);
         assert_eq!(monitor.signals.limit, Some(Limit::PressureWarning));
         monitor.update(
             Sample {
                 swap_used_mib: Some(plateau),
-                ..sample(92_000, 1, 0)
+                ..sample(122_000, 1, 0)
             },
             &config,
         );
+        assert_eq!(monitor.mode(), Pressure::Normal);
+    }
+    #[test]
+    fn a_small_burst_right_after_start_is_not_sustained_swapping() {
+        let config = Config::default();
+        let mut monitor = settled(&config, 1);
+        let mut next = sample(2000, 1, 0);
+        next.swap_out_bytes = Some(20 * 1_048_576);
+        monitor.update(next, &config);
         assert_eq!(monitor.mode(), Pressure::Normal);
     }
     #[test]
@@ -515,12 +525,12 @@ mod tests {
                 at_ms: 2000,
                 ..Sample::default()
             },
-            sample(1000, 1, 2_000_000),
+            sample(1000, 1, 100 * 1_048_576),
             sample(2000, 1, 0),
         ] {
             let mut monitor = Monitor::default();
             monitor.update(sample(0, 1, 0), &config);
-            monitor.update(sample(1000, 1, 2_000_000), &config);
+            monitor.update(sample(1000, 1, 100 * 1_048_576), &config);
             assert_eq!(monitor.signals.limit, Some(Limit::Swapping));
             monitor.update(invalid, &config);
             assert_eq!(monitor.signals.limit, Some(Limit::Swapping));

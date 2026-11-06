@@ -76,13 +76,13 @@ fn sample_resources(
     }
     let _ = config;
     let mut sample = sampler.sample(at_ms);
-    sample.disk_free_mib = platform::free_disk_mib(
-        std::iter::once(paths.root.as_path()).chain(
-            jobs.iter()
-                .filter(|job| !job.terminal())
-                .map(|job| Path::new(&job.request.lane)),
-        ),
-    );
+    let lanes: std::collections::BTreeSet<_> = jobs
+        .iter()
+        .filter(|job| !job.terminal())
+        .map(|job| Path::new(&job.request.lane))
+        .collect();
+    sample.disk_free_mib =
+        platform::free_disk_mib(std::iter::once(paths.root.as_path()).chain(lanes));
     sample
 }
 
@@ -848,7 +848,7 @@ pub async fn run(paths: Paths) -> Result<()> {
                     if let Ok(updated)=Config::load(&paths) {config=updated;}
                     let sampled_jobs=store.jobs()?;
                     let sample=sample_resources(&paths, &config, &mut sampler, started.elapsed().as_millis() as u64, &sampled_jobs);
-                    crate::resources::refresh_resident(&sample,&mut resident,||sampled_jobs.iter().filter(|job|job.holds_metered_capacity()).map(|job| {
+                    crate::resources::refresh_resident(&sample,&mut resident,||sampled_jobs.iter().filter(|job|job.holds_metered_capacity() || (job.state=="queued" && job.server.is_some())).map(|job| {
                         let owners:Vec<_>=job.child.iter().cloned().chain(job.server.iter().map(|server|server.identity.clone())).collect();
                         (job.request.id.clone(),platform::process_memory(&owners))
                     }).collect());
@@ -1291,7 +1291,7 @@ fn handle(
                     job.request.lane = lane;
                     job.request.prepared = true;
                     job.server = server;
-                    let admitting = monitor.mode() == Pressure::Normal
+                    let admitting = monitor.mode() != Pressure::Held
                         && !store.drained()?
                         && legacy_owners(store, config)?.is_empty();
                     match (&job.fast, up_to_date) {
