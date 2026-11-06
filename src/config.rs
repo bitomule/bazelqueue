@@ -29,6 +29,7 @@ pub struct Config {
     pub constrained_divisor: u32,
     pub memory_safety_mib: u64,
     pub swap_thrashing_mib_per_min: u64,
+    pub disk_safety_mib: u64,
     /// Up-to-date checks and the runs they admit at once; 0 turns the fast lane off.
     pub fast_lane_slots: u32,
     pub hooks: Vec<Hook>,
@@ -63,6 +64,7 @@ impl Default for Config {
             constrained_divisor: 4,
             memory_safety_mib: 1024,
             swap_thrashing_mib_per_min: 64,
+            disk_safety_mib: 10240,
             fast_lane_slots: 2,
             hooks: Vec::new(),
             legacy: Vec::new(),
@@ -101,6 +103,7 @@ impl Config {
             || self.constrained_divisor == 0
             || self.memory_safety_mib == 0
             || self.swap_thrashing_mib_per_min == 0
+            || self.disk_safety_mib == 0
         {
             bail!("resource capacities and concurrency must be positive");
         }

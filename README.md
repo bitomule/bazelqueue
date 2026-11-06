@@ -84,7 +84,7 @@ waits. In a terminal, every position change is shown as it happens.
 |---|---|
 | Several agents use different worktrees | CPU and memory reservations determine which calls fit. Same-server calls keep FIFO order. |
 | A build or test has nothing to rebuild | Bazel's own up-to-date check runs in a small fast-lane slot; if it passes, the call starts at once instead of waiting behind other builds. |
-| Memory pressure rises | Warning keeps full capacity. Critical pressure or active swap thrashing admits one smaller build if real memory headroom permits; the next safe sample restores full admission. |
+| Memory runs short | Warning admits one smaller build at a time. Critical pressure, macOS writing to swap, low disk space or a sensor without data hold new builds; running ones keep their reservation. The next safe sample restores full admission. |
 | The caller disappears | Its owned backend is cancelled. Capacity is retained until completion or verified recovery. |
 | The coordinator restarts | Guardians reconnect without submitting the command a second time. |
 | `bazel run` finishes compiling | The target runs through Bazel's generated script. Compilation capacity is released; the target's process footprint remains tracked. |
@@ -216,7 +216,8 @@ ${EDITOR:-vi} ~/.local/state/bazelqueue/config.toml
 | `jobs` | The cap on actions Bazel keeps in flight, cache checks included. Default: **64**; the reserved CPUs, not this, limit what runs locally. |
 | `worker_instances` | Worker and multiplex-worker instance caps. |
 | `memory_safety_mib` | Free-memory margin, at least 5% of RAM. Default: **1024 MiB**. |
-| `swap_thrashing_mib_per_min` | Threshold that both swap-in and swap-out rates must exceed to reduce admission. Default: **64 MiB/min** each. |
+| `swap_thrashing_mib_per_min` | New builds wait while swap-out or swap growth, over the last 60 seconds, exceeds this rate. Default: **64 MiB/min**. |
+| `disk_safety_mib` | New builds wait while free space on the queue state or an output base is below this. Default: **10240 MiB**. |
 | `fast_lane_slots` | Up-to-date checks, and the runs they admit, that may proceed outside the build capacity at once. Default: **2**; `0` turns the fast lane off. |
 
 A lone supported build can receive the wide profile. Concurrent managed builds
@@ -268,18 +269,35 @@ call at its queue position, already prepared. Bazel's check only trusts the
 workspace's own action cache: results available only in a remote or disk cache
 still wait for a reservation. [Measurements](docs/admission-measurements.md#fast-lane-measurement-5-november-2026).
 
-**Warning is not a reason to slow a build down.** Under native warning pressure,
-sixteen fresh Clang compilations took **16.14 / 16.45 s** with 8 CPU / 9 GiB,
-versus **25.31 / 24.86 s** with 2 CPU / 2304 MiB. These are workload-specific
-measurements, not a throughput guarantee. [Method and admission research](docs/admission-measurements.md).
+**Admission follows what the machine really has free.** Free memory is what macOS
+can hand over without compressing or swapping: free pages, file cache and
+purgeable pages. Bazel servers, Docker and other apps count because they occupy
+it. Each admission checks that figure after the safety margin and growth still
+promised to active reservations.
 
-Memory values are estimates, not hard OS quotas. Each admission checks real
-available memory after the safety margin and growth still promised to active
-reservations. Critical pressure or bidirectional swap thrashing reduces new
-managed work to one smaller build; opaque invocations wait. A high CPU load
-also holds new admission. Recovery takes effect on the next sample, even under
-warning. Existing grants remain unchanged. The legacy `pressure_recovery_samples`
-setting is accepted but no longer delays recovery.
+| Signal | New builds and tests |
+|---|---|
+| macOS writes to swap, or swap grows, faster than `swap_thrashing_mib_per_min` over 60 seconds | Wait |
+| Critical pressure | Wait |
+| Free disk below `disk_safety_mib` | Wait |
+| A memory, swap or disk sensor without data | Wait |
+| High CPU load | Wait |
+| Warning pressure | One smaller build at a time |
+| Old swap that no longer grows, swap-in alone | No effect |
+
+Reservations follow measurements too. A running job counts as the larger of its
+reservation and the resident memory of its Bazel server and children. Each output
+base remembers the peak of its latest three builds, and a new build there reserves
+that peak plus a quarter, or 1536 MiB within its share until one was measured. A
+build that does not fit waits for free memory instead of starting on a token
+reservation. With no build running and a stable machine, one build may start
+below that figure, so that large apps cannot stop the queue for good. Under
+warning, reduced admission costs speed: sixteen Clang compilations took 25 s with
+2 CPU / 2304 MiB against 16 s with 8 CPU / 9 GiB. [Method and admission research](docs/admission-measurements.md).
+
+Recovery takes effect on the next safe sample. Existing grants remain unchanged.
+The legacy `pressure_recovery_samples` setting is accepted but no longer delays
+recovery.
 
 `bazelqueue status` and `status --json` show hourly utilization for the latest
 24 hours: observed time, time with a build running, reserved CPU and memory, and

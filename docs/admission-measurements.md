@@ -23,9 +23,34 @@ Alondra #1330, commit `0fd2d0f1837cb940ced1e4561fe933f198e23a20`, uses native
 memory percentage, swap-out deltas, anticipated memory growth and CPU overload.
 Take those sensors and pending growth. Discard its 60-second memory window,
 20%/30% free-memory floors and three-minute warning admission interval: those
-protect agent sessions rather than maximizing build throughput. Unlike that
-policy, bazelqueue requires both swap-in and swap-out above 64 MiB/min to signal
-thrashing. Swap occupancy and compressor size alone remain diagnostic.
+protect agent sessions rather than maximizing build throughput. Like that
+policy, bazelqueue now reacts to swap-out and swap growth; the
+[November measurement](#disk-filled-with-swap-6-november-2026) explains why.
+Swap occupancy that no longer grows and compressor size remain diagnostic.
+
+## Disk filled with swap, 6 November 2026
+
+Host: M3 Pro, 18 GiB RAM, v0.1.11. Swap filled the disk five times. `status`
+showed warning pressure, 6819 MiB available, swap of 9-20 GB growing about
+1 GB/min, three builds running and "full admission", while reservations summed
+6 CPU / 8192 MiB. One job reserved 300 MiB while its server used more than 1 GB.
+
+| Finding | Evidence |
+|---|---|
+| Swap counters never arrived | `swap_in_bytes`, `swap_out_bytes` and `compressor_mib` were null: the sampler required `HOST_VM_INFO64_COUNT` fields, and the kernel returned 62 of 104 with success |
+| "Available" included memory in use | `kern.memorystatus_level` gave 6819 MiB; active + inactive + free + speculative was 6754 MiB; free + file-backed + purgeable was 2527 MiB |
+| Swap growth was invisible to policy | Only simultaneous swap-in and swap-out above the threshold reduced admission |
+| Reservations shrank to fit | Shares of what remained, with a 256 MiB minimum, regardless of the job's server |
+
+Over 30 seconds of that load, swap counters moved 2053 swap-in pages (32 MiB at
+16 KiB per page) while occupancy fell 40 MiB, with zero swap-out: the counters
+are pages, and recovering pages is not a reason to hold. Available memory follows the
+[XNU definition](https://cs.iossec.tech/xnu/latest/source/doc/vm/memorystatus_notify.md),
+which counts active pages as available because they can be compressed.
+
+The warning experiment below still stands: reduced admission costs speed. Warning
+now accepts that cost, because full admission under warning is what preceded the
+swap growth above.
 
 ## Before-change ABBA measurement, 30 October 2026
 
@@ -64,8 +89,8 @@ It does not establish causal performance for arbitrary Swift/Rust builds,
 prove that parallel invocations always improve makespan, or separate the CPU
 effect from the smaller memory budget. Other applications were active.
 
-Reproduce with the **baseline** feature binary (a newer policy no longer maps
-warning to reduced admission):
+Reproduce with the **baseline** feature binary, whose pressure input selects
+both profiles:
 
 ```sh
 cargo build --locked --features test-fixtures --bins

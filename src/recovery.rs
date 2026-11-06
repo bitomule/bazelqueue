@@ -157,6 +157,7 @@ mod tests {
                     drained: false,
                     run_memory_mib: 0,
                     new_memory_mib: 9216,
+                    resident_mib: Default::default(),
                     reason: None,
                 };
                 assert!(scheduler::eligible(&jobs, &config, &capacity).is_empty());

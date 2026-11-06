@@ -4,6 +4,7 @@ use bazelqueue::{
     coordinator,
     platform::{self, Identity},
     protocol::{Event, Snapshot},
+    resources::Limit,
 };
 use std::{
     cell::RefCell,
@@ -481,7 +482,7 @@ fn stdout_stdin_and_non_utf8_arguments_are_preserved() {
 fn critical_memory_pressure_blocks_and_recovery_resumes_the_queue() {
     let mut harness = Harness::new(1);
     fs::write(harness.paths.root.join("pressure"), "4").unwrap();
-    harness.wait(|s| s.pressure == "critical" && s.constrained.is_some());
+    harness.wait(|s| s.pressure == "critical" && s.held);
     let listener = harness.spawn_hold("a");
     harness.wait(|s| s.jobs.iter().any(|job| job.state == "queued"));
     fs::write(harness.paths.root.join("pressure"), "1").unwrap();
@@ -490,39 +491,10 @@ fn critical_memory_pressure_blocks_and_recovery_resumes_the_queue() {
 }
 
 #[test]
-fn warning_runs_parallel_jobs_at_full_capacity() {
+fn warning_reduces_new_work_and_normal_recovers_without_changing_a_grant() {
     let mut harness = Harness::new(2);
-    harness.command().arg("drain").output().unwrap();
     fs::write(harness.paths.root.join("pressure"), "2").unwrap();
-    harness.wait(|s| s.pressure == "warning" && s.constrained.is_none());
-    let first = harness.spawn_hold("first");
-    let second = harness.spawn_hold("second");
-    harness.wait(|s| s.jobs.iter().filter(|job| job.state == "queued").count() == 2);
-    harness.command().arg("resume").output().unwrap();
-    let mut running = Harness::accepted(&first);
-    let mut parallel = Harness::accepted(&second);
-    let snapshot =
-        harness.wait(|s| s.jobs.iter().filter(|job| job.state == "running").count() == 2);
-    let active: Vec<_> = snapshot
-        .jobs
-        .iter()
-        .filter(|job| job.holds_capacity())
-        .collect();
-    assert_eq!(active.len(), 2);
-    assert!(
-        active
-            .iter()
-            .all(|job| job.request.budget.cpu == 4 && job.request.budget.memory_mib == 2048)
-    );
-    running.write_all(b"F").unwrap();
-    parallel.write_all(b"F").unwrap();
-}
-
-#[test]
-fn critical_reduces_new_work_and_warning_recovers_without_changing_a_grant() {
-    let mut harness = Harness::new(2);
-    fs::write(harness.paths.root.join("pressure"), "4").unwrap();
-    harness.wait(|s| s.constrained.is_some());
+    harness.wait(|s| s.pressure == "warning" && s.constrained.is_some());
     let first = harness.spawn_hold("first");
     let mut running = Harness::accepted(&first);
     let second = harness.spawn_hold("second");
@@ -537,7 +509,7 @@ fn critical_reduces_new_work_and_warning_recovers_without_changing_a_grant() {
         .clone();
     assert_eq!((granted.cpu, granted.memory_mib), (2, 1024));
     assert!(second.accept().is_err());
-    fs::write(harness.paths.root.join("pressure"), "2").unwrap();
+    fs::write(harness.paths.root.join("pressure"), "1").unwrap();
     let mut parallel = Harness::accepted(&second);
     let after = harness.wait(|s| s.jobs.iter().filter(|job| job.state == "running").count() == 2);
     assert!(after.constrained.is_none());
@@ -552,26 +524,150 @@ fn critical_reduces_new_work_and_warning_recovers_without_changing_a_grant() {
 }
 
 #[test]
-fn injected_swap_rates_reduce_and_recover_while_warning_persists() {
+fn growing_swap_holds_a_build_until_it_stops_while_warning_persists() {
     let mut harness = Harness::new(2);
     let sensor = harness.paths.root.join("resources.json");
-    let sample = |counter, at_ms| serde_json::json!({"at_ms":at_ms,"pressure":2,"total_mib":5120,"available_mib":5120,"swap_in_bytes":counter,"swap_out_bytes":counter});
-    platform::atomic_write(&sensor, &serde_json::to_vec(&sample(0_u64, 0)).unwrap()).unwrap();
-    harness.wait(|s| s.pressure == "warning" && s.constrained.is_none());
-    platform::atomic_write(
-        &sensor,
-        &serde_json::to_vec(&sample(1_u64 << 50, 1000)).unwrap(),
+    let sample = |used: u64, at_ms: u64| serde_json::json!({"at_ms":at_ms,"pressure":2,"total_mib":18432,"available_mib":6819,"swap_in_bytes":0,"swap_out_bytes":0,"swap_used_mib":used,"disk_free_mib":1048576});
+    let write = |used, at_ms| {
+        platform::atomic_write(&sensor, &serde_json::to_vec(&sample(used, at_ms)).unwrap()).unwrap()
+    };
+    write(0, 100_000);
+    harness.wait(|s| s.pressure == "warning");
+    write(0, 101_000);
+    harness.wait(|s| s.pressure == "warning" && s.constrained.is_some());
+    write(1024, 102_000);
+    let limit = |s: &Snapshot| s.resources.as_ref().and_then(|r| r.limit);
+    harness.wait(|s| limit(s) == Some(Limit::Swapping) && s.held);
+    let listener = harness.spawn_hold("waits");
+    harness.wait(|s| s.jobs.iter().any(|job| job.state == "queued"));
+    assert!(listener.accept().is_err());
+    // Virtual time moves only once the hold has been observed.
+    write(1024, 162_000);
+    let mut running = Harness::accepted(&listener);
+    harness.wait(|s| limit(s) == Some(Limit::PressureWarning) && !s.held);
+    running.write_all(b"F").unwrap();
+}
+
+#[test]
+fn low_disk_holds_a_build_until_space_returns() {
+    let mut harness = Harness::new(1);
+    let sensor = harness.paths.root.join("resources.json");
+    let sample = |free: u64| serde_json::json!({"pressure":1,"total_mib":18432,"available_mib":12000,"swap_in_bytes":0,"swap_out_bytes":0,"swap_used_mib":0,"disk_free_mib":free});
+    platform::atomic_write(&sensor, &serde_json::to_vec(&sample(1024)).unwrap()).unwrap();
+    harness.wait(|s| s.resources.as_ref().and_then(|r| r.limit) == Some(Limit::DiskLow));
+    let listener = harness.spawn_hold("waits");
+    harness.wait(|s| s.jobs.iter().any(|job| job.state == "queued"));
+    assert!(listener.accept().is_err());
+    platform::atomic_write(&sensor, &serde_json::to_vec(&sample(1_048_576)).unwrap()).unwrap();
+    let mut running = Harness::accepted(&listener);
+    running.write_all(b"F").unwrap();
+}
+
+#[test]
+fn a_build_waits_for_free_memory_instead_of_shrinking_below_a_bazel_server() {
+    let mut harness = Harness::new(2);
+    let sensor = harness.paths.root.join("resources.json");
+    let write = |available: u64| {
+        let sample = serde_json::json!({"pressure":1,"total_mib":18432,"available_mib":available,"swap_in_bytes":0,"swap_out_bytes":0,"swap_used_mib":0,"disk_free_mib":1048576});
+        platform::atomic_write(&sensor, &serde_json::to_vec(&sample).unwrap()).unwrap()
+    };
+    write(32768);
+    let busy = emulated_workspace(&harness, "busy");
+    emulated_workspace(&harness, "next");
+    let holder = UnixListener::bind(harness.root.path().join("busy.sock")).unwrap();
+    fs::write(
+        busy.join("hold"),
+        holder
+            .local_addr()
+            .unwrap()
+            .as_pathname()
+            .unwrap()
+            .as_os_str()
+            .as_encoded_bytes(),
     )
     .unwrap();
-    harness
-        .wait(|s| s.resources.as_ref().and_then(|r| r.reason.as_deref()) == Some("swap thrashing"));
-    // Virtual time stays fixed until the test has observed the reduction.
-    platform::atomic_write(
-        &sensor,
-        &serde_json::to_vec(&sample(1_u64 << 50, 2000)).unwrap(),
+    let child = emulated_bazel(&harness, "busy", &["build", "//:x"])
+        .spawn()
+        .unwrap();
+    harness.children.push(child);
+    let mut running = Harness::accepted(&holder);
+    let reserved = harness
+        .wait(|s| s.jobs.iter().any(|job| job.state == "running"))
+        .jobs
+        .iter()
+        .find(|job| job.state == "running")
+        .unwrap()
+        .request
+        .budget
+        .memory_mib;
+    let mut config = Config::load(&harness.paths).unwrap();
+    config.cpu_capacity = 16;
+    config.memory_capacity_mib = 16384;
+    config.save(&harness.paths).unwrap();
+    // Margin of 1024 MiB, then about 500 MiB beyond what the running build was promised.
+    write(reserved + 1024 + 500);
+    let child = emulated_bazel(&harness, "next", &["build", "//:x"])
+        .spawn()
+        .unwrap();
+    harness.children.push(child);
+    harness.wait(|s| {
+        s.jobs
+            .iter()
+            .any(|job| job.state == "queued" && job.request.budget.memory_mib == 1536)
+    });
+    write(32768);
+    harness.wait(|s| {
+        s.jobs
+            .iter()
+            .any(|job| job.state == "finished" && job.code == Some(0))
+    });
+    running.write_all(b"F").unwrap();
+}
+
+#[test]
+fn a_finished_build_leaves_its_measured_memory_for_its_output_base() {
+    let mut harness = Harness::new(1);
+    fs::write(
+        harness.paths.root.join("resources.json"),
+        r#"{"pressure":1,"total_mib":65536,"available_mib":32768,"swap_in_bytes":0,"swap_out_bytes":0,"swap_used_mib":0,"disk_free_mib":1048576}"#,
     )
     .unwrap();
-    harness.wait(|s| s.pressure == "warning" && s.constrained.is_none());
+    let state = emulated_workspace(&harness, "measured");
+    let holder = UnixListener::bind(harness.root.path().join("measured.sock")).unwrap();
+    fs::write(
+        state.join("hold"),
+        holder
+            .local_addr()
+            .unwrap()
+            .as_pathname()
+            .unwrap()
+            .as_os_str()
+            .as_encoded_bytes(),
+    )
+    .unwrap();
+    let child = emulated_bazel(&harness, "measured", &["build", "//:x"])
+        .spawn()
+        .unwrap();
+    harness.children.push(child);
+    let mut running = Harness::accepted(&holder);
+    let at_ms = |s: &Snapshot| s.resources.as_ref().map_or(0, |r| r.sample.at_ms);
+    let started = harness.wait(|s| s.jobs.iter().any(|job| job.state == "running"));
+    let lane = started
+        .jobs
+        .iter()
+        .find(|job| job.state == "running")
+        .unwrap()
+        .request
+        .lane
+        .clone();
+    let sampled = at_ms(&started) + 1500;
+    harness.wait(|s| at_ms(s) >= sampled);
+    running.write_all(b"F").unwrap();
+    let finished = harness.wait(|s| s.jobs.iter().any(|job| job.state == "finished"));
+    let recorded = at_ms(&finished) + 1500;
+    harness.wait(|s| at_ms(s) >= recorded);
+    let store = bazelqueue::store::Store::open(&harness.paths).unwrap();
+    assert!(store.lane_memory().unwrap().needed_mib(&lane).is_some());
 }
 
 #[test]
@@ -1009,7 +1105,7 @@ fn an_up_to_date_build_starts_at_once_while_the_queue_is_full() {
     let mut harness = Harness::new(1);
     fs::write(
         harness.paths.root.join("resources.json"),
-        r#"{"pressure":1,"total_mib":65536,"available_mib":32768,"swap_in_bytes":0,"swap_out_bytes":0}"#,
+        r#"{"pressure":1,"total_mib":65536,"available_mib":32768,"swap_in_bytes":0,"swap_out_bytes":0,"swap_used_mib":0,"disk_free_mib":1048576}"#,
     )
     .unwrap();
     let busy = emulated_workspace(&harness, "busy");
@@ -1288,7 +1384,7 @@ fn native_up_to_date_build_skips_a_full_queue_and_an_edited_one_waits() {
     let mut harness = Harness::new(1);
     fs::write(
         harness.paths.root.join("resources.json"),
-        r#"{"pressure":1,"total_mib":65536,"available_mib":32768,"swap_in_bytes":0,"swap_out_bytes":0}"#,
+        r#"{"pressure":1,"total_mib":65536,"available_mib":32768,"swap_in_bytes":0,"swap_out_bytes":0,"swap_used_mib":0,"disk_free_mib":1048576}"#,
     )
     .unwrap();
     native_workspace(&harness, "");
@@ -1723,8 +1819,6 @@ fn control(harness: &Harness, operation: &str) {
 #[ignore = "requires BAZELQUEUE_TEST_BAZEL; real concurrent native actions"]
 fn native_distinct_workspaces_execute_in_parallel_with_bounded_shares() {
     let mut harness = Harness::new(2);
-    fs::write(harness.paths.root.join("pressure"), "2").unwrap();
-    harness.wait(|s| s.pressure == "warning" && s.constrained.is_none());
     native_workspace(&harness, "");
     let mut config = Config::load(&harness.paths).unwrap();
     config.cpu_capacity = 7;

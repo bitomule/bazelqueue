@@ -110,6 +110,24 @@ impl Store {
         self.connection.execute("INSERT INTO settings(key,value) VALUES('utilization',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![serde_json::to_string(usage)?])?;
         Ok(())
     }
+    pub fn lane_memory(&self) -> Result<crate::resources::LaneMemory> {
+        let json: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT value FROM settings WHERE key='lane_memory'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(json
+            .map(|json| serde_json::from_str(&json))
+            .transpose()?
+            .unwrap_or_default())
+    }
+    pub fn save_lane_memory(&self, lanes: &crate::resources::LaneMemory) -> Result<()> {
+        self.connection.execute("INSERT INTO settings(key,value) VALUES('lane_memory',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![serde_json::to_string(lanes)?])?;
+        Ok(())
+    }
     pub fn trim(&self) -> Result<()> {
         self.connection.execute("DELETE FROM jobs WHERE sequence NOT IN (SELECT sequence FROM jobs ORDER BY sequence DESC LIMIT 500) AND json_extract(data,'$.state') IN ('finished','cancelled')",[])?;
         Ok(())

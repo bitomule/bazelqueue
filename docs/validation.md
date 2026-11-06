@@ -63,11 +63,11 @@ Other workloads should be calibrated before increasing invocation concurrency.
 
 The warning/full versus reduced ABBA experiment, research and limitations are in
 [Admission research and measurements](admission-measurements.md). New pure tests
-cover injected pressure, bidirectional swap rates, missing sensors, counter
+cover injected pressure, swap-out and swap growth, low disk, missing sensors, counter
 resets, pending memory growth, fair resource sharing and hourly utilization.
-Process E2E covers warning parallelism and recovery while grants remain fixed.
-The native parallel-action contract also runs under injected warning and uses
-all seven configured CPU tokens, including the uneven remainder.
+Process E2E covers one build at a time under warning, holds for swap growth and
+low disk, and recovery while grants remain fixed. The native parallel-action
+contract uses all seven configured CPU tokens, including the uneven remainder.
 
 The admission change was validated with 67 unit tests, 29 process E2E tests,
 17 installation transaction tests and 3 PTY tests, plus nine native contracts
