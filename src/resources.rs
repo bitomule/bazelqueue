@@ -85,7 +85,6 @@ pub enum Limit {
     Swapping,
     PressureCritical,
     CpuOverload,
-    PressureWarning,
 }
 
 impl Limit {
@@ -98,13 +97,13 @@ impl Limit {
             Self::Swapping => "macOS is swapping",
             Self::PressureCritical => "memory pressure (critical)",
             Self::CpuOverload => "CPU overload",
-            Self::PressureWarning => "memory pressure (warning)",
         }
     }
 
     pub fn mode(self) -> Pressure {
         match self {
-            Self::PressureWarning => Pressure::Constrained,
+            Self::CpuOverload => Pressure::Overloaded,
+            Self::Swapping | Self::PressureCritical => Pressure::Constrained,
             _ => Pressure::Held,
         }
     }
@@ -220,8 +219,6 @@ impl Monitor {
             .is_some_and(|at| sample.at_ms.saturating_sub(at) <= SENSOR_REUSE_MS);
         let limit = if sample.available_mib.is_none() || sample.pressure.is_none() {
             Some(Limit::MemoryUnavailable)
-        } else if self.swapping {
-            Some(Limit::Swapping)
         } else if !swap_known {
             Some(Limit::SwapUnavailable)
         } else if sample.disk_free_mib.is_none() {
@@ -231,12 +228,12 @@ impl Monitor {
             .is_some_and(|free| free < config.disk_safety_mib)
         {
             Some(Limit::DiskLow)
+        } else if self.swapping {
+            Some(Limit::Swapping)
         } else if sample.memory_pressure() == Some(MemoryPressure::Critical) {
             Some(Limit::PressureCritical)
         } else if self.overloaded {
             Some(Limit::CpuOverload)
-        } else if sample.memory_pressure() == Some(MemoryPressure::Warning) {
-            Some(Limit::PressureWarning)
         } else {
             None
         };
@@ -347,21 +344,21 @@ mod tests {
         monitor
     }
     #[test]
-    fn warning_allows_one_build_and_critical_holds_until_the_next_safe_sample() {
+    fn warning_alone_limits_nothing_and_critical_reduces_until_the_next_safe_sample() {
         let config = Config::default();
         let mut monitor = settled(&config, 1);
         assert_eq!(monitor.mode(), Pressure::Normal);
         monitor.update(sample(2000, 2, 0), &config);
-        assert_eq!(monitor.signals.limit, Some(Limit::PressureWarning));
-        assert_eq!(monitor.mode(), Pressure::Constrained);
+        assert_eq!(monitor.signals.limit, None);
+        assert_eq!(monitor.mode(), Pressure::Normal);
         monitor.update(sample(3000, 4, 0), &config);
         assert_eq!(monitor.signals.limit, Some(Limit::PressureCritical));
-        assert_eq!(monitor.mode(), Pressure::Held);
+        assert_eq!(monitor.mode(), Pressure::Constrained);
         monitor.update(sample(4000, 1, 0), &config);
         assert_eq!(monitor.mode(), Pressure::Normal);
     }
     #[test]
-    fn the_measured_swap_growth_holds_warning_admission_until_it_stops() {
+    fn the_measured_swap_growth_reduces_admission_until_it_stops() {
         let config = Config::default();
         let measured = |at_ms, used| Sample {
             available_mib: Some(6819),
@@ -373,13 +370,13 @@ mod tests {
             monitor.update(measured(second * 1000, 9000 + second * 17), &config);
         }
         assert_eq!(monitor.signals.limit, Some(Limit::Swapping));
-        assert_eq!(monitor.mode(), Pressure::Held);
+        assert_eq!(monitor.mode(), Pressure::Constrained);
         assert_eq!(monitor.signals.swap_growth_mib_per_min, Some(1020.0));
         let plateau = 9000 + 60 * 17;
         monitor.update(measured(91_000, plateau), &config);
         assert_eq!(monitor.signals.limit, Some(Limit::Swapping));
         monitor.update(measured(121_000, plateau), &config);
-        assert_eq!(monitor.signals.limit, Some(Limit::PressureWarning));
+        assert_eq!(monitor.signals.limit, None);
         monitor.update(
             Sample {
                 swap_used_mib: Some(plateau),
@@ -399,7 +396,7 @@ mod tests {
         assert_eq!(monitor.mode(), Pressure::Normal);
     }
     #[test]
-    fn swap_writes_hold_admission_even_while_occupancy_stays_flat() {
+    fn swap_writes_reduce_admission_even_while_occupancy_stays_flat() {
         let config = Config::default();
         let mut monitor = settled(&config, 1);
         let mut next = sample(61_000, 1, 0);
@@ -415,10 +412,10 @@ mod tests {
         let mut next = sample(2000, 1, 0);
         next.swap_out_bytes = Some(burst);
         monitor.update(next.clone(), &config);
-        assert_eq!(monitor.mode(), Pressure::Held);
+        assert_eq!(monitor.mode(), Pressure::Constrained);
         next.at_ms = 30_000;
         monitor.update(next.clone(), &config);
-        assert_eq!(monitor.mode(), Pressure::Held);
+        assert_eq!(monitor.mode(), Pressure::Constrained);
         next.at_ms = 63_000;
         monitor.update(next, &config);
         assert_eq!(monitor.mode(), Pressure::Normal);
@@ -470,6 +467,37 @@ mod tests {
         assert_eq!(monitor.mode(), Pressure::Held);
     }
     #[test]
+    fn a_swap_sensor_lost_while_swapping_holds_rather_than_reduces() {
+        let config = Config::default();
+        let mut monitor = settled(&config, 1);
+        let mut next = sample(2000, 1, 0);
+        next.swap_out_bytes = Some(200 * 1_048_576);
+        monitor.update(next, &config);
+        assert_eq!(monitor.signals.limit, Some(Limit::Swapping));
+        monitor.update(
+            Sample {
+                swap_in_bytes: None,
+                swap_out_bytes: None,
+                swap_used_mib: None,
+                ..sample(7001, 1, 0)
+            },
+            &config,
+        );
+        assert_eq!(monitor.signals.limit, Some(Limit::SwapUnavailable));
+        assert_eq!(monitor.mode(), Pressure::Held);
+    }
+    #[test]
+    fn low_disk_stops_the_queue_even_while_macos_swaps() {
+        let config = Config::default();
+        let mut monitor = settled(&config, 1);
+        let mut next = sample(2000, 1, 0);
+        next.swap_out_bytes = Some(200 * 1_048_576);
+        next.disk_free_mib = Some(config.disk_safety_mib - 1);
+        monitor.update(next, &config);
+        assert_eq!(monitor.signals.limit, Some(Limit::DiskLow));
+        assert_eq!(monitor.mode(), Pressure::Held);
+    }
+    #[test]
     fn low_or_unknown_disk_holds_admission() {
         let config = Config::default();
         let mut monitor = settled(&config, 1);
@@ -510,7 +538,7 @@ mod tests {
         let mut next = sample(7000, 1, 0);
         next.load_per_cpu = Some(4.1);
         monitor.update(next.clone(), &config);
-        assert_eq!(monitor.mode(), Pressure::Held);
+        assert_eq!(monitor.mode(), Pressure::Overloaded);
         next.at_ms = 8000;
         next.load_per_cpu = Some(2.9);
         monitor.update(next, &config);
@@ -533,7 +561,7 @@ mod tests {
             monitor.update(sample(1000, 1, 100 * 1_048_576), &config);
             assert_eq!(monitor.signals.limit, Some(Limit::Swapping));
             monitor.update(invalid, &config);
-            assert_eq!(monitor.signals.limit, Some(Limit::Swapping));
+            assert_ne!(monitor.mode(), Pressure::Normal);
         }
     }
     #[test]

@@ -58,6 +58,7 @@ impl Store {
             cancel: false,
             reason: None,
             retiring_server: None,
+            passed: 0,
             fast: Default::default(),
         };
         self.connection.execute(

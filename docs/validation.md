@@ -65,8 +65,9 @@ The warning/full versus reduced ABBA experiment, research and limitations are in
 [Admission research and measurements](admission-measurements.md). New pure tests
 cover injected pressure, swap-out and swap growth, low disk, missing sensors, counter
 resets, pending memory growth, fair resource sharing and hourly utilization.
-Process E2E covers one build at a time under warning, holds for swap growth and
-low disk, and recovery while grants remain fixed. The native parallel-action
+Process E2E covers half-size admission under CPU overload, parallel builds under
+warning, one reduced build under swap growth and critical pressure, the hold for low
+disk, and recovery while grants remain fixed. The native parallel-action
 contract uses all seven configured CPU tokens, including the uneven remainder.
 
 The admission change was validated with 67 unit tests, 29 process E2E tests,

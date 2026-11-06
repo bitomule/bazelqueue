@@ -7,21 +7,49 @@ use crate::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Pressure {
     Normal,
+    /// New builds go on at half size.
+    Overloaded,
+    /// One reduced build, and only with nothing else of ours running.
     Constrained,
     Held,
 }
 
+/// How many later jobs may start ahead of one that does not fit. Bazel gives no
+/// reliable durations to reserve its start with, so the bound is a count.
+const MAX_PASSES: u32 = 4;
+
 pub fn admission_budget(config: &Config, pressure: Pressure) -> Budget {
-    if pressure == Pressure::Constrained {
-        config.constrained_budget()
-    } else {
-        Budget {
+    match pressure {
+        Pressure::Constrained => config.constrained_budget(),
+        Pressure::Overloaded => config.overload_budget(),
+        Pressure::Normal | Pressure::Held => Budget {
             cpu: config.cpu_capacity,
             memory_mib: config.memory_capacity_mib,
             exclusive: false,
             estimate: None,
-        }
+        },
     }
+}
+
+/// What a new build may take. Under overload a start only needs the queue below half
+/// size, and then gets at least what its workers need.
+fn free_cpu(config: &Config, pressure: Pressure, active_cpu: u32) -> u32 {
+    let limit = admission_budget(config, pressure).cpu;
+    if pressure == Pressure::Overloaded && active_cpu < limit {
+        (limit - active_cpu).max(config.fast_budget().cpu)
+    } else {
+        limit.saturating_sub(active_cpu)
+    }
+}
+
+/// The order queued metered work is served in.
+fn waiting_order(jobs: &[Job]) -> Vec<usize> {
+    (0..jobs.len())
+        .filter(|index| {
+            let job = &jobs[*index];
+            job.state == "queued" && !job.cancel && job.metered()
+        })
+        .collect()
 }
 
 pub fn fit_queued(budget: &mut Budget, config: &Config, pressure: Pressure) -> bool {
@@ -30,7 +58,7 @@ pub fn fit_queued(budget: &mut Budget, config: &Config, pressure: Pressure) -> b
     }
     let before = budget.clone();
     let share = config.budget(true);
-    if pressure == Pressure::Normal {
+    if matches!(pressure, Pressure::Normal | Pressure::Overloaded) {
         if let Some(estimate) = budget.estimate {
             budget.cpu = estimate.cpu;
             budget.memory_mib = estimate.memory_mib;
@@ -128,7 +156,7 @@ pub fn allocate_queued(jobs: &mut [Job], config: &Config, capacity: &Capacity) {
         .filter(|job| job.holds_build_capacity())
         .map(|job| capacity.occupied_mib(job))
         .sum();
-    let cpu = limit.cpu.saturating_sub(active_cpu);
+    let cpu = free_cpu(config, capacity.pressure, active_cpu);
     let memory = limit
         .memory_mib
         .saturating_sub(active_memory)
@@ -163,21 +191,16 @@ pub fn allocate_queued(jobs: &mut [Job], config: &Config, capacity: &Capacity) {
         return;
     }
     let mut allocated = std::collections::BTreeSet::new();
-    let selected: Vec<_> = jobs
-        .iter()
-        .enumerate()
-        .filter(|(_, job)| {
-            job.state == "queued"
-                && !job.cancel
-                && job.metered()
-                && !job.request.budget.exclusive
+    let selected: Vec<_> = waiting_order(jobs)
+        .into_iter()
+        .filter(|index| {
+            let job = &jobs[*index];
+            !job.request.budget.exclusive
                 && job.request.command != "exec"
-        })
-        .filter(|(_, job)| {
-            lanes.contains(&job.request.lane) && allocated.insert(job.request.lane.clone())
+                && lanes.contains(&job.request.lane)
+                && allocated.insert(job.request.lane.clone())
         })
         .take(count)
-        .map(|(index, _)| index)
         .collect();
     let cpu_demands: Vec<_> = selected
         .iter()
@@ -240,9 +263,20 @@ fn fair_shares(mut total: u64, demands: &[u64]) -> Vec<u64> {
     result
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Grants {
+    pub chosen: Vec<u64>,
+    /// One entry per job that started ahead of this one.
+    pub overtaken: Vec<u64>,
+}
+
 pub fn eligible(jobs: &[Job], config: &Config, capacity: &Capacity) -> Vec<u64> {
+    grants(jobs, config, capacity).chosen
+}
+
+pub fn grants(jobs: &[Job], config: &Config, capacity: &Capacity) -> Grants {
     if capacity.drained {
-        return Vec::new();
+        return Grants::default();
     }
     let mut chosen = Vec::new();
     let mut maintained: Vec<&Request> = jobs
@@ -271,7 +305,10 @@ pub fn eligible(jobs: &[Job], config: &Config, capacity: &Capacity) -> Vec<u64> 
         }
     }
     if capacity.pressure == Pressure::Held || capacity.legacy_active {
-        return chosen;
+        return Grants {
+            chosen,
+            overtaken: Vec::new(),
+        };
     }
     let limit = admission_budget(config, capacity.pressure);
     let max_builds = if capacity.pressure == Pressure::Constrained {
@@ -290,12 +327,12 @@ pub fn eligible(jobs: &[Job], config: &Config, capacity: &Capacity) -> Vec<u64> 
         .sum::<u64>()
         .saturating_add(capacity.run_memory_mib);
     let mut fresh_memory = 0_u64;
-    // Free memory is a cautious figure: with nothing of ours running and macOS
-    // not swapping, one build may start on it, or big apps would stop the queue for good.
+    // Free memory is a cautious figure: with nothing of ours running, one build
+    // may start on it, or big apps would stop the queue for good.
     let idle = !jobs.iter().any(|job| job.holds_metered_capacity());
-    let mut waiting: Vec<_> = jobs
-        .iter()
-        .filter(|job| job.state == "queued" && !job.cancel && job.metered())
+    let mut waiting: Vec<_> = waiting_order(jobs)
+        .into_iter()
+        .map(|index| &jobs[index])
         .collect();
     let ready: Vec<_> = waiting
         .iter()
@@ -324,7 +361,13 @@ pub fn eligible(jobs: &[Job], config: &Config, capacity: &Capacity) -> Vec<u64> 
         let preparation = waiting.remove(index);
         waiting.insert(0, preparation);
     }
+    let mut skipped = Vec::new();
+    let mut overtaken = Vec::new();
+    let mut passes = MAX_PASSES;
     for job in waiting {
+        if capacity.pressure == Pressure::Constrained && !(idle && active.is_empty()) {
+            break;
+        }
         if active
             .iter()
             .any(|other| other.request.lane == job.request.lane)
@@ -338,46 +381,59 @@ pub fn eligible(jobs: &[Job], config: &Config, capacity: &Capacity) -> Vec<u64> 
             continue;
         }
         let budget = &job.request.budget;
+        // Opaque work cannot be reduced, so it simply does not start here.
         if capacity.pressure == Pressure::Constrained && budget.exclusive {
-            break;
+            continue;
         }
         let exclusive = active.iter().any(|job| job.request.budget.exclusive);
-        let (cpu_limit, memory_limit) = if budget.exclusive {
-            (config.cpu_capacity, config.memory_capacity_mib)
+        let (free, memory_limit) = if budget.exclusive {
+            (
+                config.cpu_capacity.saturating_sub(cpu),
+                config.memory_capacity_mib,
+            )
         } else {
-            (limit.cpu, limit.memory_mib)
+            (free_cpu(config, capacity.pressure, cpu), limit.memory_mib)
         };
         let slots = active
             .iter()
-            .filter(|job| {
-                capacity.pressure == Pressure::Constrained || job.request.budget.estimate.is_none()
-            })
+            .filter(|job| job.request.budget.estimate.is_none())
             .count();
         if exclusive
             || (budget.exclusive && !active.is_empty())
-            || ((budget.estimate.is_none() || capacity.pressure == Pressure::Constrained)
-                && slots >= max_builds)
-            || cpu.saturating_add(budget.cpu) > cpu_limit
+            || (budget.estimate.is_none() && slots >= max_builds)
+            || budget.cpu > free
             || memory.saturating_add(budget.memory_mib) > memory_limit
             || (fresh_memory.saturating_add(capacity.fresh_mib(job)) > capacity.new_memory_mib
                 && !(idle && active.is_empty()))
         {
-            break;
+            passes = passes.min(MAX_PASSES.saturating_sub(job.passed));
+            if passes == 0 {
+                break;
+            }
+            skipped.push(job.sequence);
+            continue;
         }
         cpu += budget.cpu;
         memory += budget.memory_mib;
         fresh_memory += capacity.fresh_mib(job);
         active.push(job);
         chosen.push(job.sequence);
+        if !skipped.is_empty() {
+            overtaken.extend_from_slice(&skipped);
+            passes -= 1;
+            if passes == 0 {
+                break;
+            }
+        }
     }
-    chosen
+    Grants { chosen, overtaken }
 }
 
 /// Queued fast-lane requests that may be checked now, ahead of the build queue.
 /// A check runs only where Bazel has built before: a first invocation in a
 /// workspace never passed one in the measured history.
 pub fn fast_lane(jobs: &[Job], config: &Config, capacity: &Capacity) -> Vec<u64> {
-    if capacity.drained || capacity.legacy_active || capacity.pressure == Pressure::Held {
+    if capacity.drained || capacity.legacy_active || capacity.pressure != Pressure::Normal {
         return Vec::new();
     }
     let memory = config.fast_budget().memory_mib;
@@ -438,10 +494,12 @@ pub fn reason<'a>(job: &Job, jobs: &[Job], capacity: &'a Capacity) -> &'a str {
         .any(|other| other.holds_capacity() && other.request.lane == job.request.lane)
     {
         "workspace is busy"
-    } else if capacity.pressure == Pressure::Constrained
-        && jobs.iter().any(|other| other.holds_build_capacity())
+    } else if matches!(
+        capacity.pressure,
+        Pressure::Constrained | Pressure::Overloaded
+    ) && jobs.iter().any(|other| other.holds_metered_capacity())
     {
-        "reduced admission: one build at a time"
+        capacity.reason.as_deref().unwrap_or("reduced admission")
     } else if capacity.fresh_mib(job) > capacity.new_memory_mib {
         "waiting for free memory"
     } else {
@@ -485,6 +543,7 @@ mod tests {
             reason: None,
             retiring_server: None,
             fast: Default::default(),
+            passed: 0,
         }
     }
     fn capacity() -> Capacity {
@@ -508,13 +567,250 @@ mod tests {
         }
     }
     #[test]
-    fn budgets_are_immutable_and_large_jobs_are_not_starved() {
-        let jobs = vec![
+    fn a_small_job_passes_a_large_one_only_a_bounded_number_of_times() {
+        let mut jobs = vec![
             job(1, "a", 4, false, "running"),
             job(2, "b", 8, false, "queued"),
             job(3, "c", 1, false, "queued"),
         ];
+        assert_eq!(
+            grants(&jobs, &config(), &capacity()),
+            Grants {
+                chosen: vec![3],
+                overtaken: vec![2],
+            }
+        );
+        jobs[1].passed = MAX_PASSES;
+        assert_eq!(grants(&jobs, &config(), &capacity()), Grants::default());
+    }
+    #[test]
+    fn one_round_cannot_spend_more_passes_than_the_job_has_left() {
+        let mut jobs = vec![
+            job(1, "a", 1, false, "running"),
+            job(2, "b", 8, false, "queued"),
+            job(3, "c", 1, false, "queued"),
+            job(4, "d", 1, false, "queued"),
+        ];
+        jobs[1].passed = MAX_PASSES - 1;
+        let mut roomy = config();
+        roomy.max_builds = 4;
+        assert_eq!(
+            grants(&jobs, &roomy, &capacity()),
+            Grants {
+                chosen: vec![3],
+                overtaken: vec![2],
+            }
+        );
+    }
+    #[test]
+    fn a_job_whose_workspace_is_busy_is_not_passed_and_stops_nobody() {
+        let mut jobs = vec![
+            job(1, "a", 1, false, "running"),
+            job(2, "a", 1, false, "queued"),
+            job(3, "b", 1, false, "queued"),
+        ];
+        jobs[1].passed = MAX_PASSES;
+        assert_eq!(
+            grants(&jobs, &config(), &capacity()),
+            Grants {
+                chosen: vec![3],
+                overtaken: Vec::new(),
+            }
+        );
+    }
+    #[test]
+    fn opaque_work_is_passed_while_builds_run_and_then_gets_the_machine() {
+        let mut opaque = job(2, "b", 8, true, "queued");
+        opaque.request.budget = config().budget(false);
+        let mut jobs = vec![
+            job(1, "a", 1, false, "running"),
+            opaque,
+            job(3, "c", 1, false, "queued"),
+        ];
+        assert_eq!(eligible(&jobs, &config(), &capacity()), vec![3]);
+        jobs[1].passed = MAX_PASSES;
         assert!(eligible(&jobs, &config(), &capacity()).is_empty());
+        jobs[0].state = "finished".into();
+        assert_eq!(eligible(&jobs, &config(), &capacity()), vec![2]);
+    }
+    fn overloaded() -> Capacity {
+        Capacity {
+            pressure: Pressure::Overloaded,
+            reason: Some("CPU overload".into()),
+            ..capacity()
+        }
+    }
+    #[test]
+    fn overload_runs_two_small_builds_or_one_large_one() {
+        let config = incident_config();
+        let mut small = vec![
+            estimated(1, "a", 2, "queued"),
+            estimated(2, "b", 2, "queued"),
+            estimated(3, "c", 2, "queued"),
+        ];
+        assert_eq!(eligible(&small, &config, &overloaded()), vec![1, 2]);
+        small[0].state = "running".into();
+        small[1].state = "running".into();
+        assert!(eligible(&small, &config, &overloaded()).is_empty());
+        assert_eq!(reason(&small[2], &small, &overloaded()), "CPU overload");
+
+        let mut large = estimated(1, "a", 6, "queued").request.budget;
+        fit_queued(&mut large, &config, Pressure::Overloaded);
+        assert_eq!(large.cpu, 3);
+        let mut jobs = vec![
+            estimated(1, "a", 3, "running"),
+            estimated(2, "b", 2, "queued"),
+        ];
+        jobs[0].request.budget = large;
+        assert!(eligible(&jobs, &config, &overloaded()).is_empty());
+    }
+    #[test]
+    fn overload_never_starts_a_build_below_what_its_workers_need() {
+        let config = incident_config();
+        let mut jobs = vec![
+            estimated(1, "a", 2, "running"),
+            estimated(2, "b", 6, "queued"),
+        ];
+        allocate_queued(&mut jobs, &config, &overloaded());
+        assert_eq!(jobs[1].request.budget.cpu, 2);
+        assert_eq!(eligible(&jobs, &config, &overloaded()), vec![2]);
+    }
+    #[test]
+    fn overload_lets_opaque_work_start_on_an_idle_queue() {
+        let mut opaque = job(1, "a", 6, true, "queued");
+        opaque.request.budget = incident_config().budget(false);
+        assert_eq!(
+            eligible(&[opaque], &incident_config(), &overloaded()),
+            vec![1]
+        );
+    }
+    #[test]
+    fn a_reservation_made_under_memory_trouble_grows_back_under_overload() {
+        let config = incident_config();
+        let mut budget = estimated(1, "a", 2, "queued").request.budget;
+        fit_queued(&mut budget, &config, Pressure::Constrained);
+        assert_eq!(budget.cpu, 1);
+        fit_queued(&mut budget, &config, Pressure::Overloaded);
+        assert_eq!(budget.cpu, 2);
+    }
+    fn incident_config() -> Config {
+        Config {
+            cpu_capacity: 6,
+            memory_capacity_mib: 8192,
+            max_builds: 1,
+            action_memory_mib: 6144,
+            worker_instances: 2,
+            ..Config::default()
+        }
+    }
+    /// Estimated CPU and tenths of a minute really run, from the jobs of 6 November 2026.
+    const INCIDENT: [(Option<u32>, u32); 23] = [
+        (Some(3), 3),
+        (None, 2),
+        (Some(2), 37),
+        (Some(6), 476),
+        (Some(3), 91),
+        (Some(6), 3),
+        (Some(3), 1),
+        (Some(6), 32),
+        (Some(3), 215),
+        (Some(2), 13),
+        (Some(2), 235),
+        (None, 1),
+        (Some(2), 10),
+        (None, 7),
+        (Some(6), 3),
+        (Some(2), 45),
+        (Some(2), 15),
+        (Some(6), 212),
+        (Some(6), 22),
+        (Some(6), 50),
+        (Some(3), 1),
+        (Some(6), 6),
+        (Some(4), 9),
+    ];
+    /// The 142 minutes job 15947 waited, one step per tenth of a minute.
+    const INCIDENT_STEPS: u32 = 1420;
+    #[test]
+    fn the_queue_of_the_6_november_incident_keeps_moving_under_cpu_overload() {
+        use crate::resources::{Monitor, Sample};
+        let config = incident_config();
+        let mut monitor = Monitor::default();
+        for at_ms in [0, 1000] {
+            monitor.update(
+                Sample {
+                    at_ms,
+                    pressure: Some(2),
+                    total_mib: 18432,
+                    available_mib: Some(7557),
+                    swap_in_bytes: Some(0),
+                    swap_out_bytes: Some(0),
+                    swap_used_mib: Some(0),
+                    disk_free_mib: Some(1 << 20),
+                    load_per_cpu: Some(5.0),
+                    ..Sample::default()
+                },
+                &config,
+            );
+        }
+        let mut jobs: Vec<_> = INCIDENT
+            .iter()
+            .enumerate()
+            .map(|(index, (cpu, _))| {
+                let lane = format!("lane-{index}");
+                let sequence = index as u64 + 1;
+                match cpu {
+                    Some(cpu) => estimated(sequence, &lane, *cpu, "queued"),
+                    None => managed(sequence, &lane),
+                }
+            })
+            .collect();
+        let mut left: Vec<_> = INCIDENT.iter().map(|(_, tenths)| *tenths).collect();
+        let mut idle_steps = 0;
+        for _ in 0..INCIDENT_STEPS {
+            let capacity = Capacity {
+                pressure: monitor.mode(),
+                new_memory_mib: monitor.headroom(&config),
+                reason: monitor.signals.reason.clone(),
+                ..capacity()
+            };
+            for job in jobs.iter_mut().filter(|job| job.state == "queued") {
+                fit_queued(&mut job.request.budget, &config, capacity.pressure);
+            }
+            allocate_queued(&mut jobs, &config, &capacity);
+            let granted = grants(&jobs, &config, &capacity);
+            for job in &mut jobs {
+                job.passed += granted
+                    .overtaken
+                    .iter()
+                    .filter(|sequence| **sequence == job.sequence)
+                    .count() as u32;
+                if granted.chosen.contains(&job.sequence) {
+                    job.state = "running".into();
+                }
+            }
+            let reserved: u32 = jobs
+                .iter()
+                .filter(|job| job.state == "running")
+                .map(|job| job.request.budget.cpu)
+                .sum();
+            assert!(reserved <= 4, "{reserved} CPU reserved under overload");
+            let waiting = jobs.iter().any(|job| job.state == "queued");
+            if reserved == 0 && waiting {
+                idle_steps += 1;
+            }
+            for (job, left) in jobs.iter_mut().zip(&mut left) {
+                if job.state == "running" {
+                    *left -= 1;
+                    if *left == 0 {
+                        job.state = "finished".into();
+                    }
+                }
+            }
+        }
+        let finished = jobs.iter().filter(|job| job.state == "finished").count();
+        assert_eq!(idle_steps, 0, "the queue sat empty with jobs waiting");
+        assert_eq!(finished, INCIDENT.len(), "10 finished in the incident");
     }
     #[test]
     fn busy_lane_does_not_block_another_workspace() {
@@ -667,26 +963,27 @@ mod tests {
         assert_eq!(jobs[0].request.budget.memory_mib, 1024);
     }
     #[test]
-    fn warning_says_when_free_memory_is_what_a_build_waits_for() {
+    fn a_build_short_of_free_memory_says_so() {
         let mut fast = job(1, "a", 1, false, "running");
         fast.fast = FastLane::Admitted;
         let jobs = vec![fast, job(2, "b", 1, false, "queued")];
-        let warning = Capacity {
+        let short = Capacity {
             new_memory_mib: 0,
-            reason: Some("memory pressure (warning)".into()),
-            ..constrained()
-        };
-        assert_eq!(reason(&jobs[1], &jobs, &warning), "waiting for free memory");
-    }
-    #[test]
-    fn warning_keeps_the_fast_lane_and_a_hold_closes_it() {
-        let jobs = vec![built(1, "w", 0), candidate(2, "w")];
-        assert_eq!(fast_lane(&jobs, &config(), &constrained()), vec![2]);
-        let held = Capacity {
-            pressure: Pressure::Held,
             ..capacity()
         };
-        assert!(fast_lane(&jobs, &config(), &held).is_empty());
+        assert_eq!(reason(&jobs[1], &jobs, &short), "waiting for free memory");
+    }
+    #[test]
+    fn only_a_machine_without_limits_opens_the_fast_lane() {
+        let jobs = vec![built(1, "w", 0), candidate(2, "w")];
+        assert_eq!(fast_lane(&jobs, &config(), &capacity()), vec![2]);
+        for pressure in [Pressure::Overloaded, Pressure::Constrained, Pressure::Held] {
+            let limited = Capacity {
+                pressure,
+                ..capacity()
+            };
+            assert!(fast_lane(&jobs, &config(), &limited).is_empty());
+        }
     }
     #[test]
     fn a_build_never_measured_still_reserves_a_server_within_its_share() {
@@ -734,12 +1031,12 @@ mod tests {
             ..capacity()
         };
         assert_eq!(eligible(&jobs, &config(), &short), vec![1]);
-        let warning = Capacity {
+        let swapping = Capacity {
             pressure: Pressure::Constrained,
             new_memory_mib: 0,
             ..capacity()
         };
-        assert_eq!(eligible(&jobs, &config(), &warning), vec![1]);
+        assert_eq!(eligible(&jobs, &config(), &swapping), vec![1]);
         let held = Capacity {
             pressure: Pressure::Held,
             new_memory_mib: 0,
@@ -751,11 +1048,13 @@ mod tests {
         assert!(eligible(&busy, &config(), &short).is_empty());
     }
     #[test]
-    fn warning_keeps_the_next_build_waiting_behind_a_running_one() {
-        let jobs = vec![
+    fn swapping_keeps_the_next_build_waiting_behind_anything_of_ours_running() {
+        let mut jobs = vec![
             job(1, "a", 1, false, "running"),
             job(2, "b", 1, false, "queued"),
         ];
+        assert!(eligible(&jobs, &config(), &constrained()).is_empty());
+        jobs[0].fast = FastLane::Admitted;
         assert!(eligible(&jobs, &config(), &constrained()).is_empty());
     }
     fn constrained() -> Capacity {
@@ -785,10 +1084,11 @@ mod tests {
         assert_eq!(eligible(&jobs, &config(), &constrained()), vec![1]);
         jobs[0].state = "running".into();
         assert!(eligible(&jobs, &config(), &constrained()).is_empty());
-        assert_eq!(
-            reason(&jobs[1], &jobs, &constrained()),
-            "reduced admission: one build at a time"
-        );
+        let swapping = Capacity {
+            reason: Some("macOS is swapping".into()),
+            ..constrained()
+        };
+        assert_eq!(reason(&jobs[1], &jobs, &swapping), "macOS is swapping");
     }
     #[test]
     fn constrained_admission_holds_opaque_work() {
@@ -799,8 +1099,20 @@ mod tests {
             &config(),
             Pressure::Constrained
         ));
-        let jobs = vec![unmanaged, managed(2, "b")];
-        assert!(eligible(&jobs, &config(), &constrained()).is_empty());
+        let mut reduced = managed(2, "b");
+        fit_queued(
+            &mut reduced.request.budget,
+            &config(),
+            Pressure::Constrained,
+        );
+        let jobs = vec![unmanaged, reduced];
+        assert_eq!(
+            grants(&jobs, &config(), &constrained()),
+            Grants {
+                chosen: vec![2],
+                overtaken: Vec::new(),
+            }
+        );
         assert_eq!(eligible(&jobs, &config(), &capacity()), vec![1]);
     }
     #[test]
@@ -929,7 +1241,7 @@ mod tests {
         );
     }
     #[test]
-    fn a_large_run_ahead_of_small_ones_is_not_overtaken() {
+    fn small_runs_go_beside_a_large_run_that_does_not_fit_yet() {
         let mut large = job(2, "b", 8, false, "queued");
         large.request.budget.memory_mib = 9216;
         let jobs = vec![
@@ -937,7 +1249,7 @@ mod tests {
             large,
             estimated(3, "c", 2, "queued"),
         ];
-        assert!(eligible(&jobs, &whole_machine(), &capacity()).is_empty());
+        assert_eq!(eligible(&jobs, &whole_machine(), &capacity()), vec![3]);
     }
     #[test]
     fn memory_pressure_still_admits_one_reduced_run_at_a_time() {

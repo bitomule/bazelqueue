@@ -156,6 +156,16 @@ impl Config {
             estimate: None,
         }
     }
+    /// CPU overload mostly comes from outside the queue, so waiting frees nothing: the
+    /// queue goes on at half size. Memory is not what is short, so it stays whole.
+    pub fn overload_budget(&self) -> Budget {
+        Budget {
+            cpu: self.cpu_capacity.div_ceil(2).max(self.fast_budget().cpu),
+            memory_mib: self.memory_capacity_mib,
+            exclusive: false,
+            estimate: None,
+        }
+    }
     /// A Bazel server analysing or running cached work. Its CPU matches the worker
     /// count of an ordinary run, so the check never restarts the persistent workers.
     pub fn fast_budget(&self) -> Budget {
