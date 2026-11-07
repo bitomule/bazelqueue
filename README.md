@@ -350,7 +350,14 @@ Many worktrees sharing one output root leave a Bazel server and a cache behind f
 `<checkout>/.bazel-output`, so deleting the worktree deletes its cache and no cleanup service is
 needed. Bazel does not expand `%workspace%` in `--output_base`, so the script writes the absolute
 path to a git-ignored `.bazelrc.local` and makes `.bazelrc` `try-import` it. It works from any
-subdirectory and is safe to run again. When `BAZEL_SHARED_CACHE_DIR` is set (to any directory, e.g. on a volume shared by all your worktrees), it also writes `--disk_cache`, `--repository_cache` and the automatic trim (`--experimental_disk_cache_gc_max_size=12G`, `--experimental_disk_cache_gc_max_age=7d`) under it, so every worktree shares one capped cache. Each output base is its own lane, and the disk free-space
+subdirectory and is safe to run again. It also adds `.bazel-output` to `.bazelignore` without
+duplicating the entry or replacing existing lines. This prevents recursive package discovery
+from following `.bazel-output/external/_main` back into the workspace; `.gitignore` alone does
+not prevent Bazel's infinite symlink expansion error. Commit `.bazelignore` with the repository's
+setup changes. When `BAZEL_SHARED_CACHE_DIR` is set (to any directory, e.g. on a volume shared
+by all your worktrees), it also writes `--disk_cache`, `--repository_cache` and the automatic trim
+(`--experimental_disk_cache_gc_max_size=12G`, `--experimental_disk_cache_gc_max_age=7d`) under it,
+so every worktree shares one capped cache. Each output base is its own lane, and the disk free-space
 check looks at the volume of each build's output base. Stop the worktree's server
 (`bazel shutdown`) before deleting it. [docs/worktree-migration.md](docs/worktree-migration.md) covers
 moving existing checkouts and removing orphaned bases without touching a live build.

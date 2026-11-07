@@ -20,6 +20,10 @@ pgrep -fl 'A-server.jar|bazel.*output_base'   # any live server?
 
 1. Run `make worktree-bazel` in the worktree when it is rebased or created. Nothing is forced:
    a worktree that never runs it keeps using the shared output root, as today.
+   Use the updated setup that adds `.bazel-output` to `.bazelignore`, preserving existing
+   entries. Rerun it in checkouts configured with an older version, too. A Git ignore does not
+   stop Bazel from following `.bazel-output/external/_main` back to the workspace during
+   recursive package discovery, which can fail with infinite symlink expansion.
 2. `bazel info output_base` must print `<worktree>/.bazel-output`, from the root and from a
    subdirectory.
 3. The old server goes idle and `startup --max_idle_secs=120` retires it by itself. At most two
@@ -27,6 +31,18 @@ pgrep -fl 'A-server.jar|bazel.*output_base'   # any live server?
 
 The main checkout keeps its base under `output_user_root`, which is today's behaviour. Run
 `make worktree-bazel` there only if you want it to follow the same rule.
+
+## Propagating the setup correction
+
+Every repository that already copied the setup script needs the corrected
+`tools/worktree-bazel-setup` and a committed `.bazelignore` containing `.bazel-output`, with
+existing entries preserved. Updating the `.bazelrc.local` import alone is insufficient.
+
+Run the corrected setup when preparing each repository's change and rerun it in existing
+worktrees. Keep generating the absolute `.bazelrc.local` separately per checkout, rather than
+committing it. Verify `bazel info output_base` and a recursive `bazel build //...` in an isolated
+checkout with a root `BUILD` or `BUILD.bazel`: the latter catches the symlink traversal that
+checking the output base alone misses. Check both an initial setup and a repeated setup.
 
 ## Orphaned bases
 

@@ -28,3 +28,13 @@ grep -qxF "$import" "$root/.bazelrc" 2>/dev/null || printf '\n%s\n' "$import" >>
 for entry in /.bazel-output/ /.bazelrc.local /.bazelrc.local.* /.bazel-output-disk.log; do
     grep -qxF "$entry" "$root/.gitignore" 2>/dev/null || printf '%s\n' "$entry" >>"$root/.gitignore"
 done
+
+# The output base contains external/_main -> workspace. Keep Bazel's recursive package
+# discovery out of it, independently of Git's ignores.
+ignore="$root/.bazelignore"
+if ! grep -qxF '.bazel-output' "$ignore" 2>/dev/null; then
+    if [ -s "$ignore" ] && [ -n "$(tail -c 1 "$ignore")" ]; then
+        printf '\n' >>"$ignore"
+    fi
+    printf '%s\n' '.bazel-output' >>"$ignore"
+fi
