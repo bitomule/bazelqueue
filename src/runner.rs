@@ -3,7 +3,9 @@ use crate::{
     bazel,
     config::{Config, Paths},
     coordinator, estimate, platform,
-    protocol::{self, Admission, Budget, Event, Message, NativeServer, Progress, Request},
+    protocol::{
+        self, Admission, Budget, Event, Message, NativeServer, Priority, Progress, Request,
+    },
     stall::{self, Stall},
     summary,
 };
@@ -28,7 +30,12 @@ use tokio::{
     time::{sleep, timeout},
 };
 
-pub async fn frontend(backend: PathBuf, args: Vec<OsString>, generic: bool) -> Result<ExitStatus> {
+pub async fn frontend(
+    backend: PathBuf,
+    args: Vec<OsString>,
+    generic: bool,
+    priority: Option<Priority>,
+) -> Result<ExitStatus> {
     let paths = Paths::discover()?;
     if std::env::var_os("BAZELQUEUE_ACTIVE").is_some() {
         bail!(
@@ -47,6 +54,9 @@ pub async fn frontend(backend: PathBuf, args: Vec<OsString>, generic: bool) -> R
         .arg("--")
         .args(args)
         .env("BAZELQUEUE_HOME", &paths.root);
+    if let Some(priority) = priority {
+        command.env("BAZELQUEUE_PRIORITY", priority.as_str());
+    }
     command
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -406,6 +416,16 @@ async fn up_to_date(
     }
 }
 
+fn requested_priority() -> Priority {
+    match std::env::var("BAZELQUEUE_PRIORITY") {
+        Ok(value) if !value.trim().is_empty() => value.parse().unwrap_or_else(|message| {
+            eprintln!("bazelqueue: BAZELQUEUE_PRIORITY ignored: {message}");
+            Priority::Normal
+        }),
+        _ => Priority::Normal,
+    }
+}
+
 pub async fn guardian(backend: PathBuf, args: Vec<OsString>, generic: bool) -> Result<ExitStatus> {
     let paths = Paths::discover()?;
     let config = Config::load(&paths)?;
@@ -431,6 +451,7 @@ pub async fn guardian(backend: PathBuf, args: Vec<OsString>, generic: bool) -> R
     let estimate_key = estimate::key(&invocation, &workspace);
     let history = estimate::lookup(&paths.root, &estimate_key);
     let mut request = Request {
+        priority: requested_priority(),
         id: id.clone(),
         owner,
         lane: workspace.to_string_lossy().into_owned(),

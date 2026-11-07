@@ -191,7 +191,7 @@ outlast it. With those limits committed, all 14 contracts passed on 8.4.2 and on
 at load 8 to 33. Thirteen hand ablations, including the limit itself, each failed
 their test and passed once restored.
 
-The final ordinary `make all` run passed 88 unit tests, 31 process E2E tests,
+The final ordinary `make all` run passed 160 unit tests, 44 process E2E tests,
 17 installation transaction tests and 3 PTY tests. The locked production release
 build and `musts validate` also passed. Two isolated ablations removed orphan
 retirement and restored receipt-before-message short-circuiting, respectively:

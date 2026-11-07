@@ -82,7 +82,8 @@ waits. In a terminal, every position change is shown as it happens.
 
 | Situation | Queue behavior |
 |---|---|
-| Several agents use different worktrees | CPU and memory reservations determine which calls fit. A call that fits may pass one that does not, at most four times; same-server calls keep FIFO order. |
+| Several agents use different worktrees | CPU and memory reservations determine which calls fit. A call that fits may pass one that does not, at most four times; same-server calls of the same priority keep FIFO order. |
+| A build is more urgent than the queue ahead of it | Give it `BAZELQUEUE_PRIORITY=high` (or `bazelqueue exec --priority high -- ...`). In the queue, higher priority goes first and arrival order breaks ties; it takes the next free slot but never cuts a running build, and low disk, swap and CPU limits apply to it like to any other call. `low` waits behind `normal` and `high`, with no aging. |
 | A build or test has nothing to rebuild | Bazel's own up-to-date check runs in a small fast-lane slot; if it passes, the call starts at once instead of waiting behind other builds. |
 | The machine runs short | High CPU load halves new work. Critical pressure or macOS writing to swap admit one smaller build, only with nothing else of the queue running. Low disk space or a sensor without data hold new builds. Running ones keep their reservation, and the next safe sample restores full admission. |
 | The caller disappears | Its owned backend is cancelled. Capacity is retained until completion or verified recovery. |
@@ -125,6 +126,11 @@ needed for an agent to read it at the moment it would start polling.
   the current workspace ends, prints the same summary and exits with its exit
   code. `bazelqueue wait ID` waits for a specific request; `--json` prints the
   summary as JSON.
+- **Unblocking something urgent?** Launch the build with
+  `BAZELQUEUE_PRIORITY=high bazel test ...`. A tool that already knows how urgent
+  its work is (a task runner, for example) only needs to map that to
+  `high`/`normal`/`low` in the environment of the build it starts; bazelqueue
+  knows nothing about the tool.
 - **Want a file?** Set `BAZELQUEUE_SUMMARY=/path/result.json` for a JSON copy of
   the summary, or read `~/.local/state/bazelqueue/runs/ID.json`.
 
@@ -162,7 +168,10 @@ bazelqueue status --json     # Inspect it from a script or agent
 | `bazelqueue resume` | Reopen admission. |
 | `bazelqueue doctor` | Check the backend, telemetry and recovery state. |
 | `bazelqueue config show` | Print the effective configuration. |
-| `bazelqueue exec -- /absolute/backend ARGS...` | Queue a backend explicitly without PATH interception. |
+| `bazelqueue exec [--priority high\|normal\|low] -- /absolute/backend ARGS...` | Queue a backend explicitly without PATH interception. |
+
+`status` marks requests that are not `normal` priority with `priority=high` or
+`priority=low`; `status --json` has it in `jobs[].request.priority`.
 
 `status` also shows the ten most recent failed requests, with their exit code
 and reason. `status --json` includes those details in the retained job records.
@@ -325,6 +334,7 @@ coordinator restarts.
 | `BAZELQUEUE_PROGRESS=quiet` | Suppress queue notices (the end-of-run summary stays). |
 | `BAZELQUEUE_PROGRESS=verbose` | Print every position change even when stderr is not a terminal. |
 | `BAZELQUEUE_SUMMARY` | Also write the end-of-run summary JSON to this path. |
+| `BAZELQUEUE_PRIORITY` | `high`, `normal` (default) or `low`: where this call waits in the queue. An unknown value is reported and treated as `normal`. `exec --priority` wins over it. |
 
 ## One output base per worktree
 
@@ -359,8 +369,8 @@ and any limitations are recorded in the validation evidence below.
 
 | Layer | Checks | Evidence covered |
 |---|---:|---|
-| Unit | 88 | Scheduling, injected recovery/liveness, resource samples, utilization, framing, configuration and persistent drain state. |
-| Process E2E | 31 | FIFO/rank, warning parallelism, pressure/swap recovery, cancellation, restart, raw argument bytes, retained executables and failure diagnostics. |
+| Unit | 160 | Scheduling, injected recovery/liveness, resource samples, utilization, framing, configuration and persistent drain state. |
+| Process E2E | 44 | FIFO/rank, priority overtaking, warning parallelism, pressure/swap recovery, cancellation, restart, raw argument bytes, retained executables and failure diagnostics. |
 | Installation | 17 | Interrupted setup, rollback, upgrades, original backups and shell activation. |
 | Interactive PTY | 3 | Terminal input, Ctrl-C and Ctrl-Z/fg in a real shell. |
 | Native Bazel | 12 per version | Parallel held actions under warning, paused guardians, interrupted retirement, orphan recovery and run handoff; matrix: 8.4.2 and 9.2.0. |

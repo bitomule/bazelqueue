@@ -3,7 +3,7 @@ use bazelqueue::{
     config::{Config, Paths},
     coordinator,
     platform::{self, Identity},
-    protocol::{Event, Snapshot},
+    protocol::{Event, Priority, Snapshot},
     resources::Limit,
     stall::{Fingerprint, Reading},
 };
@@ -167,6 +167,15 @@ impl Harness {
         self.spawn_hold_as(label, None)
     }
     fn spawn_hold_as(&mut self, label: &str, release: Option<&str>) -> UnixListener {
+        self.spawn_hold_with(label, release, &[], &[])
+    }
+    fn spawn_hold_with(
+        &mut self,
+        label: &str,
+        release: Option<&str>,
+        flags: &[&str],
+        environment: &[(&str, &str)],
+    ) -> UnixListener {
         let lane = self.root.path().join(label);
         fs::create_dir_all(&lane).unwrap();
         let listener = UnixListener::bind(self.root.path().join(format!("{label}.sock"))).unwrap();
@@ -176,7 +185,10 @@ impl Harness {
             command.env("BAZELQUEUE_FIXTURE_COORDINATOR", release);
         }
         let child = command
-            .args(["exec", "--", env!("CARGO_BIN_EXE_fixture-backend"), "hold"])
+            .envs(environment.iter().copied())
+            .arg("exec")
+            .args(flags)
+            .args(["--", env!("CARGO_BIN_EXE_fixture-backend"), "hold"])
             .arg(listener.local_addr().unwrap().as_pathname().unwrap())
             .current_dir(lane)
             .stdout(Stdio::null())
@@ -301,6 +313,63 @@ fn queue_positions_and_fifo_follow_actual_backend_completion() {
             .read_to_string(&mut error)
             .unwrap();
         assert!(error.contains("bazelqueue:"));
+    }
+}
+
+#[test]
+fn high_priority_builds_overtake_queued_normal_ones_and_status_shows_it() {
+    let mut harness = Harness::new(1);
+    let first = harness.spawn_hold("first");
+    let mut running = Harness::accepted(&first);
+    let second = harness.spawn_hold("second");
+    harness.wait(|s| s.jobs.iter().filter(|job| job.state == "queued").count() == 1);
+    let low = harness.spawn_hold_with("low", None, &[], &[("BAZELQUEUE_PRIORITY", "low")]);
+    harness.wait(|s| s.jobs.iter().filter(|job| job.state == "queued").count() == 2);
+    let third = harness.spawn_hold("third");
+    harness.wait(|s| s.jobs.iter().filter(|job| job.state == "queued").count() == 3);
+    let high = harness.spawn_hold_with(
+        "high",
+        None,
+        &["--priority", "high"],
+        &[("BAZELQUEUE_PRIORITY", "low")],
+    );
+    let snapshot = harness.wait(|s| s.jobs.iter().filter(|job| job.state == "queued").count() == 4);
+    let priorities: Vec<_> = snapshot
+        .jobs
+        .iter()
+        .filter(|job| job.state == "queued")
+        .map(|job| job.request.priority)
+        .collect();
+    assert_eq!(
+        priorities,
+        vec![
+            Priority::Normal,
+            Priority::Low,
+            Priority::Normal,
+            Priority::High
+        ]
+    );
+    let status = harness.command().arg("status").output().unwrap();
+    let status = String::from_utf8(status.stdout).unwrap();
+    assert!(status.contains("priority=high"), "{status}");
+    assert!(status.contains("priority=low"), "{status}");
+    let json = harness
+        .command()
+        .args(["status", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8(json.stdout)
+            .unwrap()
+            .contains(r#""priority":"high""#)
+    );
+    running.write_all(b"F").unwrap();
+    for listener in [&high, &second, &third, &low] {
+        let mut next = Harness::accepted(listener);
+        next.write_all(b"F").unwrap();
+    }
+    for child in &mut harness.children {
+        assert!(child.wait().unwrap().success());
     }
 }
 

@@ -20,6 +20,9 @@ struct Cli {
 #[derive(Subcommand)]
 enum Control {
     Exec {
+        /// Queue priority for this build: high, normal or low. Overrides BAZELQUEUE_PRIORITY.
+        #[arg(long)]
+        priority: Option<bazelqueue::protocol::Priority>,
         #[arg(last = true, required = true)]
         arguments: Vec<OsString>,
     },
@@ -128,7 +131,7 @@ async fn entry() -> Result<()> {
         } else {
             config.backend
         };
-        exit(runner::frontend(backend, rest, false).await?);
+        exit(runner::frontend(backend, rest, false, None).await?);
     }
     if rest.first().is_some_and(|arg| arg == "_guardian") {
         let backend = PathBuf::from(rest.get(1).context("guardian backend is missing")?);
@@ -147,13 +150,16 @@ async fn entry() -> Result<()> {
     let cli = Cli::parse();
     let paths = Paths::discover()?;
     match cli.command {
-        Control::Exec { arguments } => {
+        Control::Exec {
+            priority,
+            arguments,
+        } => {
             let mut args = arguments.into_iter();
             let backend = PathBuf::from(args.next().context("backend is required")?);
             let generic = !backend
                 .file_name()
                 .is_some_and(|name| name == "bazel" || name == "bazelisk");
-            exit(runner::frontend(backend, args.collect(), generic).await?);
+            exit(runner::frontend(backend, args.collect(), generic, priority).await?);
         }
         Control::Daemon {
             command: DaemonCommand::Run,
@@ -329,12 +335,13 @@ fn show(event: Event, json: bool) -> Result<()> {
                 "unmetered".to_owned()
             };
             println!(
-                "{} {} {} {} {}{}",
+                "{} {} {} {} {}{}{}",
                 job.request.id,
                 job.state,
                 job.request.command,
                 reservation,
                 job.request.lane,
+                job.request.priority.as_suffix(),
                 job.reason
                     .as_ref()
                     .map(|reason| format!(" | {reason}"))
