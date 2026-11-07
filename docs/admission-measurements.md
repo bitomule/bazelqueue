@@ -73,7 +73,26 @@ Swap got the same treatment. Alondra logged 120 swap-out readings between 19:00 
 22:00, all above the 64 MiB/min threshold (lowest 72, hourly medians 238-308). It logs
 them only while it holds nodes, so the sample is biased, but a full hold would have
 stopped the queue at each of them. One reduced build with nothing else of ours running
-keeps it moving; low disk still stops it, because that one a build can make worse.
+keeps it moving; an almost full disk still stops it, because that one a build can make
+worse ([7 November](#queue-stopped-by-low-disk-7-november-2026)).
+
+## Queue stopped by low disk, 7 November 2026
+
+Same host, v0.1.12, 10240 MiB of `disk_safety_mib`. Reported as a queue stuck under
+warning pressure for hours. From the notices agents received, run summaries and
+`queue.sqlite3`:
+
+| Finding | Evidence |
+|---|---|
+| The hold was disk, not warning | Every notice in the two stopped windows (06:00-07:40, 08:30-10:30) read "low disk space"; `status` showed "pressure warning" because that field is macOS's level |
+| Swap kept the disk under the margin | At 05:19: warning, swap 10210 MiB, 9060 MiB free; at 13:03: swap 7693 MiB, 10356 MiB free |
+| Nothing started for two hours twice | No run started between 08:25 and 10:30; two jobs waited 1h56m and 2h18m, dozens ended waiting with 143 |
+
+The queue did not fill that disk and waiting did not empty it. Low disk now admits one
+reduced build with nothing else of ours running, as swapping does, which bounds what
+the queue itself can write (2.2-4.2 GB per output base measured); below half the margin
+it still holds. Replaying 23 jobs at 9060 MiB free, the queue is never empty while jobs
+wait and every job finishes; before the change it held for the whole replay.
 
 ## Before-change ABBA measurement, 30 October 2026
 

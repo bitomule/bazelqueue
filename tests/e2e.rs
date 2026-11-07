@@ -714,13 +714,35 @@ fn low_disk_holds_a_build_until_space_returns() {
     let sensor = harness.paths.root.join("resources.json");
     let sample = |free: u64| serde_json::json!({"pressure":1,"total_mib":18432,"available_mib":12000,"swap_in_bytes":0,"swap_out_bytes":0,"swap_used_mib":0,"disk_free_mib":free});
     platform::atomic_write(&sensor, &serde_json::to_vec(&sample(1024)).unwrap()).unwrap();
-    harness.wait(|s| s.resources.as_ref().and_then(|r| r.limit) == Some(Limit::DiskLow));
+    harness.wait(|s| s.resources.as_ref().and_then(|r| r.limit) == Some(Limit::DiskCritical));
     let listener = harness.spawn_hold("waits");
     harness.wait(|s| s.jobs.iter().any(|job| job.state == "queued"));
     assert!(listener.accept().is_err());
     platform::atomic_write(&sensor, &serde_json::to_vec(&sample(1_048_576)).unwrap()).unwrap();
     let mut running = Harness::accepted(&listener);
     running.write_all(b"F").unwrap();
+}
+
+#[test]
+fn low_disk_lets_one_build_start_and_keeps_the_next_waiting() {
+    let mut harness = Harness::new(2);
+    let sensor = harness.paths.root.join("resources.json");
+    let sample = |free: u64| serde_json::json!({"pressure":2,"total_mib":18432,"available_mib":12000,"swap_in_bytes":0,"swap_out_bytes":0,"swap_used_mib":10210,"disk_free_mib":free});
+    platform::atomic_write(&sensor, &serde_json::to_vec(&sample(9060)).unwrap()).unwrap();
+    harness.wait(|s| {
+        s.resources.as_ref().and_then(|r| r.limit) == Some(Limit::DiskLow)
+            && !s.held
+            && s.constrained.is_some()
+    });
+    let first = harness.spawn_hold("first");
+    let mut running = Harness::accepted(&first);
+    let waits = harness.spawn_hold("waits");
+    harness.wait(|s| s.jobs.iter().any(|job| job.state == "queued"));
+    assert!(waits.accept().is_err());
+    platform::atomic_write(&sensor, &serde_json::to_vec(&sample(1_048_576)).unwrap()).unwrap();
+    let mut parallel = Harness::accepted(&waits);
+    running.write_all(b"F").unwrap();
+    parallel.write_all(b"F").unwrap();
 }
 
 #[test]
@@ -1285,7 +1307,7 @@ fn each_worktree_output_base_is_its_own_lane() {
         )
     };
     fs::write(&sensor, sample(1024)).unwrap();
-    harness.wait(|s| s.resources.as_ref().and_then(|r| r.limit) == Some(Limit::DiskLow));
+    harness.wait(|s| s.resources.as_ref().and_then(|r| r.limit) == Some(Limit::DiskCritical));
     let mut holders = Vec::new();
     for name in ["one", "two"] {
         let state = emulated_workspace(&harness, name);

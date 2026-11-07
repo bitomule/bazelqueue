@@ -914,6 +914,88 @@ mod tests {
         assert_eq!(idle_steps, 0, "the queue sat empty with jobs waiting");
         assert_eq!(finished, INCIDENT.len(), "10 finished in the incident");
     }
+    /// Swap held the disk just under the safety margin for hours on 7 November 2026,
+    /// with warning pressure and no build of ours running.
+    #[test]
+    fn the_queue_of_the_7_november_incident_keeps_moving_on_low_disk() {
+        use crate::resources::{Monitor, Sample};
+        let config = incident_config();
+        let mut monitor = Monitor::default();
+        for at_ms in [0, 1000] {
+            monitor.update(
+                Sample {
+                    at_ms,
+                    pressure: Some(2),
+                    total_mib: 18432,
+                    available_mib: Some(2035),
+                    swap_in_bytes: Some(0),
+                    swap_out_bytes: Some(0),
+                    swap_used_mib: Some(10210),
+                    disk_free_mib: Some(9060),
+                    load_per_cpu: Some(1.0),
+                    ..Sample::default()
+                },
+                &config,
+            );
+        }
+        let mut jobs: Vec<_> = INCIDENT
+            .iter()
+            .enumerate()
+            .map(|(index, (cpu, _))| {
+                let lane = format!("lane-{index}");
+                let sequence = index as u64 + 1;
+                match cpu {
+                    Some(cpu) => estimated(sequence, &lane, *cpu, "queued"),
+                    None => managed(sequence, &lane),
+                }
+            })
+            .collect();
+        let mut left: Vec<_> = INCIDENT.iter().map(|(_, tenths)| *tenths).collect();
+        let serial_steps: u32 = left.iter().sum::<u32>() + INCIDENT.len() as u32;
+        let mut idle_steps = 0;
+        for _ in 0..serial_steps {
+            let capacity = Capacity {
+                pressure: monitor.mode(),
+                new_memory_mib: monitor.headroom(&config),
+                reason: monitor.signals.reason.clone(),
+                ..capacity()
+            };
+            for job in jobs.iter_mut().filter(|job| job.state == "queued") {
+                fit_queued(&mut job.request.budget, &config, capacity.pressure);
+            }
+            allocate_queued(&mut jobs, &config, &capacity);
+            let granted = grants(&jobs, &config, &capacity);
+            for job in &mut jobs {
+                if granted.chosen.contains(&job.sequence) {
+                    job.state = "running".into();
+                }
+            }
+            let running = jobs.iter().filter(|job| job.state == "running").count();
+            assert!(running <= 1, "{running} builds started on low disk");
+            if let Some(queued) = jobs.iter().find(|job| job.state == "queued")
+                && running == 1
+            {
+                assert_eq!(
+                    waiting(queued, &jobs, &capacity),
+                    (WaitKind::ReducedAdmission, "low disk space")
+                );
+            }
+            if running == 0 && jobs.iter().any(|job| job.state == "queued") {
+                idle_steps += 1;
+            }
+            for (job, left) in jobs.iter_mut().zip(&mut left) {
+                if job.state == "running" {
+                    *left -= 1;
+                    if *left == 0 {
+                        job.state = "finished".into();
+                    }
+                }
+            }
+        }
+        let finished = jobs.iter().filter(|job| job.state == "finished").count();
+        assert_eq!(idle_steps, 0, "the queue sat empty with jobs waiting");
+        assert_eq!(finished, INCIDENT.len());
+    }
     #[test]
     fn busy_lane_does_not_block_another_workspace() {
         let jobs = vec![

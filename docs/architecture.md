@@ -144,8 +144,10 @@ that waiting cannot clear must not stop the queue. CPU overload admits new work
 while the reservations stay below half the capacity, each with at least
 `worker_instances` CPUs. Swapping and critical pressure admit one managed build
 with the reduced budget, only with no metered job holding capacity, and opaque work
-waits. Low disk and any memory, swap or disk sensor without data hold new metered
-admission, and rank above the others. Warning alone is no limit. The next safe
+waits. Free disk below `disk_safety_mib` does the same, because swap that macOS keeps
+for hours can hold it there. Free disk below half of it and any memory, swap or disk
+sensor without data hold new metered admission, and rank above the others;
+`resources::disk_limit` is the one place that turns free disk into a limit. Warning alone is no limit. The next safe
 sample restores normal admission.
 
 Native samples arrive each second: macOS pressure from sysctl, memory and swap
