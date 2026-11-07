@@ -8,6 +8,7 @@ use tempfile::TempDir;
 struct Checkout {
     dir: TempDir,
     root: PathBuf,
+    shared: Option<PathBuf>,
 }
 
 impl Checkout {
@@ -21,13 +22,21 @@ impl Checkout {
             .output()
             .unwrap();
         assert!(init.status.success());
-        Self { dir, root }
+        Self {
+            dir,
+            root,
+            shared: None,
+        }
     }
 
     fn setup_from(&self, cwd: &Path) -> Output {
         let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/worktree-bazel-setup");
         let mut command = Command::new(script);
         command.current_dir(cwd);
+        command.env_remove("BAZEL_SHARED_CACHE_DIR");
+        if let Some(shared) = &self.shared {
+            command.env("BAZEL_SHARED_CACHE_DIR", shared);
+        }
         command.output().unwrap()
     }
 
@@ -107,4 +116,31 @@ fn running_it_twice_changes_nothing_and_keeps_existing_settings() {
     assert!(first.0.starts_with("build -c opt\n"));
     assert!(first.1.starts_with("/target/\n"));
     assert_eq!(first.0.matches("try-import").count(), 1);
+}
+
+#[test]
+fn a_shared_cache_dir_adds_the_cache_and_trim_flags() {
+    let mut checkout = Checkout::new();
+    let shared = checkout.root.join("volume");
+    checkout.shared = Some(shared.clone());
+    assert!(checkout.setup().status.success());
+    let shared = shared.display();
+    assert_eq!(
+        checkout.read(".bazelrc.local"),
+        format!(
+            "startup --output_base={root}/.bazel-output\n\
+             common --disk_cache={shared}/disk-cache\n\
+             common --repository_cache={shared}/repo-cache\n\
+             common --experimental_disk_cache_gc_max_size=12G\n\
+             common --experimental_disk_cache_gc_max_age=7d\n",
+            root = checkout.root.display()
+        )
+    );
+}
+
+#[test]
+fn without_a_shared_cache_dir_only_the_output_base_is_set() {
+    let checkout = Checkout::new();
+    assert!(checkout.setup().status.success());
+    assert!(!checkout.read(".bazelrc.local").contains("disk_cache"));
 }

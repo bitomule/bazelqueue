@@ -348,9 +348,17 @@ Many worktrees sharing one output root leave a Bazel server and a cache behind f
 `<checkout>/.bazel-output`, so deleting the worktree deletes its cache and no cleanup service is
 needed. Bazel does not expand `%workspace%` in `--output_base`, so the script writes the absolute
 path to a git-ignored `.bazelrc.local` and makes `.bazelrc` `try-import` it. It works from any
-subdirectory and is safe to run again. Each output base is its own lane, and the disk free-space
+subdirectory and is safe to run again. When `BAZEL_SHARED_CACHE_DIR` is set (to any directory, e.g. on a volume shared by all your worktrees), it also writes `--disk_cache`, `--repository_cache` and the automatic trim (`--experimental_disk_cache_gc_max_size=12G`, `--experimental_disk_cache_gc_max_age=7d`) under it, so every worktree shares one capped cache. Each output base is its own lane, and the disk free-space
 check looks at the worktree's own volume. Stop the worktree's server (`bazel shutdown`) before
 deleting it.
+
+The cost is one Bazel server per worktree that builds: measured servers hold 1.1-1.7 GB of memory
+each, so ten active worktrees can hold more than ten gigabytes. The queue already bounds this:
+a build is admitted only with the memory its output base peaked at last time (`LaneMemory`), and
+`startup --max_idle_secs=120` retires the idle servers. Disk is the other half: each worktree's
+cache (measured 2.2-4.2 GB per output base) now lives wherever the worktree lives, so only the
+shared disk and repository caches stay on a shared volume. Two worktrees run side by side;
+two builds in the same worktree still wait for each other.
 
 ## Compatibility
 

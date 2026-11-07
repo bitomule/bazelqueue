@@ -1276,6 +1276,57 @@ fn a_server_slower_than_15_seconds_to_answer_keeps_its_job_managed() {
 }
 
 #[test]
+fn each_worktree_output_base_is_its_own_lane() {
+    let mut harness = Harness::new(3);
+    let sensor = harness.paths.root.join("resources.json");
+    let sample = |free: u64| {
+        format!(
+            r#"{{"pressure":1,"total_mib":65536,"available_mib":32768,"swap_in_bytes":0,"swap_out_bytes":0,"swap_used_mib":0,"disk_free_mib":{free}}}"#
+        )
+    };
+    fs::write(&sensor, sample(1024)).unwrap();
+    harness.wait(|s| s.resources.as_ref().and_then(|r| r.limit) == Some(Limit::DiskLow));
+    let mut holders = Vec::new();
+    for name in ["one", "two"] {
+        let state = emulated_workspace(&harness, name);
+        let holder = UnixListener::bind(harness.root.path().join(format!("{name}.sock"))).unwrap();
+        holder.set_nonblocking(true).unwrap();
+        fs::write(
+            state.join("hold"),
+            holder
+                .local_addr()
+                .unwrap()
+                .as_pathname()
+                .unwrap()
+                .as_os_str()
+                .as_encoded_bytes(),
+        )
+        .unwrap();
+        let child = emulated_bazel(&harness, name, &["build", "//:x"])
+            .spawn()
+            .unwrap();
+        harness.children.push(child);
+        holders.push(holder);
+    }
+    harness.wait(|s| s.jobs.iter().filter(|job| job.state == "queued").count() == 2);
+    fs::write(&sensor, sample(1_048_576)).unwrap();
+    let mut running: Vec<_> = holders.iter().map(Harness::accepted).collect();
+    let snapshot = harness.snapshot().unwrap();
+    let mut lanes: Vec<_> = snapshot
+        .jobs
+        .iter()
+        .filter(|job| job.state == "running")
+        .filter_map(|job| job.server.as_ref().map(|server| server.output_base.clone()))
+        .collect();
+    lanes.sort();
+    lanes.dedup();
+    assert_eq!(lanes.len(), 2, "two worktrees, two lanes, both running");
+    for stream in &mut running {
+        stream.write_all(b"F").unwrap();
+    }
+}
+
+#[test]
 fn an_up_to_date_build_starts_at_once_while_the_queue_is_full() {
     let mut harness = Harness::new(1);
     fs::write(
