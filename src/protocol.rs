@@ -60,6 +60,53 @@ pub struct Estimate {
     pub memory_mib: u64,
 }
 
+/// Who goes first when the queue has a free slot. Declaration order is queue order.
+#[derive(
+    Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum Priority {
+    High,
+    #[default]
+    Normal,
+    Low,
+}
+
+impl Priority {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::High => "high",
+            Self::Normal => "normal",
+            Self::Low => "low",
+        }
+    }
+}
+
+impl Priority {
+    /// Shown in `status` only when it differs from the default.
+    pub fn as_suffix(self) -> String {
+        match self {
+            Self::Normal => String::new(),
+            other => format!(" priority={}", other.as_str()),
+        }
+    }
+}
+
+impl std::str::FromStr for Priority {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "high" => Ok(Self::High),
+            "normal" => Ok(Self::Normal),
+            "low" => Ok(Self::Low),
+            other => Err(format!(
+                "unknown priority `{other}`; expected high, normal or low"
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Request {
     pub id: String,
@@ -72,6 +119,8 @@ pub struct Request {
     /// The guardian can ask Bazel whether this build or test is already up to date.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub fast_lane: bool,
+    #[serde(default)]
+    pub priority: Priority,
 }
 
 /// How a request is admitted. Only metered requests consume build capacity; the
@@ -378,6 +427,24 @@ pub async fn receive<R: AsyncRead + Unpin, T: DeserializeOwned>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn requests_without_a_priority_are_normal_and_priorities_round_trip() {
+        let request = serde_json::json!({
+            "id":"1","owner":{"pid":1,"birth":"b"},"lane":"l","workspace":"w",
+            "command":"test","prepared":true,"budget":{"cpu":1,"memory_mib":256,"exclusive":false}
+        });
+        let older: Request = serde_json::from_value(request.clone()).unwrap();
+        assert_eq!(older.priority, Priority::Normal);
+        let mut newer = older;
+        newer.priority = Priority::High;
+        let decoded: Request =
+            serde_json::from_str(&serde_json::to_string(&newer).unwrap()).unwrap();
+        assert_eq!(decoded.priority, Priority::High);
+        assert_eq!(serde_json::to_value(&newer).unwrap()["priority"], "high");
+        assert_eq!("LOW".parse::<Priority>(), Ok(Priority::Low));
+        assert!("urgent".parse::<Priority>().is_err());
+    }
+
     #[test]
     fn snapshots_from_coordinators_without_a_version_still_decode() {
         let snapshot: Snapshot = serde_json::from_str(

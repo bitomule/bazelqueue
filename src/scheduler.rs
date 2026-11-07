@@ -42,14 +42,24 @@ fn free_cpu(config: &Config, pressure: Pressure, active_cpu: u32) -> u32 {
     }
 }
 
-/// The order queued metered work is served in.
+/// The order queued metered work is served in: priority first, then arrival.
 fn waiting_order(jobs: &[Job]) -> Vec<usize> {
-    (0..jobs.len())
+    let mut order: Vec<usize> = (0..jobs.len())
         .filter(|index| {
             let job = &jobs[*index];
             job.state == "queued" && !job.cancel && job.metered()
         })
-        .collect()
+        .collect();
+    order.sort_by_key(|index| (jobs[*index].request.priority, jobs[*index].sequence));
+    order
+}
+
+/// Where a queued job stands among the queued jobs, counting from 1.
+pub fn queue_position(jobs: &[Job], job: &Job) -> usize {
+    let key = (job.request.priority, job.sequence);
+    jobs.iter()
+        .filter(|other| other.state == "queued" && (other.request.priority, other.sequence) <= key)
+        .count()
 }
 
 pub fn fit_queued(budget: &mut Budget, config: &Config, pressure: Pressure) -> bool {
@@ -528,12 +538,17 @@ mod tests {
     use super::*;
     use crate::{
         platform::Identity,
-        protocol::{Budget, Request},
+        protocol::{Budget, Priority, Request},
     };
+    fn with_priority(mut job: Job, priority: Priority) -> Job {
+        job.request.priority = priority;
+        job
+    }
     fn job(sequence: u64, lane: &str, cpu: u32, exclusive: bool, state: &str) -> Job {
         Job {
             sequence,
             request: Request {
+                priority: Priority::Normal,
                 id: sequence.to_string(),
                 owner: Identity {
                     pid: 1,
@@ -585,6 +600,73 @@ mod tests {
             action_memory_mib: 1024,
             ..Config::default()
         }
+    }
+    #[test]
+    fn a_high_priority_job_starts_before_older_normal_and_low_jobs() {
+        let jobs = vec![
+            job(1, "a", 1, false, "running"),
+            with_priority(job(2, "b", 4, false, "queued"), Priority::Low),
+            job(3, "c", 4, false, "queued"),
+            with_priority(job(4, "d", 4, false, "queued"), Priority::High),
+        ];
+        assert_eq!(
+            grants(&jobs, &config(), &capacity()),
+            Grants {
+                chosen: vec![4],
+                overtaken: vec![],
+            }
+        );
+    }
+    #[test]
+    fn equal_priorities_keep_arrival_order() {
+        let jobs = vec![
+            with_priority(job(1, "a", 1, false, "queued"), Priority::High),
+            job(2, "b", 1, false, "queued"),
+            with_priority(job(3, "c", 1, false, "queued"), Priority::High),
+            job(4, "d", 1, false, "queued"),
+        ];
+        let order: Vec<_> = waiting_order(&jobs)
+            .into_iter()
+            .map(|index| jobs[index].sequence)
+            .collect();
+        assert_eq!(order, vec![1, 3, 2, 4]);
+        assert_eq!(queue_position(&jobs, &jobs[2]), 2);
+        assert_eq!(queue_position(&jobs, &jobs[1]), 3);
+    }
+    #[test]
+    fn a_high_priority_job_that_does_not_fit_is_still_passed_only_a_bounded_number_of_times() {
+        let mut jobs = vec![
+            job(1, "a", 4, false, "running"),
+            with_priority(job(2, "b", 8, false, "queued"), Priority::High),
+            job(3, "c", 1, false, "queued"),
+        ];
+        assert_eq!(
+            grants(&jobs, &config(), &capacity()),
+            Grants {
+                chosen: vec![3],
+                overtaken: vec![2],
+            }
+        );
+        jobs[1].passed = MAX_PASSES;
+        assert_eq!(grants(&jobs, &config(), &capacity()), Grants::default());
+    }
+    #[test]
+    fn priority_does_not_lift_a_pressure_limit() {
+        let mut busy = capacity();
+        busy.pressure = Pressure::Constrained;
+        let jobs = vec![
+            job(1, "a", 1, false, "running"),
+            with_priority(job(2, "b", 1, false, "queued"), Priority::High),
+        ];
+        assert_eq!(grants(&jobs, &config(), &busy), Grants::default());
+    }
+    #[test]
+    fn a_high_priority_job_goes_before_an_older_normal_one_of_the_same_workspace() {
+        let jobs = vec![
+            job(1, "a", 1, false, "queued"),
+            with_priority(job(2, "a", 1, false, "queued"), Priority::High),
+        ];
+        assert_eq!(grants(&jobs, &config(), &capacity()).chosen, vec![2]);
     }
     #[test]
     fn a_small_job_passes_a_large_one_only_a_bounded_number_of_times() {

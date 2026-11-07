@@ -127,12 +127,16 @@ a run without its own history takes the median of its repository and command. Es
 bounded by summed CPU and memory rather than `max_builds`. Large estimates share
 the remaining machine with other waiting lanes; a lone invocation can use the
 wide profile. CPU division assigns the remainder rather than losing a core.
-Admission goes first come first served among available lanes, and a job that does
+Admission goes by priority (`Request::priority`: high, normal, low) and then first
+come first served among available lanes, and a job that does
 not fit does not stop the ones behind it: those that fit start, and `Job::passed`
 counts them. After four passes nothing starts ahead of that job until it does, so
 large and opaque work cannot starve. Durations are too unreliable to reserve its
 start as EASY backfilling does, so the bound is a count. A job whose workspace is
-busy neither blocks nor counts. `waiting_order` is the one place that orders the queue.
+busy neither blocks nor counts. `waiting_order` is the one place that orders the queue. Priority only reorders it:
+it never raises a pressure limit, cuts a running job or changes a reservation, and
+there is no aging, so `low` can wait while higher work keeps arriving. Old guardians
+and stored jobs have no priority and read as `normal`.
 Reservations stay immutable while executing. Profiles can broaden only before
 execution; lowering settings drains active work. Monitor reports one typed
 `Limit`; the display reason derives from it and no decision reads text. A limit
