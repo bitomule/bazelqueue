@@ -81,6 +81,7 @@ pub enum Limit {
     MemoryUnavailable,
     SwapUnavailable,
     DiskUnavailable,
+    DiskCritical,
     DiskLow,
     Swapping,
     PressureCritical,
@@ -93,6 +94,7 @@ impl Limit {
             Self::MemoryUnavailable => "memory sample unavailable",
             Self::SwapUnavailable => "swap sample unavailable",
             Self::DiskUnavailable => "disk sample unavailable",
+            Self::DiskCritical => "disk almost full",
             Self::DiskLow => "low disk space",
             Self::Swapping => "macOS is swapping",
             Self::PressureCritical => "memory pressure (critical)",
@@ -103,9 +105,20 @@ impl Limit {
     pub fn mode(self) -> Pressure {
         match self {
             Self::CpuOverload => Pressure::Overloaded,
-            Self::Swapping | Self::PressureCritical => Pressure::Constrained,
+            Self::DiskLow | Self::Swapping | Self::PressureCritical => Pressure::Constrained,
             _ => Pressure::Held,
         }
+    }
+}
+
+/// Swap that macOS keeps for hours can hold the disk under the margin, so low disk only
+/// serialises the queue; it stops below half the margin, where one build could fill it.
+pub fn disk_limit(free_mib: Option<u64>, config: &Config) -> Option<Limit> {
+    match free_mib {
+        None => Some(Limit::DiskUnavailable),
+        Some(free) if free < config.disk_safety_mib / 2 => Some(Limit::DiskCritical),
+        Some(free) if free < config.disk_safety_mib => Some(Limit::DiskLow),
+        Some(_) => None,
     }
 }
 
@@ -221,13 +234,8 @@ impl Monitor {
             Some(Limit::MemoryUnavailable)
         } else if !swap_known {
             Some(Limit::SwapUnavailable)
-        } else if sample.disk_free_mib.is_none() {
-            Some(Limit::DiskUnavailable)
-        } else if sample
-            .disk_free_mib
-            .is_some_and(|free| free < config.disk_safety_mib)
-        {
-            Some(Limit::DiskLow)
+        } else if let Some(limit) = disk_limit(sample.disk_free_mib, config) {
+            Some(limit)
         } else if self.swapping {
             Some(Limit::Swapping)
         } else if sample.memory_pressure() == Some(MemoryPressure::Critical) {
@@ -487,18 +495,18 @@ mod tests {
         assert_eq!(monitor.mode(), Pressure::Held);
     }
     #[test]
-    fn low_disk_stops_the_queue_even_while_macos_swaps() {
+    fn an_almost_full_disk_stops_the_queue_even_while_macos_swaps() {
         let config = Config::default();
         let mut monitor = settled(&config, 1);
         let mut next = sample(2000, 1, 0);
         next.swap_out_bytes = Some(200 * 1_048_576);
-        next.disk_free_mib = Some(config.disk_safety_mib - 1);
+        next.disk_free_mib = Some(config.disk_safety_mib / 2 - 1);
         monitor.update(next, &config);
-        assert_eq!(monitor.signals.limit, Some(Limit::DiskLow));
+        assert_eq!(monitor.signals.limit, Some(Limit::DiskCritical));
         assert_eq!(monitor.mode(), Pressure::Held);
     }
     #[test]
-    fn low_or_unknown_disk_holds_admission() {
+    fn low_disk_reduces_an_almost_full_or_unknown_one_holds() {
         let config = Config::default();
         let mut monitor = settled(&config, 1);
         let disk = |at_ms, free| Sample {
@@ -507,6 +515,11 @@ mod tests {
         };
         monitor.update(disk(2000, Some(config.disk_safety_mib - 1)), &config);
         assert_eq!(monitor.signals.limit, Some(Limit::DiskLow));
+        assert_eq!(monitor.mode(), Pressure::Constrained);
+        monitor.update(disk(2500, Some(config.disk_safety_mib / 2)), &config);
+        assert_eq!(monitor.signals.limit, Some(Limit::DiskLow));
+        monitor.update(disk(2600, Some(config.disk_safety_mib / 2 - 1)), &config);
+        assert_eq!(monitor.signals.limit, Some(Limit::DiskCritical));
         assert_eq!(monitor.mode(), Pressure::Held);
         monitor.update(disk(3000, Some(config.disk_safety_mib)), &config);
         assert_eq!(monitor.mode(), Pressure::Normal);

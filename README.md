@@ -85,7 +85,7 @@ waits. In a terminal, every position change is shown as it happens.
 | Several agents use different worktrees | CPU and memory reservations determine which calls fit. A call that fits may pass one that does not, at most four times; same-server calls of the same priority keep FIFO order. |
 | A build is more urgent than the queue ahead of it | Give it `BAZELQUEUE_PRIORITY=high` (or `bazelqueue exec --priority high -- ...`). In the queue, higher priority goes first and arrival order breaks ties; it takes the next free slot but never cuts a running build, and low disk, swap and CPU limits apply to it like to any other call. `low` waits behind `normal` and `high`, with no aging. |
 | A build or test has nothing to rebuild | Bazel's own up-to-date check runs in a small fast-lane slot; if it passes, the call starts at once instead of waiting behind other builds. |
-| The machine runs short | High CPU load halves new work. Critical pressure or macOS writing to swap admit one smaller build, only with nothing else of the queue running. Low disk space or a sensor without data hold new builds. Running ones keep their reservation, and the next safe sample restores full admission. |
+| The machine runs short | High CPU load halves new work. Critical pressure, macOS writing to swap or low disk space admit one smaller build, only with nothing else of the queue running. A disk almost full or a sensor without data hold new builds. Running ones keep their reservation, and the next safe sample restores full admission. |
 | The caller disappears | Its owned backend is cancelled. Capacity is retained until completion or verified recovery. |
 | A build stops progressing | With no Bazel events, output or CPU for `stall_minutes`, the call exits with 124 (`TIMEOUT`) and its hung server is killed. A slow test keeps running: Bazel's progress lines count as output. |
 | The coordinator restarts | Guardians reconnect without submitting the command a second time. |
@@ -238,7 +238,7 @@ ${EDITOR:-vi} ~/.local/state/bazelqueue/config.toml
 | `worker_instances` | Worker and multiplex-worker instance caps. |
 | `memory_safety_mib` | Free-memory margin, at least 5% of RAM. Default: **1024 MiB**. |
 | `swap_thrashing_mib_per_min` | New builds wait while swap-out or swap growth, over the last 60 seconds, exceeds this rate. Default: **64 MiB/min**. |
-| `disk_safety_mib` | New builds wait while free space on the output base of a build that has one is below this. The queue state only needs 1024 MiB. Default: **10240 MiB**. |
+| `disk_safety_mib` | Below this free space on the output base of a build that has one, one build runs at a time; below half of it, new builds wait. The queue state only needs 1024 MiB. Default: **10240 MiB**. |
 | `fast_lane_slots` | Up-to-date checks, and the runs they admit, that may proceed outside the build capacity at once. Default: **2**; `0` turns the fast lane off. |
 | `stall_minutes` | Minutes without Bazel events, `command.log` output or CPU before a job is cut as a time failure. Default: **10**; `0` turns detection off. macOS only. Bazel 9 writes no `command.log` by default, so a job there with child processes and a connected client is not cut. |
 
@@ -299,7 +299,8 @@ promised to active reservations.
 
 | Signal | New builds and tests |
 |---|---|
-| Free disk below `disk_safety_mib` | Wait |
+| Free disk below half of `disk_safety_mib` | Wait |
+| Free disk below `disk_safety_mib` | One smaller build, only with nothing else of the queue running |
 | A memory, swap or disk sensor without data | Wait |
 | macOS writes to swap, or swap grows, faster than `swap_thrashing_mib_per_min` over 60 seconds | One smaller build, only with nothing else of the queue running |
 | Critical pressure | One smaller build, only with nothing else of the queue running |
@@ -309,7 +310,8 @@ promised to active reservations.
 
 Up-to-date checks run only without any of these limits. Most of these signals come
 from outside the queue, so waiting for them can last hours: only a full disk or a
-blind sensor stops it completely.
+blind sensor stops it completely. `status` reports macOS's pressure level in
+`pressure`; what holds the queue is in `resources.reason`.
 
 Reservations follow measurements too. A running job counts as the larger of its
 reservation and the resident memory of its Bazel server and children. Each output
