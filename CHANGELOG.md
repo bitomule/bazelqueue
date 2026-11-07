@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.12](https://github.com/bitomule/bazelqueue/compare/v0.1.11...v0.1.12) - 2026-11-07
+
+### Added
+
+- cut stalled Bazel jobs as a time failure and free their slot ([#27](https://github.com/bitomule/bazelqueue/pull/27))
+
+### Fixed
+
+- keep the queue moving under load and let small jobs pass ([#29](https://github.com/bitomule/bazelqueue/pull/29))
+- admit builds on what the machine really has free ([#26](https://github.com/bitomule/bazelqueue/pull/26))
+
 ## [0.1.11](https://github.com/bitomule/bazelqueue/compare/v0.1.10...v0.1.11) - 2026-11-05
 
 ### Added
