@@ -31,6 +31,17 @@ impl Fixture {
             .output()
             .unwrap();
         assert!(init.status.success());
+        fs::write(
+            root.join(".bazelrc"),
+            "try-import %workspace%/.bazelrc.local\n",
+        )
+        .unwrap();
+        fs::write(root.join(".bazelignore"), ".bazel-output\n").unwrap();
+        fs::write(
+            root.join(".gitignore"),
+            "/.bazel-output/\n/.bazelrc.local\n/.bazelrc.local.*\n/.bazel-output-disk.log\n",
+        )
+        .unwrap();
         let mounts = base.join("mounts");
         let fixture = Self {
             _dir: dir,
@@ -62,7 +73,12 @@ impl Fixture {
             .arg(&self.volume)
             .current_dir(&self.root)
             .env("BAZEL_OUTPUT_DISK_MOUNT_TABLE", &self.mounts)
-            .env("BAZEL_OUTPUT_DISK_TIMEOUT", timeout);
+            .env("BAZEL_OUTPUT_DISK_TIMEOUT", timeout)
+            .env_remove("BAZEL_SHARED_CACHE_DIR")
+            .env("HOME", &self.root)
+            .env("XDG_CONFIG_HOME", &self.root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null");
         if let Some(shims) = path {
             let inherited = std::env::var("PATH").unwrap();
             command.env("PATH", format!("{}:{inherited}", shims.display()));
@@ -79,8 +95,8 @@ impl Fixture {
     fn output_base(&self) -> String {
         fs::read_to_string(self.root.join(".bazelrc.local"))
             .unwrap()
-            .trim()
-            .strip_prefix("startup --output_base=")
+            .lines()
+            .find_map(|line| line.strip_prefix("startup --output_base="))
             .unwrap()
             .to_owned()
     }
@@ -254,4 +270,87 @@ fn staying_on_the_same_disk_leaves_its_server_running() {
     let mut server = Server::start(&fixture.output_base());
     fixture.run();
     assert!(!server.stopped());
+}
+
+#[test]
+fn missing_preparation_fails_before_probe_log_or_server_switch() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.root.join(".bazelrc.local"),
+        "startup --output_base=/previous/base\n",
+    )
+    .unwrap();
+    fs::remove_file(fixture.root.join(".bazelignore")).unwrap();
+    let output = fixture.run_with("3", None);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("add .bazel-output to .bazelignore"));
+    assert!(!fixture.volume.join("bazel").exists());
+    assert!(!fixture.root.join(".bazel-output-disk.log").exists());
+    assert_eq!(fixture.output_base(), "/previous/base");
+    assert!(!fixture.root.join(".bazelignore").exists());
+}
+
+#[test]
+fn repeated_hook_with_shared_cache_keeps_tracked_files_clean() {
+    let fixture = Fixture::new();
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .current_dir(&fixture.root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    assert!(git(&["add", "."]).status.success());
+    assert!(
+        git(&[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-qm",
+            "fixture"
+        ])
+        .status
+        .success()
+    );
+    fs::write(
+        fixture.root.join(".bazelrc.local"),
+        "# Personal settings\nbuild --jobs=3\n",
+    )
+    .unwrap();
+    let shared = fixture.volume.join("shared");
+    for mounted in [true, true, false, false] {
+        fixture.mount(mounted);
+        let output =
+            Command::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/bazel-output-disk"))
+                .arg(&fixture.volume)
+                .current_dir(&fixture.root)
+                .env("BAZEL_OUTPUT_DISK_MOUNT_TABLE", &fixture.mounts)
+                .env("BAZEL_SHARED_CACHE_DIR", &shared)
+                .output()
+                .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let local = fs::read_to_string(fixture.root.join(".bazelrc.local")).unwrap();
+        assert!(local.starts_with("# Personal settings\nbuild --jobs=3\n"));
+        assert!(local.contains(&format!(
+            "common --disk_cache={}/disk-cache",
+            shared.display()
+        )));
+        let diff = git(&["diff", "--exit-code", "HEAD"]);
+        assert!(diff.status.success(), "{diff:?}");
+        assert!(
+            git(&["ls-files", "--others", "--exclude-standard"])
+                .stdout
+                .is_empty()
+        );
+        assert_eq!(
+            fixture
+                .output_base()
+                .starts_with(&fixture.external_prefix()),
+            mounted
+        );
+    }
 }

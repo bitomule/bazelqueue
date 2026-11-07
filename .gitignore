@@ -10,3 +10,5 @@ __pycache__/
 !/.musts/.gitattributes
 /.bazel-output/
 /.bazelrc.local
+/.bazelrc.local.*
+/.bazel-output-disk.log
