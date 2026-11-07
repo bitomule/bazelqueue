@@ -350,7 +350,8 @@ needed. Bazel does not expand `%workspace%` in `--output_base`, so the script wr
 path to a git-ignored `.bazelrc.local` and makes `.bazelrc` `try-import` it. It works from any
 subdirectory and is safe to run again. When `BAZEL_SHARED_CACHE_DIR` is set (to any directory, e.g. on a volume shared by all your worktrees), it also writes `--disk_cache`, `--repository_cache` and the automatic trim (`--experimental_disk_cache_gc_max_size=12G`, `--experimental_disk_cache_gc_max_age=7d`) under it, so every worktree shares one capped cache. Each output base is its own lane, and the disk free-space
 check looks at the worktree's own volume. Stop the worktree's server (`bazel shutdown`) before
-deleting it.
+deleting it. [docs/worktree-migration.md](docs/worktree-migration.md) covers moving existing checkouts and
+removing orphaned bases without touching a live build.
 
 The cost is one Bazel server per worktree that builds: measured servers hold 1.1-1.7 GB of memory
 each, so ten active worktrees can hold more than ten gigabytes. The queue already bounds this:
