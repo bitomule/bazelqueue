@@ -1,40 +1,94 @@
 #!/bin/sh
-# Gives this checkout its own Bazel output base, inside the checkout unless a path is given, so
-# deleting the worktree deletes its cache. Bazel does not expand %workspace% in --output_base, so
-# the absolute path lives in a git-ignored .bazelrc.local that each checkout generates for itself.
-# When BAZEL_SHARED_CACHE_DIR is set, every checkout also points its disk and repository caches
-# at that directory and trims the disk cache to 12G / 7 days.
+# Generate checkout-local Bazel settings only. Repository preparation is explicit;
+# see README.md, One output base per worktree. --check validates without writing.
 set -eu
 
 root=$(git rev-parse --show-toplevel)
 output_base=${1:-$root/.bazel-output}
 shared=${BAZEL_SHARED_CACHE_DIR:-}
 
-temporary=$(mktemp "$root/.bazelrc.local.XXXXXX")
-{
-    printf 'startup --output_base=%s\n' "$output_base"
-    if [ -n "$shared" ]; then
-        printf 'common --disk_cache=%s/disk-cache\n' "$shared"
-        printf 'common --repository_cache=%s/repo-cache\n' "$shared"
-        printf 'common --experimental_disk_cache_gc_max_size=12G\n'
-        printf 'common --experimental_disk_cache_gc_max_age=7d\n'
-    fi
-} >"$temporary"
-mv "$temporary" "$root/.bazelrc.local"
+fail() {
+    printf "worktree-bazel-setup: %s\n" "$1" >&2
+    exit 1
+}
 
-import='try-import %workspace%/.bazelrc.local'
-grep -qxF "$import" "$root/.bazelrc" 2>/dev/null || printf '\n%s\n' "$import" >>"$root/.bazelrc"
-
-for entry in /.bazel-output/ /.bazelrc.local /.bazelrc.local.* /.bazel-output-disk.log; do
-    grep -qxF "$entry" "$root/.gitignore" 2>/dev/null || printf '%s\n' "$entry" >>"$root/.gitignore"
+# Check before creating a temporary file, including when an external base is selected:
+# bazel-output-disk can fall back to the checkout on its next invocation.
+grep -Eq "^[[:space:]]*(try-import|import)[[:space:]]+%workspace%/\\.bazelrc\\.local[[:space:]]*$" "$root/.bazelrc" 2>/dev/null ||
+    fail "missing preparation: add try-import %workspace%/.bazelrc.local to .bazelrc"
+grep -qxF ".bazel-output" "$root/.bazelignore" 2>/dev/null ||
+    fail "missing preparation: add .bazel-output to .bazelignore (Git ignores do not prevent recursive Bazel discovery)"
+for entry in "/.bazel-output/" "/.bazelrc.local" "/.bazelrc.local.*" "/.bazel-output-disk.log"; do
+    # check-ignore respects committed rules, info/exclude and core.excludesFile.
+    # It also rejects tracked local configuration instead of overwriting it.
+    case "$entry" in
+        /.bazel-output/) sample=.bazel-output/preparation-check ;;
+        /.bazelrc.local.\*) sample=.bazelrc.local.preparation-check ;;
+        *) sample=${entry#/} ;;
+    esac
+    git -C "$root" check-ignore -q -- "$sample" ||
+        fail "missing preparation: ignore $entry in .gitignore or git info/exclude; generated files must be untracked"
 done
 
-# The output base contains external/_main -> workspace. Keep Bazel's recursive package
-# discovery out of it, independently of Git's ignores.
-ignore="$root/.bazelignore"
-if ! grep -qxF '.bazel-output' "$ignore" 2>/dev/null; then
-    if [ -s "$ignore" ] && [ -n "$(tail -c 1 "$ignore")" ]; then
-        printf '\n' >>"$ignore"
+local=$root/.bazelrc.local
+[ ! -L "$local" ] || fail ".bazelrc.local must be a regular checkout-local file, not a symlink"
+[ ! -e "$local" ] || [ -f "$local" ] || fail ".bazelrc.local must be a regular file"
+source=$local
+[ -f "$source" ] || source=/dev/null
+begin="# BEGIN bazelqueue worktree setup"
+end="# END bazelqueue worktree setup"
+
+# Old versions owned the entire file. Only migrate their complete known format;
+# never infer ownership of cache/output options mixed with custom settings.
+kind=$(awk -v begin="$begin" -v end="$end" '
+    { lines[NR]=$0 }
+    END {
+        legacy = (NR == 1 || NR == 5) && lines[1] ~ /^startup --output_base=.+$/
+        if (NR == 5) {
+            disk=lines[2]; repo=lines[3]
+            sub(/^common --disk_cache=/, "", disk); sub(/\/disk-cache$/, "", disk)
+            sub(/^common --repository_cache=/, "", repo); sub(/\/repo-cache$/, "", repo)
+            legacy = legacy && lines[2] ~ /^common --disk_cache=.+\/disk-cache$/ && \
+                lines[3] ~ /^common --repository_cache=.+\/repo-cache$/ && disk == repo && \
+                lines[4] == "common --experimental_disk_cache_gc_max_size=12G" && \
+                lines[5] == "common --experimental_disk_cache_gc_max_age=7d"
+        }
+        if (legacy) { print "legacy"; exit }
+        inside=0; blocks=0
+        for (i=1; i<=NR; i++) {
+            line=lines[i]
+            if (line == begin) { if (inside || blocks++) exit 1; inside=1; continue }
+            if (line == end) { if (!inside) exit 1; inside=0; continue }
+            if (!inside && line !~ /^[[:space:]]*#/ && line ~ /--(output_base|disk_cache|repository_cache|experimental_disk_cache_gc_max_size|experimental_disk_cache_gc_max_age)(=|[[:space:]]|$)/) exit 1
+        }
+        if (inside) exit 1
+        print "custom"
+    }
+' "$source") || fail "ambiguous .bazelrc.local: move custom output/cache options to .bazelrc or remove them; repair any incomplete bazelqueue managed block before retrying (file unchanged)"
+
+[ "${1:-}" != --check ] || exit 0
+[ "$#" -le 1 ] || fail "usage: worktree-bazel-setup [output_base | --check]"
+
+temporary=$(mktemp "$root/.bazelrc.local.XXXXXX")
+trap 'rm -f "$temporary"' EXIT HUP INT TERM
+{
+    if [ "$kind" != legacy ] && [ -s "$source" ]; then
+        awk -v begin="$begin" -v end="$end" '
+            $0 == begin { inside=1; next }
+            $0 == end { inside=0; next }
+            !inside { print }
+        ' "$source"
     fi
-    printf '%s\n' '.bazel-output' >>"$ignore"
+    printf "%s\n" "$begin"
+    printf "startup --output_base=%s\n" "$output_base"
+    if [ -n "$shared" ]; then
+        printf "common --disk_cache=%s/disk-cache\n" "$shared"
+        printf "common --repository_cache=%s/repo-cache\n" "$shared"
+        printf "common --experimental_disk_cache_gc_max_size=12G\n"
+        printf "common --experimental_disk_cache_gc_max_age=7d\n"
+    fi
+    printf "%s\n" "$end"
+} >"$temporary"
+if ! cmp -s "$temporary" "$local"; then
+    mv "$temporary" "$local"
 fi

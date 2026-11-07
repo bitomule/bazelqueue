@@ -76,6 +76,9 @@ stop_server() {
     done
 }
 
+# Fail before probing volumes or writing logs when this checkout is not prepared.
+"$setup" --check
+
 previous=$(current_base)
 
 if available; then
