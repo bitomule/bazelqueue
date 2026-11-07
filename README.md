@@ -347,6 +347,14 @@ subdirectory and is safe to run again. Each output base is its own lane, and the
 check looks at the worktree's own volume. Stop the worktree's server (`bazel shutdown`) before
 deleting it.
 
+The cost is one Bazel server per worktree that builds: measured servers hold 1.1-1.7 GB of memory
+each, so ten active worktrees can hold more than ten gigabytes. The queue already bounds this:
+a build is admitted only with the memory its output base peaked at last time (`LaneMemory`), and
+`startup --max_idle_secs=120` retires the idle servers. Disk is the other half: each worktree's
+cache (measured 2.2-4.2 GB per output base) now lives wherever the worktree lives, so only the
+shared disk and repository caches stay on a shared volume. Two worktrees run side by side;
+two builds in the same worktree still wait for each other.
+
 ## Compatibility
 
 | Area | Support |

@@ -97,14 +97,18 @@ fn sample_resources(
     }
     let _ = config;
     let mut sample = sampler.sample(at_ms);
+    sample.disk_free_mib = free_disk_mib(&paths.root, jobs);
+    sample
+}
+
+/// Lowest free space on the queue state and on the lane of every job still in play.
+fn free_disk_mib(root: &Path, jobs: &[Job]) -> Option<u64> {
     let lanes: std::collections::BTreeSet<_> = jobs
         .iter()
         .filter(|job| !job.terminal())
         .map(|job| Path::new(&job.request.lane))
         .collect();
-    sample.disk_free_mib =
-        platform::free_disk_mib(std::iter::once(paths.root.as_path()).chain(lanes));
-    sample
+    platform::free_disk_mib(std::iter::once(root).chain(lanes))
 }
 
 fn read_server(paths: &Paths, job: &Job, server: &NativeServer, at_ms: u64) -> Reading {
@@ -1572,6 +1576,23 @@ mod tests {
         resources::Monitor,
         utilization::Utilization,
     };
+
+    #[test]
+    fn disk_is_measured_on_the_lane_of_every_job_still_in_play() {
+        let fixture = Fixture::new();
+        let nowhere = fixture._root.path().join("lane-not-created-yet");
+        let mut live = fixture.job("live", "running");
+        live.request.lane = "/dev".into();
+        let mut done = fixture.job("done", "finished");
+        done.request.lane = "/dev".into();
+        let root = fixture._root.path();
+        let state_only = platform::free_disk_mib([root]);
+        assert_eq!(free_disk_mib(root, &[done.clone()]), state_only);
+        let dev_and_state = platform::free_disk_mib([root, Path::new("/dev")]);
+        assert_eq!(free_disk_mib(root, &[live.clone(), done]), dev_and_state);
+        live.request.lane = nowhere.to_string_lossy().into_owned();
+        assert_eq!(free_disk_mib(root, &[live]), state_only);
+    }
 
     #[test]
     fn duplicate_orphans_do_not_protect_the_same_server_but_live_owners_do() {
