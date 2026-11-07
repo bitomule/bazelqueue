@@ -1,4 +1,4 @@
-.PHONY: build release fmt lint unit e2e contract terminal all install dist
+.PHONY: worktree-bazel build release fmt lint unit e2e contract terminal all install dist
 build:
 	cargo build --locked
 release:
@@ -22,3 +22,5 @@ install: release
 	./target/release/bazelqueue setup
 dist:
 	dist build --artifacts=local --target=aarch64-apple-darwin
+worktree-bazel:
+	tools/worktree-bazel-setup
