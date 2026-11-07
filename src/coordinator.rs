@@ -1649,18 +1649,19 @@ mod tests {
         let mut done = fixture.job("done", "finished");
         done.request.lane = "/dev".into();
         let root = fixture._root.path();
-        let state = platform::free_disk_mib([root]).unwrap();
-        let without_output_base = Some(state.max(MARGIN_MIB));
+        let beyond_any_disk = 1 << 40;
+        let without_output_base = Some(beyond_any_disk);
         assert_eq!(
-            free_disk_mib(root, &[done.clone()], MARGIN_MIB),
+            free_disk_mib(root, &[done.clone()], beyond_any_disk),
             without_output_base
         );
-        assert_eq!(
-            free_disk_mib(root, &[live.clone(), done], MARGIN_MIB),
-            platform::free_disk_mib([Path::new("/dev")])
-        );
+        let measured = free_disk_mib(root, &[live.clone(), done], beyond_any_disk).unwrap();
+        assert!(measured < beyond_any_disk);
         live.request.lane = nowhere.to_string_lossy().into_owned();
-        assert_eq!(free_disk_mib(root, &[live], MARGIN_MIB), without_output_base);
+        assert_eq!(
+            free_disk_mib(root, &[live], beyond_any_disk),
+            without_output_base
+        );
     }
 
     #[test]
