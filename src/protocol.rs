@@ -3,9 +3,10 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::platform::Identity;
+use crate::{platform::Identity, stall::Stall};
 use std::{
     io,
+    path::PathBuf,
     pin::Pin,
     task::{Context as TaskContext, Poll},
 };
@@ -110,6 +111,13 @@ pub struct NativeServer {
     pub version: String,
 }
 
+/// Where a guardian's backend reports progress. A guardian that sends this
+/// understands `Event::Stalled`; older ones are only judged once they die.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Progress {
+    pub events: Option<PathBuf>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Message {
@@ -130,6 +138,8 @@ pub enum Message {
     Defer,
     Running {
         child: Identity,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        progress: Option<Progress>,
     },
     Preparing {
         child: Identity,
@@ -167,6 +177,10 @@ pub struct Job {
     /// How many later jobs started ahead of this one while it did not fit.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub passed: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<Progress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stall: Option<Stall>,
 }
 
 fn is_zero(count: &u32) -> bool {
@@ -216,6 +230,15 @@ impl Job {
     pub fn terminal(&self) -> bool {
         matches!(self.state.as_str(), "finished" | "cancelled")
     }
+    /// Metered Bazel work whose server can be judged for lack of progress.
+    pub fn watched(&self) -> bool {
+        self.metered()
+            && match self.state.as_str() {
+                "running" => self.progress.is_some(),
+                "quarantined" => self.request.command != "exec",
+                _ => false,
+            }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -264,6 +287,10 @@ pub enum Event {
         state: String,
     },
     Cancel,
+    /// Cut the backend and report the job as a time failure.
+    Stalled {
+        stall: Stall,
+    },
     Ack,
     Owned {
         child: Identity,
@@ -332,6 +359,30 @@ mod tests {
         .unwrap();
         assert_eq!(snapshot.version, "");
         assert_eq!(snapshot.executable, None);
+    }
+
+    #[test]
+    fn only_guardians_that_declare_progress_are_cut_while_they_run() {
+        let older: Message =
+            serde_json::from_str(r#"{"type":"running","child":{"pid":7,"birth":"b"}}"#).unwrap();
+        assert!(matches!(older, Message::Running { progress: None, .. }));
+        let mut job: Job = serde_json::from_value(serde_json::json!({
+            "sequence":1,"state":"running","child":null,"code":null,"cancel":false,
+            "server":{"identity":{"pid":2,"birth":"b"},"output_base":"o","workspace":"w","version":"8.4.2"},
+            "request":{"id":"1","owner":{"pid":1,"birth":"b"},"lane":"l","workspace":"w",
+                "command":"test","prepared":true,"budget":{"cpu":1,"memory_mib":256,"exclusive":false}}
+        }))
+        .unwrap();
+        assert!(!job.watched());
+        job.progress = Some(Progress::default());
+        assert!(job.watched());
+        job.state = "quarantined".into();
+        job.progress = None;
+        assert!(job.watched());
+        job.request.command = "exec".into();
+        assert!(!job.watched());
+        job.request.command = "query".into();
+        assert!(!job.watched());
     }
 
     #[tokio::test(flavor = "current_thread")]

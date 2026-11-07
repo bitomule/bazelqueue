@@ -60,6 +60,8 @@ impl Store {
             retiring_server: None,
             passed: 0,
             fast: Default::default(),
+            progress: None,
+            stall: None,
         };
         self.connection.execute(
             "INSERT INTO jobs(id,data) VALUES(?1,?2)",

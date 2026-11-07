@@ -3,7 +3,8 @@ use crate::{
     bazel,
     config::{Config, Paths},
     coordinator, estimate, platform,
-    protocol::{self, Admission, Budget, Event, Message, NativeServer, Request},
+    protocol::{self, Admission, Budget, Event, Message, NativeServer, Progress, Request},
+    stall::{self, Stall},
     summary,
 };
 use anyhow::{Context, Result, bail};
@@ -170,6 +171,7 @@ struct Ledger {
     events: Option<(PathBuf, bool)>,
     report: bool,
     fast_lane: bool,
+    stall: Option<Stall>,
 }
 
 impl Ledger {
@@ -187,8 +189,14 @@ impl Ledger {
             workspace: self.workspace.clone(),
             exit_code: code,
             targets_reported: parsed.is_some(),
-            exit_name: parsed.as_ref().and_then(|events| events.exit_name.clone()),
-            reason: parsed.as_ref().and_then(|events| events.reason.clone()),
+            exit_name: self
+                .stall
+                .map(|_| stall::EXIT_NAME.to_owned())
+                .or_else(|| parsed.as_ref().and_then(|events| events.exit_name.clone())),
+            reason: self
+                .stall
+                .map(|stall| stall.reason())
+                .or_else(|| parsed.as_ref().and_then(|events| events.reason.clone())),
             failures: parsed.map(|events| events.failures).unwrap_or_default(),
             queued_ms: self
                 .granted
@@ -199,6 +207,7 @@ impl Ledger {
                 .granted
                 .map_or(0, |granted| now.duration_since(granted).as_millis() as u64),
             fast_lane: self.fast_lane,
+            stall: self.stall,
         }
     }
 }
@@ -251,6 +260,7 @@ async fn authorize(
     stream: &mut protocol::Framed<UnixStream>,
     child: &platform::Identity,
     state: &str,
+    progress: Option<Progress>,
 ) -> Result<bool> {
     let message = match state {
         "preparing" => Message::Preparing {
@@ -261,6 +271,7 @@ async fn authorize(
         },
         _ => Message::Running {
             child: child.clone(),
+            progress,
         },
     };
     protocol::send(stream, &message).await?;
@@ -299,7 +310,7 @@ async fn probe(
         Some(&request.id),
     )
     .await?;
-    if !authorize(paths, request, stream, &identity, "preparing").await? {
+    if !authorize(paths, request, stream, &identity, "preparing", None).await? {
         drop(permit);
         child.wait().await?;
         return Ok(Preparation::Cancelled);
@@ -312,7 +323,7 @@ async fn probe(
         stdout.read_to_end(&mut bytes).await?;
         Ok::<_, std::io::Error>(bytes)
     };
-    let result = timeout(Duration::from_secs(15), output).await;
+    let result = timeout(PREFLIGHT_TIMEOUT, output).await;
     if result.is_err() {
         let _ = platform::signal_group(identity.pid, libc::SIGINT);
         if timeout(Duration::from_secs(5), child.wait()).await.is_err() {
@@ -345,6 +356,9 @@ async fn probe(
     )))
 }
 
+/// A cold server took over 15 seconds at load 30 and 20 at load 50. A preflight cut
+/// sooner leaves its job unmanaged: no typed summary, and no server to recover.
+const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(120);
 const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Asks Bazel, under the fast-lane reservation, whether the invocation would
@@ -367,7 +381,7 @@ async fn up_to_date(
         Some(&request.id),
     )
     .await?;
-    if !authorize(paths, request, stream, &identity, "preparing").await? {
+    if !authorize(paths, request, stream, &identity, "preparing", None).await? {
         drop(permit);
         child.wait().await?;
         return Ok(None);
@@ -453,6 +467,7 @@ pub async fn guardian(backend: PathBuf, args: Vec<OsString>, generic: bool) -> R
         events: None,
         report: !immediate,
         fast_lane: false,
+        stall: None,
     };
     let mut notices = Notices::new(&id, ledger.report);
     let mut stream = registration(&paths, &request).await?;
@@ -636,7 +651,19 @@ pub async fn guardian(backend: PathBuf, args: Vec<OsString>, generic: bool) -> R
         });
     let (mut child, mut permit, child_identity) =
         owned_executor(&backend, backend_args, false, Some(&id)).await?;
-    if !authorize(&paths, &request, &mut stream, &child_identity, "running").await? {
+    let progress = (!generic).then(|| Progress {
+        events: ledger.events.as_ref().map(|(path, _)| path.clone()),
+    });
+    if !authorize(
+        &paths,
+        &request,
+        &mut stream,
+        &child_identity,
+        "running",
+        progress.clone(),
+    )
+    .await?
+    {
         drop(permit);
         child.wait().await?;
         finish(&paths, &ledger, 130, true, &mut stream).await?;
@@ -656,9 +683,10 @@ pub async fn guardian(backend: PathBuf, args: Vec<OsString>, generic: bool) -> R
             event=protocol::receive::<_,Event>(&mut stream)=> {
                 match event {
                     Ok(Event::Cancel)=>{cancelled=true;let _=platform::signal_group(child_identity.pid,libc::SIGINT);},
+                    Ok(Event::Stalled {stall})=>if ledger.stall.is_none() {ledger.stall=Some(stall);cancelled=true;let _=platform::signal_group(child_identity.pid,libc::SIGINT);},
                     Err(_)=>{
                         if let Ok(mut new)=registration(&paths,&request).await {
-                            let _=protocol::send(&mut new,&Message::Running {child:child_identity.clone()}).await;
+                            let _=protocol::send(&mut new,&Message::Running {child:child_identity.clone(),progress:progress.clone()}).await;
                             stream=new;
                         }else {sleep(Duration::from_millis(100)).await;}
                     },
@@ -712,7 +740,16 @@ pub async fn guardian(backend: PathBuf, args: Vec<OsString>, generic: bool) -> R
     if invocation.run && status.success() && !cancelled {
         let (mut target, mut permit, target_identity) =
             owned_executor(&script, Vec::new(), false, None).await?;
-        if !authorize(&paths, &request, &mut stream, &target_identity, "run_phase").await? {
+        if !authorize(
+            &paths,
+            &request,
+            &mut stream,
+            &target_identity,
+            "run_phase",
+            None,
+        )
+        .await?
+        {
             drop(permit);
             target.wait().await?;
             finish(&paths, &ledger, 130, true, &mut stream).await?;
@@ -750,16 +787,16 @@ pub async fn guardian(backend: PathBuf, args: Vec<OsString>, generic: bool) -> R
         .await?;
         return Ok(target_status);
     }
-    finish(
-        &paths,
-        &ledger,
-        status.code().unwrap_or(128 + status.signal().unwrap_or(1)),
-        stopped,
-        &mut stream,
-    )
-    .await?;
+    let code = if ledger.stall.is_some() {
+        stall::EXIT_CODE
+    } else {
+        status.code().unwrap_or(128 + status.signal().unwrap_or(1))
+    };
+    finish(&paths, &ledger, code, stopped, &mut stream).await?;
     let _ = fs::remove_dir_all(run_directory);
-    if cancelled {
+    if ledger.stall.is_some() {
+        Ok(ExitStatus::from_raw(stall::EXIT_CODE << 8))
+    } else if cancelled {
         Ok(ExitStatus::from_raw(cancellation_signal))
     } else {
         Ok(status)
@@ -818,6 +855,10 @@ pub async fn wait(
                     }) {
                         summary.reason = job.reason.clone();
                     }
+                    if job.stall.is_some() {
+                        summary.exit_name = Some(stall::EXIT_NAME.into());
+                        summary.stall = job.stall;
+                    }
                 }
                 return Ok(summary);
             }
@@ -827,13 +868,17 @@ pub async fn wait(
                 command: job.request.command.clone(),
                 workspace: job.request.workspace.clone(),
                 exit_code: job.code.unwrap_or(130),
-                exit_name: (job.state == "cancelled").then(|| "CANCELLED".into()),
+                exit_name: job
+                    .stall
+                    .map(|_| stall::EXIT_NAME.to_owned())
+                    .or_else(|| (job.state == "cancelled").then(|| "CANCELLED".into())),
                 reason: job.reason.clone(),
                 queued_ms: 0,
                 ran_ms: 0,
                 targets_reported: false,
                 failures: Vec::new(),
                 fast_lane: false,
+                stall: job.stall,
             });
         }
         sleep(Duration::from_secs(1)).await;
@@ -914,7 +959,7 @@ async fn run_hooks(
         let args = hook.arguments.iter().map(OsString::from).collect();
         let (mut child, mut permit, identity) =
             owned_executor(&hook.program, args, true, Some(&request.id)).await?;
-        if !authorize(paths, request, stream, &identity, state).await? {
+        if !authorize(paths, request, stream, &identity, state, None).await? {
             drop(permit);
             child.wait().await?;
             return Ok(false);
@@ -939,7 +984,7 @@ async fn run_hooks(
                 _=hangup.recv()=>cancelled=true,
                 event=protocol::receive::<_,Event>(stream)=>match event {
                     Ok(Event::Cancel)=>cancelled=true,
-                    Err(_)=>{*stream=registration(paths, request).await?; let message=if state=="preparing" {Message::Preparing {child:identity.clone()}} else {Message::Running {child:identity.clone()}}; protocol::send(stream,&message).await?;},
+                    Err(_)=>{*stream=registration(paths, request).await?; let message=if state=="preparing" {Message::Preparing {child:identity.clone()}} else {Message::Running {child:identity.clone(),progress:None}}; protocol::send(stream,&message).await?;},
                     _=>{},
                 },
                 _=sleep(Duration::from_millis(100)), if cancelled=>{},

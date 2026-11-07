@@ -1,6 +1,9 @@
 #![forbid(unsafe_code)]
 //! Recovery policy has no OS, store, spawning or wall-clock dependencies.
-use crate::protocol::Job;
+use crate::{
+    protocol::Job,
+    stall::{self, Stall},
+};
 use std::time::Duration;
 
 pub const UNRESPONSIVE_GRACE: Duration = Duration::from_secs(10);
@@ -21,6 +24,7 @@ pub struct Observation {
     pub native: NativeState,
     pub unresponsive_for: Duration,
     pub other_owner: bool,
+    pub stall: Option<Stall>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,6 +32,8 @@ pub enum Decision {
     Wait(&'static str),
     Finish(&'static str),
     StopServer,
+    StopClient,
+    StopStalled,
 }
 
 pub fn decide(job: &Job, observation: Observation) -> Decision {
@@ -35,11 +41,22 @@ pub fn decide(job: &Job, observation: Observation) -> Decision {
         return Decision::Wait("request is not quarantined");
     }
     if observation.child_alive {
-        return Decision::Wait("owned child is still active");
+        return if observation.stall.is_some() && !observation.owner_alive {
+            Decision::StopClient
+        } else {
+            Decision::Wait("owned child is still active")
+        };
     }
+    let stalled = observation.stall.is_some_and(|stall| stall.orphaned())
+        && !observation.other_owner
+        && !observation.owner_alive
+        && job.server.is_some();
     match observation.native {
         NativeState::Gone => Decision::Finish("execution ended; no native server remains"),
         NativeState::Idle => Decision::Finish("native server verified idle"),
+        NativeState::Busy | NativeState::Unknown | NativeState::Unresponsive if stalled => {
+            Decision::StopStalled
+        }
         NativeState::Busy => Decision::Wait("native server is busy"),
         NativeState::Unknown => Decision::Wait("native server could not be verified"),
         NativeState::Unresponsive
@@ -51,6 +68,33 @@ pub fn decide(job: &Job, observation: Observation) -> Decision {
             Decision::StopServer
         }
         NativeState::Unresponsive => Decision::Wait("native server is not responding"),
+    }
+}
+
+/// Keeps the diagnosis a job already has in front of what recovery still waits for.
+pub fn pending(job: &mut Job, reason: &str) {
+    let previous = job
+        .reason
+        .as_deref()
+        .unwrap_or("")
+        .split("; recovery pending:")
+        .next()
+        .unwrap_or("");
+    job.reason = Some(
+        if previous.is_empty() || previous.starts_with("recovery pending:") {
+            format!("recovery pending: {reason}")
+        } else {
+            format!("{previous}; recovery pending: {reason}")
+        },
+    );
+}
+
+/// An exit a guardian already reported stays the job's result.
+pub fn record_stall(job: &mut Job, stall: Stall) {
+    if job.code.is_none() {
+        job.code = Some(stall::EXIT_CODE);
+        job.stall = Some(stall);
+        job.reason = Some(stall.reason());
     }
 }
 
@@ -90,6 +134,9 @@ pub fn record_finish(job: &mut Job, code: i32, stopped: bool, reason: Option<Str
         return;
     }
     job.code = Some(code);
+    if code != stall::EXIT_CODE {
+        job.stall = None;
+    }
     job.state = if stopped { "finished" } else { "quarantined" }.into();
     job.reason = reason.or_else(|| (code != 0).then(|| format!("backend exited with code {code}")));
 }
@@ -124,6 +171,7 @@ mod tests {
             native,
             unresponsive_for: Duration::ZERO,
             other_owner: false,
+            stall: None,
         }
     }
     fn server() -> NativeServer {
@@ -232,6 +280,144 @@ mod tests {
                 Decision::Wait(_)
             ));
         }
+    }
+
+    fn stall(clients: Option<u32>) -> Option<Stall> {
+        Some(Stall {
+            silent_ms: 600_000,
+            cpu_ms: 100,
+            children: 0,
+            clients,
+        })
+    }
+
+    #[test]
+    fn a_proven_stall_retires_a_server_that_could_not_be_verified() {
+        let mut orphan = job(1, "quarantined");
+        orphan.server = Some(server());
+        for native in [
+            NativeState::Unknown,
+            NativeState::Busy,
+            NativeState::Unresponsive,
+        ] {
+            assert_eq!(
+                decide(
+                    &orphan,
+                    Observation {
+                        stall: stall(Some(0)),
+                        ..observation(native)
+                    }
+                ),
+                Decision::StopStalled
+            );
+        }
+    }
+
+    #[test]
+    fn a_stall_never_outranks_an_idle_or_gone_server() {
+        let mut orphan = job(1, "quarantined");
+        orphan.server = Some(server());
+        for native in [NativeState::Idle, NativeState::Gone] {
+            assert!(matches!(
+                decide(
+                    &orphan,
+                    Observation {
+                        stall: stall(Some(0)),
+                        ..observation(native)
+                    }
+                ),
+                Decision::Finish(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn any_doubt_about_ownership_keeps_a_stalled_server_alive() {
+        let mut orphan = job(1, "quarantined");
+        orphan.server = Some(server());
+        let proven = Observation {
+            stall: stall(Some(0)),
+            ..observation(NativeState::Unknown)
+        };
+        for doubt in [
+            Observation {
+                stall: stall(Some(1)),
+                ..proven
+            },
+            Observation {
+                stall: stall(None),
+                ..proven
+            },
+            Observation {
+                stall: None,
+                ..proven
+            },
+            Observation {
+                other_owner: true,
+                ..proven
+            },
+            Observation {
+                owner_alive: true,
+                ..proven
+            },
+        ] {
+            assert!(matches!(decide(&orphan, doubt), Decision::Wait(_)));
+        }
+        orphan.server = None;
+        assert!(matches!(decide(&orphan, proven), Decision::Wait(_)));
+    }
+
+    #[test]
+    fn a_stalled_client_without_a_guardian_is_stopped_before_its_server() {
+        let mut orphan = job(1, "quarantined");
+        orphan.server = Some(server());
+        let observed = Observation {
+            child_alive: true,
+            stall: stall(Some(1)),
+            ..observation(NativeState::Unknown)
+        };
+        assert_eq!(decide(&orphan, observed), Decision::StopClient);
+        assert!(matches!(
+            decide(
+                &orphan,
+                Observation {
+                    owner_alive: true,
+                    ..observed
+                }
+            ),
+            Decision::Wait(_)
+        ));
+    }
+
+    #[test]
+    fn a_stall_is_a_time_failure_that_survives_recovery_and_yields_to_a_real_exit() {
+        let mut stalled = job(1, "running");
+        record_stall(&mut stalled, stall(Some(0)).unwrap());
+        assert_eq!(stalled.code, Some(stall::EXIT_CODE));
+        record_finish(
+            &mut stalled,
+            stall::EXIT_CODE,
+            false,
+            Some("no progress".into()),
+        );
+        assert_eq!(stalled.state, "quarantined");
+        pending(&mut stalled, "retiring");
+        finish(&mut stalled, "execution ended");
+        assert_eq!(stalled.code, Some(stall::EXIT_CODE));
+        assert!(stalled.stall.is_some());
+        assert!(stalled.reason.unwrap().starts_with("no progress"));
+
+        let mut raced = job(2, "running");
+        record_stall(&mut raced, stall(Some(0)).unwrap());
+        record_finish(&mut raced, 0, true, None);
+        assert_eq!(raced.code, Some(0));
+        assert_eq!(raced.stall, None);
+
+        let mut reported = job(3, "quarantined");
+        reported.code = Some(1);
+        record_stall(&mut reported, stall(Some(0)).unwrap());
+        assert_eq!(reported.code, Some(1));
+        assert_eq!(reported.stall, None);
     }
 
     #[test]

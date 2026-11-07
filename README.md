@@ -86,6 +86,7 @@ waits. In a terminal, every position change is shown as it happens.
 | A build or test has nothing to rebuild | Bazel's own up-to-date check runs in a small fast-lane slot; if it passes, the call starts at once instead of waiting behind other builds. |
 | The machine runs short | High CPU load halves new work. Critical pressure or macOS writing to swap admit one smaller build, only with nothing else of the queue running. Low disk space or a sensor without data hold new builds. Running ones keep their reservation, and the next safe sample restores full admission. |
 | The caller disappears | Its owned backend is cancelled. Capacity is retained until completion or verified recovery. |
+| A build stops progressing | With no Bazel events, output or CPU for `stall_minutes`, the call exits with 124 (`TIMEOUT`) and its hung server is killed. A slow test keeps running: Bazel's progress lines count as output. |
 | The coordinator restarts | Guardians reconnect without submitting the command a second time. |
 | `bazel run` finishes compiling | The target runs through Bazel's generated script. Compilation capacity is released; the target's process footprint remains tracked. |
 
@@ -96,7 +97,10 @@ reason. A recorded orphan server that no longer answers its liveness RPC is
 stopped only after identity and ownership checks and a stopped-process check
 proves it has no children. A server with children is resumed and keeps its
 reservation. Busy servers keep their reservation. Recovery never
-retries the build. [Architecture and recovery](docs/architecture.md).
+retries the build. A stalled server is the one exception to the child check: its
+silence, flat CPU and lack of clients are proof, so the server and its process
+tree are killed even if its output base was deleted, and the reservation ends
+when their exit is observed. [Architecture and recovery](docs/architecture.md).
 
 ## Using it from an agent
 
@@ -114,6 +118,9 @@ needed for an agent to read it at the moment it would start polling.
   `bazelqueue: finished` and `bazelqueue: FAILED`: exit code, queue wait, run
   time, and each failed test or target with its `test.log` path. Open a test log
   only for a failure you need to fix; do not read the whole build output.
+- **Exit 124 with `TIMEOUT` means the build stopped progressing,** not that it
+  failed: bazelqueue cut it and killed its Bazel server. The summary's `stall`
+  field holds the evidence. Run it again; the next call starts a fresh server.
 - **Lost track of a build?** `bazelqueue wait` blocks until the newest build of
   the current workspace ends, prints the same summary and exits with its exit
   code. `bazelqueue wait ID` waits for a specific request; `--json` prints the
@@ -219,6 +226,7 @@ ${EDITOR:-vi} ~/.local/state/bazelqueue/config.toml
 | `swap_thrashing_mib_per_min` | New builds wait while swap-out or swap growth, over the last 60 seconds, exceeds this rate. Default: **64 MiB/min**. |
 | `disk_safety_mib` | New builds wait while free space on the queue state or an output base is below this. Default: **10240 MiB**. |
 | `fast_lane_slots` | Up-to-date checks, and the runs they admit, that may proceed outside the build capacity at once. Default: **2**; `0` turns the fast lane off. |
+| `stall_minutes` | Minutes without Bazel events, `command.log` output or CPU before a job is cut as a time failure. Default: **10**; `0` turns detection off. macOS only. Bazel 9 writes no `command.log` by default, so a job there with child processes and a connected client is not cut. |
 
 A lone supported build can receive the wide profile. Concurrent managed builds
 use smaller reservations; their budgets remain fixed once execution starts.

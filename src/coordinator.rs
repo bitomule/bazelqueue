@@ -2,10 +2,11 @@
 use crate::{
     config::{Config, Paths},
     platform,
-    protocol::{self, Event, FastLane, Job, Message, Snapshot},
+    protocol::{self, Event, FastLane, Job, Message, NativeServer, Snapshot},
     recovery::{self, Decision, NativeState, Observation as RecoveryObservation},
     resources::{Monitor, Sample},
     scheduler::{self, Capacity, Pressure},
+    stall::{Reading, Stall, Watch},
     store::Store,
     utilization::{Observation, Utilization},
 };
@@ -36,8 +37,28 @@ enum Input {
         observed: Box<Job>,
         connection: Option<u64>,
         native: NativeState,
+        look: Option<Look>,
+    },
+    Looked {
+        id: String,
+        look: Look,
     },
 }
+
+/// A look at the server of a watched job, and the server itself when the job
+/// has none recorded and exactly one serves its workspace.
+struct Look {
+    reading: Option<Reading>,
+    adopted: Option<NativeServer>,
+}
+
+/// Timer ticks between looks at a running job. Test readings are virtual, so
+/// waiting for the real cadence would only slow them down.
+const LOOK_TICKS: u64 = if cfg!(feature = "test-fixtures") {
+    2
+} else {
+    20
+};
 
 fn sample_resources(
     paths: &Paths,
@@ -84,6 +105,88 @@ fn sample_resources(
     sample.disk_free_mib =
         platform::free_disk_mib(std::iter::once(paths.root.as_path()).chain(lanes));
     sample
+}
+
+fn read_server(paths: &Paths, job: &Job, server: &NativeServer, at_ms: u64) -> Reading {
+    #[cfg(feature = "test-fixtures")]
+    if let Ok(value) = fs::read_to_string(paths.root.join("stall.json"))
+        && let Ok(reading) = serde_json::from_str(&value)
+    {
+        return reading;
+    }
+    let _ = paths;
+    Reading {
+        at_ms,
+        events: job
+            .progress
+            .as_ref()
+            .and_then(|progress| progress.events.as_deref())
+            .and_then(platform::fingerprint),
+        log: platform::fingerprint(&Path::new(&server.output_base).join("command.log")),
+        children: platform::descendants(&server.identity).map(|members| members.len() as u32),
+        cpu_ms: platform::tree_cpu_seconds(&server.identity).map(|cpu| (cpu * 1000.0) as u64),
+        clients: platform::established_clients(&server.identity),
+    }
+}
+
+fn look(paths: &Paths, job: &Job, at_ms: u64) -> Look {
+    let adopted = job
+        .server
+        .is_none()
+        .then(|| platform::bazel_servers(&job.request.workspace).ok())
+        .flatten()
+        .filter(|servers| servers.len() == 1)
+        .and_then(|mut servers| servers.pop());
+    Look {
+        reading: job
+            .server
+            .as_ref()
+            .or(adopted.as_ref())
+            .map(|server| read_server(paths, job, server, at_ms)),
+        adopted,
+    }
+}
+
+fn record_look(
+    paths: &Paths,
+    store: &Store,
+    id: &str,
+    look: Look,
+    watches: &mut HashMap<String, Watch>,
+    window_ms: u64,
+) -> Result<()> {
+    let Some(mut job) = store
+        .jobs()?
+        .into_iter()
+        .find(|job| job.request.id == id && job.watched())
+    else {
+        return Ok(());
+    };
+    if job.server.is_none() && look.adopted.is_some() {
+        job.server = look.adopted;
+        store.save(&job)?;
+    }
+    let Some(reading) = look.reading else {
+        return Ok(());
+    };
+    let verdict = watches
+        .entry(id.to_owned())
+        .or_default()
+        .observe(reading, window_ms);
+    #[cfg(feature = "test-fixtures")]
+    platform::atomic_write(
+        &paths.root.join("stall-read"),
+        reading.at_ms.to_string().as_bytes(),
+    )?;
+    let _ = paths;
+    if let Some(stall) = verdict
+        && job.stall.is_none()
+        && job.code.is_none()
+    {
+        recovery::record_stall(&mut job, stall);
+        store.save(&job)?;
+    }
+    Ok(())
 }
 
 async fn connection(stream: UnixStream, number: u64, send: mpsc::Sender<Input>) -> Result<()> {
@@ -557,6 +660,7 @@ async fn observe_native(job: &Job) -> NativeState {
     NativeState::Idle
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn apply_recovery(
     paths: &Paths,
     store: &Store,
@@ -565,6 +669,7 @@ async fn apply_recovery(
     current_connection: Option<u64>,
     native: NativeState,
     unresponsive_for: Duration,
+    stall: Option<Stall>,
 ) -> Result<()> {
     let jobs = store.jobs()?;
     let Some(mut job) = jobs
@@ -584,6 +689,7 @@ async fn apply_recovery(
         native,
         unresponsive_for,
         other_owner: other_owner(&job, &jobs),
+        stall,
     };
     match recovery::decide(&job, observation) {
         Decision::Finish(reason) => {
@@ -595,21 +701,24 @@ async fn apply_recovery(
             }
             recovery::finish(&mut job, reason);
         }
-        Decision::Wait(reason) => {
-            let previous = job
-                .reason
-                .as_deref()
-                .unwrap_or("")
-                .split("; recovery pending:")
-                .next()
-                .unwrap_or("");
-            job.reason = Some(
-                if previous.is_empty() || previous.starts_with("recovery pending:") {
-                    format!("recovery pending: {reason}")
-                } else {
-                    format!("{previous}; recovery pending: {reason}")
-                },
-            );
+        Decision::Wait(reason) => recovery::pending(&mut job, reason),
+        Decision::StopClient => {
+            let Some(child) = job.child.as_ref().filter(|child| platform::alive(child)) else {
+                return Ok(());
+            };
+            let _ = platform::signal_group(child.pid, libc::SIGKILL);
+            recovery::pending(&mut job, "stopped the client of a stalled job");
+        }
+        Decision::StopStalled => {
+            let server = job
+                .server
+                .as_ref()
+                .expect("recovery requires a recorded server");
+            if !platform::server_matches(server) {
+                return Ok(());
+            }
+            job.retiring_server = Some(server.identity.clone());
+            recovery::pending(&mut job, "retiring stalled server and its process tree");
         }
         Decision::StopServer => {
             let server = job
@@ -655,7 +764,7 @@ fn other_owner(job: &Job, jobs: &[Job]) -> bool {
 
 /// A persisted intent always repeats ownership and leaf verification, including
 /// after restart. It is never an unconditional permission to kill a PID list.
-fn advance_retirement(store: &Store, job: &mut Job) -> Result<()> {
+fn advance_retirement(store: &Store, job: &mut Job, stalled: bool) -> Result<()> {
     let Some(owner) = job.retiring_server.clone() else {
         return Ok(());
     };
@@ -665,13 +774,30 @@ fn advance_retirement(store: &Store, job: &mut Job) -> Result<()> {
     let protected = platform::alive(&job.request.owner)
         || job.child.as_ref().is_some_and(platform::alive)
         || other_owner(job, &store.jobs()?);
-    let matches = job.server.as_ref().is_some_and(|server| {
-        server.identity == owner && crate::native_server::retirement_matches(server)
-    });
-    if !protected && matches {
+    // A stalled server's output base may be gone: its recorded identity and
+    // argv are what remain, and the evidence stands in for the metadata.
+    let matches = |server: &NativeServer| {
+        server.identity == owner
+            && if stalled {
+                platform::server_matches(server)
+            } else {
+                crate::native_server::retirement_matches(server)
+            }
+    };
+    let matched = job.server.as_ref().is_some_and(matches);
+    if !protected && matched {
         platform::signal_verified(&owner, libc::SIGSTOP)?;
         match platform::stopped_leaf(&owner) {
             Ok(None) => return Ok(()),
+            Ok(Some(_))
+                if stalled
+                    && !other_owner(job, &store.jobs()?)
+                    && job.server.as_ref().is_some_and(matches) =>
+            {
+                platform::kill_tree(&owner)?;
+                recovery::pending(job, "stopped stalled server tree; verifying exit");
+                return store.save(job);
+            }
             Ok(Some(true))
                 if !other_owner(job, &store.jobs()?)
                     && job
@@ -793,6 +919,8 @@ pub async fn run(paths: Paths) -> Result<()> {
     let mut tick = 0;
     let mut probing = std::collections::HashSet::new();
     let mut unresponsive: HashMap<String, tokio::time::Instant> = HashMap::new();
+    let mut watches: HashMap<String, Watch> = HashMap::new();
+    let mut looking = std::collections::HashSet::new();
     let mut deferred: HashMap<String, tokio::time::Instant> = HashMap::new();
     loop {
         let mut reschedule = false;
@@ -809,13 +937,19 @@ pub async fn run(paths: Paths) -> Result<()> {
                         if let Some(id)=connection_ids.remove(&connection)
                             && sessions.get(&id).is_some_and(|(current,_)|*current==connection) {sessions.remove(&id);notices.remove(&id);}
                     }
-                    Some(Input::Recovered {observed,connection,native})=>{
+                    Some(Input::Looked {id,look})=>{
+                        looking.remove(&id);
+                        record_look(&paths,&store,&id,look,&mut watches,config.stall_window_ms())?;
+                    }
+                    Some(Input::Recovered {observed,connection,native,look})=>{
                         let id=&observed.request.id;
                         probing.remove(id);
+                        if let Some(look)=look {record_look(&paths,&store,id,look,&mut watches,config.stall_window_ms())?;}
                         let elapsed=if native==NativeState::Unresponsive {
                             unresponsive.entry(id.clone()).or_insert_with(tokio::time::Instant::now).elapsed()
                         }else {unresponsive.remove(id);Duration::ZERO};
-                        apply_recovery(&paths,&store,&observed,connection,sessions.get(id).map(|(connection,_)|*connection),native,elapsed).await?;
+                        let stall=watches.get(id).and_then(Watch::stalled);
+                        apply_recovery(&paths,&store,&observed,connection,sessions.get(id).map(|(connection,_)|*connection),native,elapsed,stall).await?;
                     }
                     Some(Input::Message {connection,message:Message::Defer,reply})=> {
                         if let Some(id)=connection_ids.get(&connection).filter(|id|sessions.get(*id).is_some_and(|(current,_)|*current==connection))&& let Some(mut job)=store.jobs()?.into_iter().find(|job|&job.request.id==id && job.state=="preparing") {job.state="queued".into();if let FastLane::Checking {queued}=&job.fast {job.request.budget=queued.clone();job.fast=FastLane::Declined;}store.save(&job)?;deferred.insert(id.clone(),tokio::time::Instant::now()+Duration::from_secs(1));notify(&reply,Event::Queued {position:store.jobs()?.iter().filter(|other|other.state=="queued" && other.sequence<=job.sequence).count(),reason:"native server is busy".into()});}
@@ -864,6 +998,13 @@ pub async fn run(paths: Paths) -> Result<()> {
             let mode = monitor.mode();
             settle_receipts(&paths, &store)?;
             let mut jobs = store.jobs()?;
+            let window_ms = config.stall_window_ms();
+            watches.retain(|id, _| {
+                window_ms > 0
+                    && jobs
+                        .iter()
+                        .any(|job| &job.request.id == id && !job.terminal())
+            });
             let previous_budgets: HashMap<_, _> = jobs
                 .iter()
                 .map(|job| (job.sequence, job.request.budget.clone()))
@@ -884,7 +1025,11 @@ pub async fn run(paths: Paths) -> Result<()> {
                 }
                 if !platform::alive(&job.request.owner) {
                     let retiring = job.retiring_server.is_some();
-                    advance_retirement(&store, job)?;
+                    let stalled = watches
+                        .get(&job.request.id)
+                        .and_then(Watch::stalled)
+                        .is_some_and(|stall| stall.orphaned());
+                    advance_retirement(&store, job, stalled)?;
                     if retiring && job.retiring_server.is_none() {
                         unresponsive.remove(&job.request.id);
                     }
@@ -918,12 +1063,17 @@ pub async fn run(paths: Paths) -> Result<()> {
                     }
                     store.save(job)?;
                 }
+                let stalled = watches
+                    .get(&job.request.id)
+                    .and_then(Watch::stalled)
+                    .is_some();
                 if tick % 4 == 0
                     && job.state == "quarantined"
-                    && job
-                        .child
-                        .as_ref()
-                        .is_none_or(|child| !platform::alive(child))
+                    && (stalled
+                        || job
+                            .child
+                            .as_ref()
+                            .is_none_or(|child| !platform::alive(child)))
                     && !probing.contains(&job.request.id)
                 {
                     let id = job.request.id.clone();
@@ -931,7 +1081,11 @@ pub async fn run(paths: Paths) -> Result<()> {
                     let connection = sessions.get(&id).map(|(connection, _)| *connection);
                     probing.insert(id.clone());
                     let sender = tx.clone();
+                    let paths = paths.clone();
                     tokio::spawn(async move {
+                        // Before the probe: its own connection must not count as a client.
+                        let look = (window_ms > 0 && observed.watched())
+                            .then(|| look(&paths, &observed, started.elapsed().as_millis() as u64));
                         let native = tokio::time::timeout(
                             Duration::from_secs(10),
                             observe_native(&observed),
@@ -943,8 +1097,24 @@ pub async fn run(paths: Paths) -> Result<()> {
                                 observed,
                                 connection,
                                 native,
+                                look,
                             })
                             .await;
+                    });
+                } else if tick % LOOK_TICKS == 0
+                    && window_ms > 0
+                    && job.watched()
+                    && !probing.contains(&job.request.id)
+                    && !looking.contains(&job.request.id)
+                {
+                    let id = job.request.id.clone();
+                    looking.insert(id.clone());
+                    let sender = tx.clone();
+                    let paths = paths.clone();
+                    let observed = job.clone();
+                    tokio::spawn(async move {
+                        let look = look(&paths, &observed, started.elapsed().as_millis() as u64);
+                        let _ = sender.send(Input::Looked { id, look }).await;
                     });
                 }
             }
@@ -1080,6 +1250,12 @@ pub async fn run(paths: Paths) -> Result<()> {
             for job in jobs.iter().filter(|job| job.cancel && !job.terminal()) {
                 if let Some((_, reply)) = sessions.get(&job.request.id) {
                     notify(reply, Event::Cancel);
+                }
+            }
+            for job in jobs.iter().filter(|job| job.state == "running") {
+                if let (Some(stall), Some((_, reply))) = (job.stall, sessions.get(&job.request.id))
+                {
+                    notify(reply, Event::Stalled { stall });
                 }
             }
             store.trim()?;
@@ -1274,7 +1450,7 @@ fn handle(
             }
             let mut granted = None;
             let ownership = match &other {
-                Message::Running { child }
+                Message::Running { child, .. }
                 | Message::Preparing { child }
                 | Message::RunPhase { child } => Some(child.clone()),
                 _ => None,
@@ -1319,10 +1495,11 @@ fn handle(
                 Message::Preparing { child } if job.state == "preparing" => {
                     job.child = Some(child);
                 }
-                Message::Running { child }
+                Message::Running { child, progress }
                     if matches!(job.state.as_str(), "starting" | "running") =>
                 {
                     job.child = Some(child);
+                    job.progress = progress;
                     job.state = "running".into();
                 }
                 Message::RunPhase { child }
@@ -1459,6 +1636,7 @@ mod tests {
             None,
             NativeState::Gone,
             Duration::ZERO,
+            None,
         )
         .await
         .unwrap();
@@ -1474,6 +1652,7 @@ mod tests {
             None,
             NativeState::Gone,
             Duration::ZERO,
+            None,
         )
         .await
         .unwrap();
@@ -1492,6 +1671,7 @@ mod tests {
             Some(2),
             NativeState::Idle,
             Duration::ZERO,
+            None,
         )
         .await
         .unwrap();
@@ -1507,6 +1687,7 @@ mod tests {
             None,
             NativeState::Idle,
             Duration::ZERO,
+            None,
         )
         .await
         .unwrap();
@@ -1529,6 +1710,7 @@ mod tests {
             targets_reported: false,
             failures: vec![],
             fast_lane: false,
+            stall: None,
         };
         crate::summary::save(&fixture.paths, &summary).unwrap();
         apply_recovery(
@@ -1539,6 +1721,7 @@ mod tests {
             None,
             NativeState::Idle,
             Duration::ZERO,
+            None,
         )
         .await
         .unwrap();
@@ -1653,6 +1836,7 @@ mod tests {
                     targets_reported: false,
                     failures: vec![],
                     fast_lane: false,
+                    stall: None,
                 },
             )
             .unwrap();

@@ -1,9 +1,11 @@
 use std::{
     env, fs,
     io::{Read, Write},
+    net::{TcpListener, TcpStream},
     os::unix::{ffi::OsStrExt, net::UnixStream},
     path::Path,
-    process,
+    process, thread,
+    time::Duration,
 };
 
 /// Stands in for Bazel: `info` names a server, an up-to-date check exits with the
@@ -18,6 +20,9 @@ fn bazel(state: &Path, arguments: &[String]) {
         writeln!(log, "{line}").unwrap();
     };
     if arguments.iter().any(|arg| arg == "info") {
+        if let Ok(delay) = fs::read_to_string(state.join("info_delay_ms")) {
+            thread::sleep(Duration::from_millis(delay.trim().parse().unwrap()));
+        }
         println!("output_base: {}", state.join("output_base").display());
         println!(
             "server_pid: {}",
@@ -83,6 +88,32 @@ fn main() {
                     .parse()
                     .unwrap(),
             );
+        }
+        Some("server") => {
+            let _worker = (!arguments[1].is_empty()).then(|| {
+                process::Command::new(env::current_exe().unwrap())
+                    .arg("hold")
+                    .arg(&arguments[1])
+                    .spawn()
+                    .unwrap()
+            });
+            loop {
+                thread::park();
+            }
+        }
+        Some("tcp") => {
+            let mut control = UnixStream::connect(&arguments[1]).unwrap();
+            let port: u16 = arguments[2].to_str().unwrap().parse().unwrap();
+            let remote = TcpStream::connect(("::1", port)).unwrap();
+            let listener = TcpListener::bind("[::1]:0").unwrap();
+            control.write_all(b"R").unwrap();
+            control
+                .write_all(&listener.local_addr().unwrap().port().to_be_bytes())
+                .unwrap();
+            let client = listener.accept().unwrap();
+            let mut release = [0; 1];
+            control.read_exact(&mut release).unwrap();
+            drop((remote, client));
         }
         Some("echo") => {
             let mut input = Vec::new();

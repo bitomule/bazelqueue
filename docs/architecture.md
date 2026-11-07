@@ -54,14 +54,61 @@ verifies the current PID/birth identity, private server metadata and discovered
 workspace/output base, and commits the server's retirement intent before any
 signal. Retirement stops that exact server, confirms process-wide suspension,
 and checks its current direct children through native APIs. A server with children
-or uncertain evidence is resumed and keeps its reservation; no descendant is
-ever signalled. Only a verified stopped leaf server may be killed, and its
+or uncertain evidence is resumed and keeps its reservation; no descendant of an
+unresponsive server is signalled. Only a verified stopped leaf server may be killed, and its
 reservation lasts until exit is observed. Restart repeats these checks; a saved
 intent never authorizes an unconditional kill. This uses Bazel's supervised
 process tree; daemons deliberately detached by a target are outside invocation
 tracking. A replacement server is probed
 but never targeted as the old server. Async results are discarded if the job or
 its connection changed while probing. No timeout directly frees capacity.
+
+A deadlocked Bazel server can leave a metered job `running` with nothing moving,
+and once its output base is deleted recovery cannot verify it either. The
+coordinator therefore looks at the server of every watched job: a running job
+whose guardian declared its progress, and any quarantined Bazel job. A look reads
+only typed signals: the size and modification time of the Build Event Protocol
+file and of `command.log`, the server's descendants, the CPU of its process tree,
+and the connections established on the ports it listens on. It never opens a log.
+
+`stall::Watch` is pure and takes each reading with its own monotonic time. Silence
+ends when either file changes or the tree spends more than 5% of one core across
+`stall_minutes`, and a signal that cannot be read restarts it, so elapsed time
+alone proves nothing. The two thresholds come from measurement. A real Bazel 8.4.2
+running a sleeping test left the event file untouched for 170 seconds and used
+1.1% of a core, while `command.log` still advanced every 60 seconds (at most 151
+seconds during loading). The server that deadlocked used at most 2.4% and its
+`command.log` stopped for good. That progress line is what separates a slow test
+from a hung server, so the default window of 10 minutes is four times the longest
+measured gap. Children do not exempt a job, because idle persistent workers and
+tests of a hung server stay children; a test run with Bazel's progress output
+turned off and sleeping for the whole window is the known false positive.
+
+Bazel 9.2.0 writes no `command.log` by default, and a sleeping test there moved
+neither the event file nor anything else for 175 seconds, so that heartbeat does
+not exist. Without it, a job with children and a connected client is never cut:
+only Bazel's own timeouts apply. A job without children still is, once silent and
+flat, which means a long remote action or download that shows no local activity
+can be cut on Bazel 9. Passing `--write_command_log` restores the heartbeat.
+
+A stall on a running job is stored with exit code 124 and sent to the guardian as
+`Event::Stalled`. The guardian cuts its client through the usual interrupt and kill
+sequence, then reports 124 and `TIMEOUT`. Only guardians that declared progress are
+cut this way: older ones do not understand the event, and are judged once they die.
+An exit the guardian already reported stays the result.
+
+A quarantined job leaves when its server is proven stalled, even if the server
+could not be verified over RPC: the PID and birth match the recorded identity,
+the process argv still names the job's workspace and output base, the guardian is
+gone, no other active owner shares the lane, and no client is connected. A live
+client whose guardian died is killed first. A watched job with no recorded server,
+as when its preparation timed out under load, adopts one only when exactly one
+process serves its workspace. Retirement stops the
+server, repeats those checks, stops and kills its descendants through their own
+identities, then kills the server. The reservation lasts until the exit is
+observed. The evidence lives only in the running coordinator: a restart starts the
+silence again, and a stopped server is resumed if progress or a client appears
+before the kill.
 
 Recovery records `finished`, preserving any known exit code or using 125 when
 the result was lost, and a bounded diagnosis visible in status and wait. It does

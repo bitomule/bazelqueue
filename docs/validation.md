@@ -171,6 +171,26 @@ A child-process barrier checks that leaf verification refuses a nonleaf without
 signalling its child. Execution and ablation results are recorded with
 the PR and the committed validation ledger.
 
+Stalled jobs are tested without waiting: readings carry virtual time, so a job
+crosses its window in two reads. E2E tests cover a running job that exits 124 with
+its server killed before the successor starts, a quarantined server with no output
+base, a tree with a live child, a client that lost its guardian, and a slow job
+that is never cut. Real sockets and a real process tree prove the client count and
+the tree kill. A native contract stops a real server, deletes its metadata and
+waits out a real one-minute window on Bazel 8.4.2 and 9.2.0. Measuring also found
+that Bazel 9.2.0 writes no `command.log`, which narrowed the rule for jobs with
+children.
+
+The native contracts first failed under load on both versions. Timing every preflight
+showed why: a cold `bazel info` took 5 to 14 seconds at load 15 to 30, and 20 at load
+50. Each of the two failures in a per-test run had a preflight cut at the 15-second
+limit, which leaves the job unmanaged and without a recorded server. One passing test
+also had a cut preflight, because it does not depend on the first job being managed.
+The limit is now 120 seconds, and the test deadlines that wait for a real server
+outlast it. With those limits committed, all 14 contracts passed on 8.4.2 and on 9.2.0
+at load 8 to 33. Thirteen hand ablations, including the limit itself, each failed
+their test and passed once restored.
+
 The final ordinary `make all` run passed 88 unit tests, 31 process E2E tests,
 17 installation transaction tests and 3 PTY tests. The locked production release
 build and `musts validate` also passed. Two isolated ablations removed orphan

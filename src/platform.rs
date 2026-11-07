@@ -489,21 +489,8 @@ pub fn tree_cpu_seconds(root: &Identity) -> Option<f64> {
             true,
             ProcessRefreshKind::nothing(),
         );
-        let mut pids = std::collections::HashSet::from([Pid::from_u32(root.pid)]);
-        loop {
-            let before = pids.len();
-            for (pid, process) in system.processes() {
-                if process
-                    .parent()
-                    .is_some_and(|parent| pids.contains(&parent))
-                {
-                    pids.insert(*pid);
-                }
-            }
-            if pids.len() == before {
-                break;
-            }
-        }
+        let mut pids = descendant_pids(&system, Pid::from_u32(root.pid));
+        pids.insert(Pid::from_u32(root.pid));
         let mut ticks = 0_u64;
         for pid in pids {
             let mut info: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
@@ -543,6 +530,168 @@ pub fn tree_cpu_seconds(root: &Identity) -> Option<f64> {
     {
         None
     }
+}
+
+fn descendant_pids(system: &System, root: Pid) -> std::collections::HashSet<Pid> {
+    let mut pids = std::collections::HashSet::from([root]);
+    loop {
+        let before = pids.len();
+        for (pid, process) in system.processes() {
+            if process
+                .parent()
+                .is_some_and(|parent| pids.contains(&parent))
+            {
+                pids.insert(*pid);
+            }
+        }
+        if pids.len() == before {
+            pids.remove(&root);
+            return pids;
+        }
+    }
+}
+
+/// Every live process below `root`. None: the root itself is gone.
+pub fn descendants(root: &Identity) -> Option<Vec<Identity>> {
+    if !alive(root) {
+        return None;
+    }
+    let mut system = System::new();
+    system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+    Some(
+        descendant_pids(&system, Pid::from_u32(root.pid))
+            .into_iter()
+            .filter_map(|pid| identity(pid.as_u32()))
+            .collect(),
+    )
+}
+
+/// Stops a stalled tree from the top so nothing forks past the final signals.
+/// The caller has already stopped `root`; each process is signalled through its
+/// own recorded identity, and one that exited first simply stays gone.
+pub fn kill_tree(root: &Identity) -> Result<()> {
+    let mut members = Vec::new();
+    loop {
+        let found = descendants(root).unwrap_or_default();
+        let unseen: Vec<_> = found
+            .into_iter()
+            .filter(|member| !members.contains(member))
+            .collect();
+        if unseen.is_empty() {
+            break;
+        }
+        for member in &unseen {
+            let _ = signal_verified(member, libc::SIGSTOP);
+        }
+        members.extend(unseen);
+    }
+    for member in &members {
+        let _ = signal_verified(member, libc::SIGKILL);
+    }
+    signal_verified(root, libc::SIGKILL)?;
+    Ok(())
+}
+
+/// What a file says about its writer, without opening it.
+pub fn fingerprint(path: &Path) -> Option<crate::stall::Fingerprint> {
+    let metadata = fs::metadata(path).ok()?;
+    Some(crate::stall::Fingerprint {
+        bytes: metadata.len(),
+        modified_seconds: metadata.mtime(),
+        modified_nanos: metadata.mtime_nsec(),
+    })
+}
+
+/// Connections a server holds on the ports it listens on: its command clients.
+/// Connections it opened itself, such as to a remote cache, do not count, and a
+/// server that closed its listener can accept no client. None: unreadable.
+#[cfg(target_os = "macos")]
+pub fn established_clients(server: &Identity) -> Option<u32> {
+    /// `struct socket_fdinfo` of <sys/proc_info.h>, which libc does not declare.
+    #[repr(C, align(8))]
+    struct SocketInfo([u8; 792]);
+    const PROC_PIDFDSOCKETINFO: i32 = 3;
+    const SOCKINFO_TCP: i32 = 2;
+    const TSI_S_LISTEN: i32 = 1;
+    const TSI_S_ESTABLISHED: i32 = 4;
+    const KIND: usize = 256;
+    const LOCAL_PORT: usize = 268;
+    const STATE: usize = 344;
+    let field = |info: &SocketInfo, offset: usize| {
+        i32::from_ne_bytes(info.0[offset..offset + 4].try_into().unwrap())
+    };
+
+    if !alive(server) {
+        return None;
+    }
+    let pid = server.pid as i32;
+    // SAFETY: a null buffer only asks libproc for the size of the list.
+    let bytes =
+        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
+    if bytes <= 0 {
+        return None;
+    }
+    let entry = std::mem::size_of::<libc::proc_fdinfo>();
+    let mut descriptors = vec![
+        libc::proc_fdinfo {
+            proc_fd: 0,
+            proc_fdtype: 0
+        };
+        bytes as usize / entry
+    ];
+    // SAFETY: libproc writes at most the byte count passed, which is the vector's size.
+    let bytes = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDLISTFDS,
+            0,
+            descriptors.as_mut_ptr().cast(),
+            (descriptors.len() * entry) as i32,
+        )
+    };
+    if bytes <= 0 {
+        return None;
+    }
+    descriptors.truncate(bytes as usize / entry);
+    let mut listening = std::collections::HashSet::new();
+    let mut established = Vec::new();
+    for descriptor in descriptors {
+        if descriptor.proc_fdtype as i32 != libc::PROX_FDTYPE_SOCKET {
+            continue;
+        }
+        let mut info = SocketInfo([0; 792]);
+        // SAFETY: libproc writes at most the size passed, which is the buffer's.
+        let read = unsafe {
+            libc::proc_pidfdinfo(
+                pid,
+                descriptor.proc_fd,
+                PROC_PIDFDSOCKETINFO,
+                (&raw mut info).cast(),
+                std::mem::size_of::<SocketInfo>() as i32,
+            )
+        };
+        if read != std::mem::size_of::<SocketInfo>() as i32 || field(&info, KIND) != SOCKINFO_TCP {
+            continue;
+        }
+        match field(&info, STATE) {
+            TSI_S_LISTEN => {
+                listening.insert(field(&info, LOCAL_PORT));
+            }
+            TSI_S_ESTABLISHED => established.push(field(&info, LOCAL_PORT)),
+            _ => {}
+        }
+    }
+    Some(
+        established
+            .iter()
+            .filter(|port| listening.contains(port))
+            .count() as u32,
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn established_clients(_server: &Identity) -> Option<u32> {
+    None
 }
 
 pub fn bazel_servers(workspace: &str) -> Result<Vec<crate::protocol::NativeServer>> {

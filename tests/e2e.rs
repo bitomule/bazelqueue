@@ -5,6 +5,7 @@ use bazelqueue::{
     platform::{self, Identity},
     protocol::{Event, Snapshot},
     resources::Limit,
+    stall::{Fingerprint, Reading},
 };
 use std::{
     cell::RefCell,
@@ -14,12 +15,16 @@ use std::{
     os::unix::{
         ffi::OsStringExt,
         net::{UnixListener, UnixStream},
+        process::ExitStatusExt,
     },
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
 use tempfile::TempDir;
+
+/// A failure bound, never a wait: it outlasts the guardian's 120-second preflight.
+const START_DEADLINE: Duration = Duration::from_secs(150);
 
 struct Harness {
     root: TempDir,
@@ -135,7 +140,7 @@ impl Harness {
         }
     }
     fn wait(&mut self, predicate: impl Fn(&Snapshot) -> bool) -> Snapshot {
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + START_DEADLINE;
         loop {
             if let Some(snapshot) = self.snapshot()
                 && predicate(&snapshot)
@@ -183,7 +188,7 @@ impl Harness {
     }
     fn accepted(listener: &UnixListener) -> UnixStream {
         listener.set_nonblocking(true).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + START_DEADLINE;
         loop {
             match listener.accept() {
                 Ok((mut stream, _)) => {
@@ -1139,6 +1144,21 @@ fn finished_ok(command: &mut Command) -> String {
 }
 
 #[test]
+fn a_server_slower_than_15_seconds_to_answer_keeps_its_job_managed() {
+    let harness = Harness::new(1);
+    fs::write(
+        harness.paths.root.join("resources.json"),
+        r#"{"pressure":1,"total_mib":65536,"available_mib":32768,"swap_in_bytes":0,"swap_out_bytes":0,"swap_used_mib":0,"disk_free_mib":1048576}"#,
+    )
+    .unwrap();
+    let cold = emulated_workspace(&harness, "cold");
+    fs::write(cold.join("info_delay_ms"), "16000").unwrap();
+    finished_ok(&mut emulated_bazel(&harness, "cold", &["build", "//:x"]));
+    let snapshot = harness.snapshot().unwrap();
+    assert_eq!(snapshot.jobs[0].server.as_ref().unwrap().version, "8.4.2");
+}
+
+#[test]
 fn an_up_to_date_build_starts_at_once_while_the_queue_is_full() {
     let mut harness = Harness::new(1);
     fs::write(
@@ -1788,6 +1808,430 @@ fn retirement_leaf_proof_refuses_a_live_child_without_signalling_it() {
         birth: "stale".into(),
     };
     assert!(!platform::signal_verified(&stale, libc::SIGKILL).unwrap());
+}
+
+fn until(condition: impl FnMut() -> bool) {
+    until_within(Duration::from_secs(30), condition);
+}
+fn until_within(limit: Duration, mut condition: impl FnMut() -> bool) {
+    let deadline = Instant::now() + limit;
+    while !condition() {
+        assert!(Instant::now() < deadline, "condition timed out");
+        std::thread::yield_now();
+    }
+}
+
+#[test]
+fn established_clients_counts_the_command_port_and_not_outbound_connections() {
+    let root = tempfile::Builder::new()
+        .prefix("bql-")
+        .tempdir_in("/private/tmp")
+        .unwrap();
+    let listener = UnixListener::bind(root.path().join("tcp.sock")).unwrap();
+    let cache = std::net::TcpListener::bind("[::1]:0").unwrap();
+    let mut server = FakeServer(
+        Command::new(env!("CARGO_BIN_EXE_fixture-backend"))
+            .arg("tcp")
+            .arg(listener.local_addr().unwrap().as_pathname().unwrap())
+            .arg(cache.local_addr().unwrap().port().to_string())
+            .spawn()
+            .unwrap(),
+    );
+    let mut control = Harness::accepted(&listener);
+    let mut port = [0; 2];
+    control.read_exact(&mut port).unwrap();
+    let identity = platform::identity(server.0.id()).unwrap();
+    assert_eq!(platform::established_clients(&identity), Some(0));
+    let client = std::net::TcpStream::connect(("::1", u16::from_be_bytes(port))).unwrap();
+    until(|| platform::established_clients(&identity) == Some(1));
+    drop(client);
+    until(|| platform::established_clients(&identity) == Some(0));
+    control.write_all(b"F").unwrap();
+    assert!(server.0.wait().unwrap().success());
+    assert_eq!(platform::established_clients(&identity), None);
+}
+
+#[test]
+fn killing_a_tree_reaches_every_descendant_through_its_identity() {
+    let root = tempfile::Builder::new()
+        .prefix("bql-")
+        .tempdir_in("/private/tmp")
+        .unwrap();
+    let listener = UnixListener::bind(root.path().join("child.sock")).unwrap();
+    let mut parent = FakeServer(
+        Command::new(env!("CARGO_BIN_EXE_fixture-backend"))
+            .arg("tree-hold")
+            .arg(listener.local_addr().unwrap().as_pathname().unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    let mut child = Harness::accepted(&listener);
+    child
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    let identity = platform::identity(parent.0.id()).unwrap();
+    let members = platform::descendants(&identity).unwrap();
+    assert_eq!(members.len(), 1);
+    platform::signal_verified(&identity, libc::SIGSTOP).unwrap();
+    until(|| matches!(platform::stopped_leaf(&identity), Ok(Some(false))));
+    platform::kill_tree(&identity).unwrap();
+    assert_killed(&mut parent);
+    assert_eq!(child.read(&mut [0]).unwrap(), 0);
+    assert!(!platform::alive(&members[0]));
+    assert_eq!(platform::descendants(&identity), None);
+}
+
+const STALL_WINDOW_MS: u64 = 60_000;
+
+fn silent(at_ms: u64) -> Reading {
+    Reading {
+        at_ms,
+        log: Some(Fingerprint::default()),
+        children: Some(0),
+        cpu_ms: Some(0),
+        clients: Some(0),
+        ..Reading::default()
+    }
+}
+
+/// Hands the coordinator a virtual reading and waits until it has judged it.
+fn look(harness: &Harness, reading: Reading) {
+    platform::atomic_write(
+        &harness.paths.root.join("stall.json"),
+        &serde_json::to_vec(&reading).unwrap(),
+    )
+    .unwrap();
+    let judged = reading.at_ms.to_string();
+    until(|| {
+        fs::read_to_string(harness.paths.root.join("stall-read")).is_ok_and(|at| at == judged)
+    });
+}
+
+/// A process with a Bazel server's argv, recorded by `info` as the job's server.
+struct FakeServer(Child);
+fn assert_killed(server: &mut FakeServer) {
+    let mut status = None;
+    until(|| {
+        status = server.0.try_wait().unwrap();
+        status.is_some()
+    });
+    assert_eq!(status.unwrap().signal(), Some(libc::SIGKILL));
+}
+fn finished(mut client: Child) -> std::process::Output {
+    until(|| client.try_wait().unwrap().is_some());
+    client.wait_with_output().unwrap()
+}
+impl Drop for FakeServer {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+fn stalling_server(harness: &mut Harness, name: &str) -> (FakeServer, PathBuf) {
+    stalling_tree(harness, name, None)
+}
+fn stalling_tree(harness: &mut Harness, name: &str, child: Option<&Path>) -> (FakeServer, PathBuf) {
+    let state = emulated_workspace(harness, name);
+    let workspace = harness.root.path().join(name);
+    let server = Command::new(env!("CARGO_BIN_EXE_fixture-backend"))
+        .arg("server")
+        .arg(child.unwrap_or(Path::new("")))
+        .arg(format!("--workspace_directory={}", workspace.display()))
+        .arg(format!(
+            "--output_base={}",
+            state.join("output_base").display()
+        ))
+        .spawn()
+        .unwrap();
+    fs::write(state.join("server_pid"), server.id().to_string()).unwrap();
+    let mut config = Config::load(&harness.paths).unwrap();
+    config.stall_minutes = (STALL_WINDOW_MS / 60_000) as u32;
+    config.fast_lane_slots = 0;
+    config.save(&harness.paths).unwrap();
+    platform::atomic_write(
+        &harness.paths.root.join("stall.json"),
+        &serde_json::to_vec(&silent(0)).unwrap(),
+    )
+    .unwrap();
+    (FakeServer(server), state)
+}
+
+fn held_build(
+    harness: &mut Harness,
+    name: &str,
+    state: &Path,
+) -> (std::process::Child, UnixStream) {
+    let socket = harness.root.path().join(format!("{name}.sock"));
+    let listener = UnixListener::bind(&socket).unwrap();
+    fs::write(state.join("hold"), socket.to_str().unwrap()).unwrap();
+    let client = emulated_bazel(harness, name, &["build", "//:x"])
+        .spawn()
+        .unwrap();
+    let action = Harness::accepted(&listener);
+    harness.wait(|s| {
+        s.jobs
+            .iter()
+            .any(|job| job.state == "running" && job.server.is_some())
+    });
+    (client, action)
+}
+
+#[test]
+fn a_stalled_job_fails_as_a_timeout_and_its_server_dies_before_the_slot_is_released() {
+    let mut harness = Harness::new(1);
+    let (mut server, state) = stalling_server(&mut harness, "hung");
+    let (client, _action) = held_build(&mut harness, "hung", &state);
+    let next = harness.spawn_hold("next");
+    harness.wait(|s| s.jobs.iter().any(|job| job.state == "queued"));
+    look(&harness, silent(0));
+    look(&harness, silent(STALL_WINDOW_MS));
+
+    let output = finished(client);
+    assert_eq!(output.status.code(), Some(bazelqueue::stall::EXIT_CODE));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("exit=124 TIMEOUT"), "{stderr}");
+    assert_killed(&mut server);
+
+    let mut admitted = Harness::accepted(&next);
+    let done = harness.wait(|s| s.jobs[0].terminal());
+    assert_eq!(done.jobs[0].state, "finished");
+    assert_eq!(done.jobs[0].code, Some(124));
+    assert_eq!(done.jobs[0].stall.unwrap().silent_ms, STALL_WINDOW_MS);
+    let waited = harness
+        .command()
+        .args(["wait", &done.jobs[0].request.id])
+        .output()
+        .unwrap();
+    assert_eq!(waited.status.code(), Some(124));
+    assert!(
+        String::from_utf8(waited.stdout)
+            .unwrap()
+            .contains("exit=124 TIMEOUT")
+    );
+    admitted.write_all(b"F").unwrap();
+}
+
+#[test]
+fn a_slow_job_that_keeps_reporting_is_never_cut() {
+    let mut harness = Harness::new(1);
+    let (_server, state) = stalling_server(&mut harness, "slow");
+    let (client, mut action) = held_build(&mut harness, "slow", &state);
+    for minute in 0..5 {
+        look(
+            &harness,
+            Reading {
+                log: Some(Fingerprint {
+                    bytes: minute,
+                    ..Fingerprint::default()
+                }),
+                ..silent(minute * STALL_WINDOW_MS)
+            },
+        );
+    }
+    let last_output = Some(Fingerprint {
+        bytes: 4,
+        ..Fingerprint::default()
+    });
+    look(
+        &harness,
+        Reading {
+            log: last_output,
+            cpu_ms: Some(STALL_WINDOW_MS),
+            children: Some(1),
+            ..silent(6 * STALL_WINDOW_MS)
+        },
+    );
+    look(
+        &harness,
+        Reading {
+            log: None,
+            cpu_ms: Some(STALL_WINDOW_MS),
+            children: Some(1),
+            clients: Some(1),
+            ..silent(20 * STALL_WINDOW_MS)
+        },
+    );
+    let snapshot = harness.snapshot().unwrap();
+    assert_eq!(snapshot.jobs[0].state, "running");
+    assert_eq!(snapshot.jobs[0].stall, None);
+    action.write_all(b"F").unwrap();
+    assert!(finished(client).status.success());
+    let done = harness.wait(|s| s.jobs[0].terminal());
+    assert_eq!(done.jobs[0].code, Some(0));
+    assert!(platform::alive(
+        &done.jobs[0].server.as_ref().unwrap().identity
+    ));
+}
+
+#[test]
+fn a_quarantined_server_that_cannot_be_verified_leaves_once_proven_stalled() {
+    let mut harness = Harness::new(1);
+    let (mut server, _state) = stalling_server(&mut harness, "orphan");
+    finished_ok(&mut emulated_bazel(&harness, "orphan", &["build", "//:x"]));
+    let mut job = harness.wait(|s| s.jobs[0].terminal()).jobs.remove(0);
+    let identity = job.server.as_ref().unwrap().identity.clone();
+    assert_eq!(identity.pid, server.0.id());
+    fs::remove_file(bazelqueue::summary::location(&harness.paths, &job.request.id).unwrap())
+        .unwrap();
+    job.state = "quarantined".into();
+    job.code = None;
+    job.reason = None;
+    bazelqueue::store::Store::open(&harness.paths)
+        .unwrap()
+        .save(&job)
+        .unwrap();
+    harness.wait(|s| {
+        s.jobs[0]
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("native server could not be verified"))
+    });
+    let next = harness.spawn_hold("next");
+    harness.wait(|s| s.jobs.iter().any(|job| job.state == "queued"));
+
+    look(&harness, silent(0));
+    look(
+        &harness,
+        Reading {
+            clients: Some(1),
+            ..silent(STALL_WINDOW_MS)
+        },
+    );
+    assert!(platform::alive(&identity));
+    look(&harness, silent(2 * STALL_WINDOW_MS));
+
+    assert_killed(&mut server);
+    let mut admitted = Harness::accepted(&next);
+    let done = harness.snapshot().unwrap();
+    assert_eq!(done.jobs[0].state, "finished");
+    assert_eq!(done.jobs[0].code, Some(124));
+    assert!(done.jobs[0].stall.is_some());
+    assert!(
+        done.jobs[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .starts_with("no progress")
+    );
+    admitted.write_all(b"F").unwrap();
+}
+
+#[test]
+fn a_stalled_server_with_children_dies_with_its_whole_tree() {
+    let mut harness = Harness::new(1);
+    let socket = harness.root.path().join("worker.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let (mut server, state) = stalling_tree(&mut harness, "tree", Some(&socket));
+    let mut worker = Harness::accepted(&listener);
+    worker
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    let (client, _action) = held_build(&mut harness, "tree", &state);
+    look(&harness, silent(0));
+    look(
+        &harness,
+        Reading {
+            children: Some(1),
+            ..silent(STALL_WINDOW_MS)
+        },
+    );
+    assert_eq!(finished(client).status.code(), Some(124));
+    assert_killed(&mut server);
+    assert_eq!(worker.read(&mut [0]).unwrap(), 0);
+    assert_eq!(
+        harness.wait(|s| s.jobs[0].terminal()).jobs[0].code,
+        Some(124)
+    );
+}
+
+#[test]
+fn a_stalled_client_that_lost_its_guardian_dies_with_its_server() {
+    let mut harness = Harness::new(1);
+    let (mut server, state) = stalling_server(&mut harness, "lost");
+    let (_client, mut action) = held_build(&mut harness, "lost", &state);
+    let running = harness.snapshot().unwrap().jobs.remove(0);
+    platform::signal_pid(running.request.owner.pid, libc::SIGKILL);
+    harness.wait(|s| s.jobs[0].state == "quarantined");
+    look(
+        &harness,
+        Reading {
+            clients: Some(1),
+            ..silent(0)
+        },
+    );
+    look(
+        &harness,
+        Reading {
+            clients: Some(1),
+            ..silent(STALL_WINDOW_MS)
+        },
+    );
+    action
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    assert_eq!(action.read(&mut [0]).unwrap(), 0);
+    look(&harness, silent(2 * STALL_WINDOW_MS));
+    assert_killed(&mut server);
+    let done = harness.wait(|s| s.jobs[0].terminal());
+    assert_eq!(done.jobs[0].code, Some(124));
+    assert!(!done.jobs[0].holds_capacity());
+}
+
+#[test]
+#[ignore = "requires BAZELQUEUE_TEST_BAZEL; real Bazel in an isolated workspace"]
+fn native_stalled_server_with_a_deleted_output_base_dies_and_frees_its_slot() {
+    let mut harness = Harness::new(1);
+    native_workspace(&harness, "");
+    let mut config = Config::load(&harness.paths).unwrap();
+    config.stall_minutes = 1;
+    config.save(&harness.paths).unwrap();
+    let mut args = native_args(&harness, "build");
+    args.push("//:hello".into());
+    assert!(
+        native_command(&harness, args)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let mut job = harness
+        .wait(|s| {
+            s.jobs
+                .iter()
+                .any(|job| job.terminal() && job.server.is_some())
+        })
+        .jobs
+        .into_iter()
+        .find(|job| job.server.is_some())
+        .unwrap();
+    let server = job.server.as_ref().unwrap().clone();
+    platform::signal_pid(server.identity.pid, libc::SIGSTOP);
+    let _resume = ResumeOnDrop(server.identity.clone());
+    fs::remove_dir_all(Path::new(&server.output_base).join("server")).unwrap();
+    // Bazel 9 writes no command.log unless asked to.
+    let _ = fs::remove_file(Path::new(&server.output_base).join("command.log"));
+    fs::remove_file(bazelqueue::summary::location(&harness.paths, &job.request.id).unwrap())
+        .unwrap();
+    job.state = "quarantined".into();
+    job.code = None;
+    job.reason = None;
+    bazelqueue::store::Store::open(&harness.paths)
+        .unwrap()
+        .save(&job)
+        .unwrap();
+    let successor = harness.spawn_hold("successor");
+    until_within(Duration::from_secs(180), || {
+        harness
+            .snapshot()
+            .is_some_and(|snapshot| snapshot.jobs[0].terminal())
+    });
+    let mut admitted = Harness::accepted(&successor);
+    let recovered = harness.snapshot().unwrap();
+    assert_eq!(recovered.jobs[0].state, "finished");
+    assert_eq!(recovered.jobs[0].code, Some(124), "{:?}", recovered.jobs[0]);
+    assert!(recovered.jobs[0].stall.unwrap().orphaned());
+    assert!(!platform::alive(&server.identity));
+    admitted.write_all(b"F").unwrap();
 }
 
 #[test]
