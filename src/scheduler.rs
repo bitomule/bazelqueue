@@ -546,6 +546,8 @@ mod tests {
             passed: 0,
             progress: None,
             stall: None,
+            queued_at_ms: None,
+            wait: None,
         }
     }
     fn capacity() -> Capacity {

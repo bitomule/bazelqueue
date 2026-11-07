@@ -1246,6 +1246,15 @@ pub async fn run(paths: Paths) -> Result<()> {
                     );
                     notices.insert(job.request.id.clone(), notice);
                 }
+                let wait = protocol::Wait {
+                    position: index + 1,
+                    reason: scheduler::reason(job, &jobs, &capacity).to_owned(),
+                };
+                if job.wait.as_ref() != Some(&wait) {
+                    let mut waiting = (*job).clone();
+                    waiting.wait = Some(wait);
+                    store.save(&waiting)?;
+                }
             }
             for job in jobs.iter().filter(|job| job.cancel && !job.terminal()) {
                 if let Some((_, reply)) = sessions.get(&job.request.id) {
@@ -1390,6 +1399,12 @@ fn handle(
                                 .map_or(0, |job| job.sequence);
                             jobs.into_iter()
                                 .filter(|job| !job.terminal() || job.sequence >= cutoff)
+                                .map(|mut job| {
+                                    if job.state != "queued" {
+                                        job.wait = None;
+                                    }
+                                    job
+                                })
                                 .collect()
                         },
                     },

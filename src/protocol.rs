@@ -181,6 +181,18 @@ pub struct Job {
     pub progress: Option<Progress>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stall: Option<Stall>,
+    /// Unix milliseconds at which the request entered the queue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued_at_ms: Option<u64>,
+    /// Where a queued job stands and what holds it, as the queue last judged it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait: Option<Wait>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Wait {
+    pub position: usize,
+    pub reason: String,
 }
 
 fn is_zero(count: &u32) -> bool {

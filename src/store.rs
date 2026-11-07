@@ -5,7 +5,10 @@ use crate::{
 };
 use anyhow::{Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 pub struct Store {
     connection: Connection,
@@ -62,6 +65,11 @@ impl Store {
             fast: Default::default(),
             progress: None,
             stall: None,
+            queued_at_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .map(|elapsed| elapsed.as_millis() as u64),
+            wait: None,
         };
         self.connection.execute(
             "INSERT INTO jobs(id,data) VALUES(?1,?2)",
