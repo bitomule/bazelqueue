@@ -91,6 +91,8 @@ fn running_it_from_a_subdirectory_targets_the_checkout_root() {
             .contains(&format!("{}/.bazel-output", checkout.root.display()))
     );
     assert!(!nested.join(".bazelrc.local").exists());
+    assert_eq!(checkout.read(".bazelignore"), ".bazel-output\n");
+    assert!(!nested.join(".bazelignore").exists());
 }
 
 #[test]
@@ -143,4 +145,33 @@ fn without_a_shared_cache_dir_only_the_output_base_is_set() {
     let checkout = Checkout::new();
     assert!(checkout.setup().status.success());
     assert!(!checkout.read(".bazelrc.local").contains("disk_cache"));
+}
+
+#[test]
+fn bazelignore_preserves_existing_content_and_excludes_the_output_base_once() {
+    for (existing, expected) in [
+        (None, ".bazel-output\n"),
+        (Some(""), ".bazel-output\n"),
+        (
+            Some("# Keep generated sources out\nvendor\n\n"),
+            "# Keep generated sources out\nvendor\n\n.bazel-output\n",
+        ),
+        (Some("vendor"), "vendor\n.bazel-output\n"),
+        (
+            Some("# .bazel-output\n.bazel-output-old\n"),
+            "# .bazel-output\n.bazel-output-old\n.bazel-output\n",
+        ),
+        (Some("vendor\n.bazel-output\n"), "vendor\n.bazel-output\n"),
+        (Some("vendor\n.bazel-output"), "vendor\n.bazel-output"),
+    ] {
+        let checkout = Checkout::new();
+        if let Some(existing) = existing {
+            fs::write(checkout.root.join(".bazelignore"), existing).unwrap();
+        }
+        for _ in 0..2 {
+            let output = checkout.setup();
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(checkout.read(".bazelignore"), expected, "{existing:?}");
+        }
+    }
 }
