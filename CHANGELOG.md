@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.13](https://github.com/bitomule/bazelqueue/compare/v0.1.12...v0.1.13) - 2026-11-07
+
+### Added
+
+- pick the output base disk before each build and judge free space where builds write ([#37](https://github.com/bitomule/bazelqueue/pull/37))
+- show each queued job's position, reason and entry time in status --json ([#33](https://github.com/bitomule/bazelqueue/pull/33))
+- point every worktree at the shared Bazel caches and cap the disk cache ([#35](https://github.com/bitomule/bazelqueue/pull/35))
+- let a build carry a priority so urgent ones go first in the queue ([#32](https://github.com/bitomule/bazelqueue/pull/32))
+- give each worktree its own Bazel output base ([#30](https://github.com/bitomule/bazelqueue/pull/30))
+
+### Fixed
+
+- keep the queue moving when swap holds the disk under the safety margin ([#38](https://github.com/bitomule/bazelqueue/pull/38))
+
+### Internal
+
+- document migrating existing checkouts and stopping the server before deleting a worktree ([#36](https://github.com/bitomule/bazelqueue/pull/36))
+- pin per-worktree lanes and disk measurement, document the cost ([#34](https://github.com/bitomule/bazelqueue/pull/34))
+
 ## [0.1.12](https://github.com/bitomule/bazelqueue/compare/v0.1.11...v0.1.12) - 2026-11-07
 
 ### Added
