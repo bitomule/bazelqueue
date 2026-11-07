@@ -157,6 +157,14 @@ or swapping. The kernel returns fewer host_statistics64 fields than current
 headers declare, so the sampler requires only those it reads. Disk space comes
 from statvfs on the state directory and each live job's lane, keeping the lowest.
 
+With the output base inside each worktree, the lane of a job is that worktree's own
+`.bazel-output`, so the lowest free space is the lowest across the volumes the live worktrees
+sit on, with no Bazel-specific code. Admission needs nothing else to support this: N building
+worktrees mean N servers and N independent lanes, each ordered by its own server lock, each
+with its own LaneMemory peak, and idle servers leave by Bazel's `max_idle_secs`. The e2e
+`each_worktree_output_base_is_its_own_lane` and the unit test
+`disk_is_measured_on_the_lane_of_every_job_still_in_play` pin both behaviours.
+
 Swapping means swap-out or occupancy growth above swap_thrashing_mib_per_min across
 a 60-second window, so pauses between bursts are not recovery and a burst
 right after start is not a sustained rate. Swap-in alone and
