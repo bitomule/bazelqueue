@@ -1246,9 +1246,11 @@ pub async fn run(paths: Paths) -> Result<()> {
                     );
                     notices.insert(job.request.id.clone(), notice);
                 }
+                let (kind, reason) = scheduler::waiting(job, &jobs, &capacity);
                 let wait = protocol::Wait {
                     position: index + 1,
-                    reason: scheduler::reason(job, &jobs, &capacity).to_owned(),
+                    kind,
+                    reason: reason.to_owned(),
                 };
                 if job.wait.as_ref() != Some(&wait) {
                     let mut waiting = (*job).clone();

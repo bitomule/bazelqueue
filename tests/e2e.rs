@@ -515,6 +515,8 @@ fn status_json_tells_each_queued_job_its_position_reason_and_entry_time() {
     assert_eq!(queued.len(), 2);
     for (index, job) in queued.iter().enumerate() {
         assert_eq!(job["wait"]["position"], index + 1);
+        assert_eq!(job["wait"]["kind"], "waiting_for_memory");
+        assert_eq!(job["wait"]["reason"], "waiting for free memory");
         assert!(!job["wait"]["reason"].as_str().unwrap().is_empty());
         assert!(job["queued_at_ms"].as_u64().unwrap() >= before);
     }

@@ -189,9 +189,24 @@ pub struct Job {
     pub wait: Option<Wait>,
 }
 
+/// What holds a queued job, for programs; `Wait::reason` is the same fact for people.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitKind {
+    Draining,
+    Maintenance,
+    LegacyDraining,
+    MemoryHeld,
+    ReducedAdmission,
+    WorkspaceBusy,
+    WaitingForMemory,
+    Capacity,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Wait {
     pub position: usize,
+    pub kind: WaitKind,
     pub reason: String,
 }
 

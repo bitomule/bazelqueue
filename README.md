@@ -167,8 +167,10 @@ bazelqueue status --json     # Inspect it from a script or agent
 `status` also shows the ten most recent failed requests, with their exit code
 and reason. `status --json` includes those details in the retained job records.
 Each queued job there also carries `queued_at_ms` (Unix milliseconds when it
-entered the queue) and `wait` with its `position` and the `reason` it is held;
-both fields are additive.
+entered the queue) and `wait` with its `position`, a typed `kind` and the
+`reason` text for people. `kind` is one of `draining`, `maintenance`,
+`legacy_draining`, `memory_held`, `reduced_admission`, `workspace_busy`,
+`waiting_for_memory` or `capacity`. All of these fields are additive.
 Recovered requests with no known result end with exit 125; `bazelqueue wait ID`
 reports that failure even if the guardian could not save a summary. Explicit
 disk-full evidence is shown as such; an environmental exit code alone is not
