@@ -773,7 +773,10 @@ pub fn legacy_invocations_for(shims: &[std::path::PathBuf]) -> Result<Vec<Identi
             continue;
         };
         if process.cmd().is_empty() {
-            bail!("legacy invocation arguments unavailable");
+            if still_running(&owner) {
+                bail!("legacy invocation arguments unavailable");
+            }
+            continue;
         }
         if let Some(script) = shell_script(process.cmd(), process.cwd())?
             && shims.contains(&script)
@@ -783,6 +786,10 @@ pub fn legacy_invocations_for(shims: &[std::path::PathBuf]) -> Result<Vec<Identi
         }
     }
     Ok(owners)
+}
+
+fn still_running(owner: &Identity) -> bool {
+    identity(owner.pid).is_some_and(|current| current == *owner)
 }
 
 fn shell_script(
@@ -1177,5 +1184,29 @@ mod cpu_tests {
             (expected * 0.5..expected * 4.0).contains(&used),
             "{used} for {expected}"
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod vanished_process_tests {
+    use super::*;
+    use std::process::Command;
+
+    #[test]
+    fn a_process_that_exited_after_listing_is_not_treated_as_unreadable() {
+        let mut child = Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
+        let owner = identity(child.id()).unwrap();
+        assert!(still_running(&owner));
+        child.wait().unwrap();
+        assert!(!still_running(&owner));
+    }
+
+    #[test]
+    fn a_reused_pid_is_not_the_process_that_was_listed() {
+        let listed = Identity {
+            pid: std::process::id(),
+            birth: "earlier".into(),
+        };
+        assert!(!still_running(&listed));
     }
 }

@@ -1407,7 +1407,7 @@ fn handle(
                         utilization: usage.visible_hours(
                             SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64,
                         ),
-                        legacy: legacy_owners(store, config)?,
+                        legacy: legacy_owners(store, config).unwrap_or_default(),
                         jobs: {
                             let jobs = store.jobs()?;
                             let cutoff = jobs
