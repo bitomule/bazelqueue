@@ -553,6 +553,54 @@ fn stdout_stdin_and_non_utf8_arguments_are_preserved() {
 }
 
 #[test]
+fn status_json_tells_each_queued_job_its_position_reason_and_entry_time() {
+    let mut harness = Harness::new(1);
+    let first = harness.spawn_hold("first");
+    let mut running = Harness::accepted(&first);
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let second = harness.spawn_hold("second");
+    harness.wait(|s| s.jobs.iter().filter(|job| job.state == "queued").count() == 1);
+    let third = harness.spawn_hold("third");
+    harness.wait(|s| {
+        s.jobs
+            .iter()
+            .filter(|job| job.state == "queued")
+            .all(|job| job.wait.is_some())
+            && s.jobs.iter().filter(|job| job.state == "queued").count() == 2
+    });
+    let output = harness
+        .command()
+        .args(["status", "--json"])
+        .output()
+        .unwrap();
+    let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let jobs = status["jobs"].as_array().unwrap();
+    let running_job = jobs.iter().find(|job| job["state"] == "running").unwrap();
+    assert!(running_job.get("wait").is_none());
+    let queued: Vec<_> = jobs.iter().filter(|job| job["state"] == "queued").collect();
+    assert_eq!(queued.len(), 2);
+    for (index, job) in queued.iter().enumerate() {
+        assert_eq!(job["wait"]["position"], index + 1);
+        assert_eq!(job["wait"]["kind"], "waiting_for_memory");
+        assert_eq!(job["wait"]["reason"], "waiting for free memory");
+        assert!(!job["wait"]["reason"].as_str().unwrap().is_empty());
+        assert!(job["queued_at_ms"].as_u64().unwrap() >= before);
+    }
+    assert!(queued[0]["queued_at_ms"].as_u64() <= queued[1]["queued_at_ms"].as_u64());
+    for field in ["sequence", "request", "state", "cancel"] {
+        assert!(queued[0].get(field).is_some(), "{field} must stay");
+    }
+    running.write_all(b"F").unwrap();
+    let mut next = Harness::accepted(&second);
+    next.write_all(b"F").unwrap();
+    let mut last = Harness::accepted(&third);
+    last.write_all(b"F").unwrap();
+}
+
+#[test]
 fn cpu_overload_keeps_the_queue_moving_at_half_size() {
     let mut harness = Harness::new(2);
     let sensor = harness.paths.root.join("resources.json");

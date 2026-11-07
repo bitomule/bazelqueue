@@ -230,6 +230,33 @@ pub struct Job {
     pub progress: Option<Progress>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stall: Option<Stall>,
+    /// Unix milliseconds at which the request entered the queue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued_at_ms: Option<u64>,
+    /// Where a queued job stands and what holds it, as the queue last judged it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait: Option<Wait>,
+}
+
+/// What holds a queued job, for programs; `Wait::reason` is the same fact for people.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitKind {
+    Draining,
+    Maintenance,
+    LegacyDraining,
+    MemoryHeld,
+    ReducedAdmission,
+    WorkspaceBusy,
+    WaitingForMemory,
+    Capacity,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Wait {
+    pub position: usize,
+    pub kind: WaitKind,
+    pub reason: String,
 }
 
 fn is_zero(count: &u32) -> bool {

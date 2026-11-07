@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 use crate::{
     config::Config,
-    protocol::{Admission, Budget, FastLane, Job, Request},
+    protocol::{Admission, Budget, FastLane, Job, Request, WaitKind},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -488,32 +488,48 @@ pub fn fast_lane(jobs: &[Job], config: &Config, capacity: &Capacity) -> Vec<u64>
 }
 
 pub fn reason<'a>(job: &Job, jobs: &[Job], capacity: &'a Capacity) -> &'a str {
+    waiting(job, jobs, capacity).1
+}
+
+pub fn waiting<'a>(job: &Job, jobs: &[Job], capacity: &'a Capacity) -> (WaitKind, &'a str) {
     if capacity.drained {
-        "queue is draining"
+        (WaitKind::Draining, "queue is draining")
     } else if job.request.admission() == Admission::Maintenance {
-        "workspace is busy"
+        (WaitKind::Maintenance, "workspace is busy")
     } else if capacity.legacy_active {
-        "legacy Bazel invocations are draining"
+        (
+            WaitKind::LegacyDraining,
+            "legacy Bazel invocations are draining",
+        )
     } else if capacity.pressure == Pressure::Held {
-        capacity
-            .reason
-            .as_deref()
-            .unwrap_or("memory sample unavailable")
+        (
+            WaitKind::MemoryHeld,
+            capacity
+                .reason
+                .as_deref()
+                .unwrap_or("memory sample unavailable"),
+        )
     } else if jobs
         .iter()
         .any(|other| other.holds_capacity() && other.request.lane == job.request.lane)
     {
-        "workspace is busy"
+        (WaitKind::WorkspaceBusy, "workspace is busy")
     } else if matches!(
         capacity.pressure,
         Pressure::Constrained | Pressure::Overloaded
     ) && jobs.iter().any(|other| other.holds_metered_capacity())
     {
-        capacity.reason.as_deref().unwrap_or("reduced admission")
+        (
+            WaitKind::ReducedAdmission,
+            capacity.reason.as_deref().unwrap_or("reduced admission"),
+        )
     } else if capacity.fresh_mib(job) > capacity.new_memory_mib {
-        "waiting for free memory"
+        (WaitKind::WaitingForMemory, "waiting for free memory")
     } else {
-        capacity.reason.as_deref().unwrap_or("resource capacity")
+        (
+            WaitKind::Capacity,
+            capacity.reason.as_deref().unwrap_or("resource capacity"),
+        )
     }
 }
 
@@ -561,6 +577,8 @@ mod tests {
             passed: 0,
             progress: None,
             stall: None,
+            queued_at_ms: None,
+            wait: None,
         }
     }
     fn capacity() -> Capacity {

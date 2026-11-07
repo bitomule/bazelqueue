@@ -1234,10 +1234,9 @@ pub async fn run(paths: Paths) -> Result<()> {
             }
             let waiting: Vec<_> = jobs.iter().filter(|job| job.state == "queued").collect();
             for job in waiting.iter() {
-                let notice = (
-                    scheduler::queue_position(&jobs, job),
-                    scheduler::reason(job, &jobs, &capacity).to_owned(),
-                );
+                let position = scheduler::queue_position(&jobs, job);
+                let (kind, reason) = scheduler::waiting(job, &jobs, &capacity);
+                let notice = (position, reason.to_owned());
                 if notices.get(&job.request.id) != Some(&notice)
                     && let Some((_, reply)) = sessions.get(&job.request.id)
                 {
@@ -1249,6 +1248,16 @@ pub async fn run(paths: Paths) -> Result<()> {
                         },
                     );
                     notices.insert(job.request.id.clone(), notice);
+                }
+                let wait = protocol::Wait {
+                    position,
+                    kind,
+                    reason: reason.to_owned(),
+                };
+                if job.wait.as_ref() != Some(&wait) {
+                    let mut waiting = (*job).clone();
+                    waiting.wait = Some(wait);
+                    store.save(&waiting)?;
                 }
             }
             for job in jobs.iter().filter(|job| job.cancel && !job.terminal()) {
@@ -1394,6 +1403,12 @@ fn handle(
                                 .map_or(0, |job| job.sequence);
                             jobs.into_iter()
                                 .filter(|job| !job.terminal() || job.sequence >= cutoff)
+                                .map(|mut job| {
+                                    if job.state != "queued" {
+                                        job.wait = None;
+                                    }
+                                    job
+                                })
                                 .collect()
                         },
                     },
