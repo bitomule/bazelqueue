@@ -23,6 +23,9 @@ use std::{
 };
 use tempfile::TempDir;
 
+/// A failure bound, never a wait: it outlasts the guardian's 120-second preflight.
+const START_DEADLINE: Duration = Duration::from_secs(150);
+
 struct Harness {
     root: TempDir,
     paths: Paths,
@@ -137,7 +140,7 @@ impl Harness {
         }
     }
     fn wait(&mut self, predicate: impl Fn(&Snapshot) -> bool) -> Snapshot {
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + START_DEADLINE;
         loop {
             if let Some(snapshot) = self.snapshot()
                 && predicate(&snapshot)
@@ -185,7 +188,7 @@ impl Harness {
     }
     fn accepted(listener: &UnixListener) -> UnixStream {
         listener.set_nonblocking(true).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + START_DEADLINE;
         loop {
             match listener.accept() {
                 Ok((mut stream, _)) => {
@@ -1138,6 +1141,21 @@ fn finished_ok(command: &mut Command) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(output.status.success(), "{stderr}");
     stderr
+}
+
+#[test]
+fn a_server_slower_than_15_seconds_to_answer_keeps_its_job_managed() {
+    let harness = Harness::new(1);
+    fs::write(
+        harness.paths.root.join("resources.json"),
+        r#"{"pressure":1,"total_mib":65536,"available_mib":32768,"swap_in_bytes":0,"swap_out_bytes":0,"swap_used_mib":0,"disk_free_mib":1048576}"#,
+    )
+    .unwrap();
+    let cold = emulated_workspace(&harness, "cold");
+    fs::write(cold.join("info_delay_ms"), "16000").unwrap();
+    finished_ok(&mut emulated_bazel(&harness, "cold", &["build", "//:x"]));
+    let snapshot = harness.snapshot().unwrap();
+    assert_eq!(snapshot.jobs[0].server.as_ref().unwrap().version, "8.4.2");
 }
 
 #[test]

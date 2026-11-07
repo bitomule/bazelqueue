@@ -4,7 +4,8 @@ use std::{
     net::{TcpListener, TcpStream},
     os::unix::{ffi::OsStrExt, net::UnixStream},
     path::Path,
-    process,
+    process, thread,
+    time::Duration,
 };
 
 /// Stands in for Bazel: `info` names a server, an up-to-date check exits with the
@@ -19,6 +20,9 @@ fn bazel(state: &Path, arguments: &[String]) {
         writeln!(log, "{line}").unwrap();
     };
     if arguments.iter().any(|arg| arg == "info") {
+        if let Ok(delay) = fs::read_to_string(state.join("info_delay_ms")) {
+            thread::sleep(Duration::from_millis(delay.trim().parse().unwrap()));
+        }
         println!("output_base: {}", state.join("output_base").display());
         println!(
             "server_pid: {}",
@@ -94,7 +98,7 @@ fn main() {
                     .unwrap()
             });
             loop {
-                std::thread::park();
+                thread::park();
             }
         }
         Some("tcp") => {

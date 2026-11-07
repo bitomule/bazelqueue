@@ -323,7 +323,7 @@ async fn probe(
         stdout.read_to_end(&mut bytes).await?;
         Ok::<_, std::io::Error>(bytes)
     };
-    let result = timeout(Duration::from_secs(15), output).await;
+    let result = timeout(PREFLIGHT_TIMEOUT, output).await;
     if result.is_err() {
         let _ = platform::signal_group(identity.pid, libc::SIGINT);
         if timeout(Duration::from_secs(5), child.wait()).await.is_err() {
@@ -356,6 +356,9 @@ async fn probe(
     )))
 }
 
+/// A cold server took over 15 seconds at load 30 and 20 at load 50. A preflight cut
+/// sooner leaves its job unmanaged: no typed summary, and no server to recover.
+const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(120);
 const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Asks Bazel, under the fast-lane reservation, whether the invocation would
