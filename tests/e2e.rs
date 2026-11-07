@@ -479,22 +479,57 @@ fn stdout_stdin_and_non_utf8_arguments_are_preserved() {
 }
 
 #[test]
-fn critical_memory_pressure_blocks_and_recovery_resumes_the_queue() {
-    let mut harness = Harness::new(1);
-    fs::write(harness.paths.root.join("pressure"), "4").unwrap();
-    harness.wait(|s| s.pressure == "critical" && s.held);
-    let listener = harness.spawn_hold("a");
-    harness.wait(|s| s.jobs.iter().any(|job| job.state == "queued"));
-    fs::write(harness.paths.root.join("pressure"), "1").unwrap();
-    let mut running = Harness::accepted(&listener);
+fn cpu_overload_keeps_the_queue_moving_at_half_size() {
+    let mut harness = Harness::new(2);
+    let sensor = harness.paths.root.join("resources.json");
+    let write = |load: f64, at_ms: u64| {
+        let sample = serde_json::json!({"at_ms":at_ms,"pressure":1,"total_mib":18432,"available_mib":12000,"swap_in_bytes":0,"swap_out_bytes":0,"swap_used_mib":0,"disk_free_mib":1048576,"load_per_cpu":load});
+        platform::atomic_write(&sensor, &serde_json::to_vec(&sample).unwrap()).unwrap()
+    };
+    let limit = |s: &Snapshot| s.resources.as_ref().and_then(|r| r.limit);
+    write(5.0, 100_000);
+    harness.wait(|s| {
+        s.resources
+            .as_ref()
+            .is_some_and(|r| r.sample.load_per_cpu == Some(5.0))
+    });
+    write(5.0, 101_000);
+    harness.wait(|s| {
+        limit(s) == Some(Limit::CpuOverload)
+            && !s.held
+            && s.constrained.as_ref().is_some_and(|budget| budget.cpu == 4)
+    });
+    let first = harness.spawn_hold("first");
+    let mut running = Harness::accepted(&first);
+    let second = harness.spawn_hold("second");
+    let before = harness.wait(|s| s.jobs.iter().any(|job| job.state == "queued"));
+    let granted = before.jobs.iter().find(|job| job.state == "running");
+    assert_eq!(granted.unwrap().request.budget.cpu, 4);
+    assert!(second.accept().is_err());
+    write(2.0, 102_000);
+    let mut parallel = Harness::accepted(&second);
     running.write_all(b"F").unwrap();
+    parallel.write_all(b"F").unwrap();
 }
 
 #[test]
-fn warning_reduces_new_work_and_normal_recovers_without_changing_a_grant() {
+fn warning_alone_lets_builds_run_side_by_side() {
     let mut harness = Harness::new(2);
     fs::write(harness.paths.root.join("pressure"), "2").unwrap();
-    harness.wait(|s| s.pressure == "warning" && s.constrained.is_some());
+    harness.wait(|s| s.pressure == "warning" && !s.held && s.constrained.is_none());
+    let first = harness.spawn_hold("first");
+    let second = harness.spawn_hold("second");
+    let mut running = Harness::accepted(&first);
+    let mut parallel = Harness::accepted(&second);
+    running.write_all(b"F").unwrap();
+    parallel.write_all(b"F").unwrap();
+}
+
+#[test]
+fn critical_pressure_reduces_new_work_and_normal_recovers_without_changing_a_grant() {
+    let mut harness = Harness::new(2);
+    fs::write(harness.paths.root.join("pressure"), "4").unwrap();
+    harness.wait(|s| s.pressure == "critical" && s.constrained.is_some());
     let first = harness.spawn_hold("first");
     let mut running = Harness::accepted(&first);
     let second = harness.spawn_hold("second");
@@ -524,7 +559,7 @@ fn warning_reduces_new_work_and_normal_recovers_without_changing_a_grant() {
 }
 
 #[test]
-fn growing_swap_holds_a_build_until_it_stops_while_warning_persists() {
+fn growing_swap_lets_one_reduced_build_start_and_keeps_the_next_waiting() {
     let mut harness = Harness::new(2);
     let sensor = harness.paths.root.join("resources.json");
     let sample = |used: u64, at_ms: u64| serde_json::json!({"at_ms":at_ms,"pressure":2,"total_mib":18432,"available_mib":6819,"swap_in_bytes":0,"swap_out_bytes":0,"swap_used_mib":used,"disk_free_mib":1048576});
@@ -534,18 +569,21 @@ fn growing_swap_holds_a_build_until_it_stops_while_warning_persists() {
     write(0, 100_000);
     harness.wait(|s| s.pressure == "warning");
     write(0, 101_000);
-    harness.wait(|s| s.pressure == "warning" && s.constrained.is_some());
-    write(1024, 102_000);
     let limit = |s: &Snapshot| s.resources.as_ref().and_then(|r| r.limit);
-    harness.wait(|s| limit(s) == Some(Limit::Swapping) && s.held);
-    let listener = harness.spawn_hold("waits");
+    harness.wait(|s| s.pressure == "warning" && limit(s).is_none());
+    write(1024, 102_000);
+    harness.wait(|s| limit(s) == Some(Limit::Swapping) && !s.held && s.constrained.is_some());
+    let first = harness.spawn_hold("first");
+    let mut running = Harness::accepted(&first);
+    let waits = harness.spawn_hold("waits");
     harness.wait(|s| s.jobs.iter().any(|job| job.state == "queued"));
-    assert!(listener.accept().is_err());
-    // Virtual time moves only once the hold has been observed.
+    assert!(waits.accept().is_err());
+    // Virtual time moves only once the wait has been observed.
     write(1024, 162_000);
-    let mut running = Harness::accepted(&listener);
-    harness.wait(|s| limit(s) == Some(Limit::PressureWarning) && !s.held);
+    let mut parallel = Harness::accepted(&waits);
+    harness.wait(|s| limit(s).is_none());
     running.write_all(b"F").unwrap();
+    parallel.write_all(b"F").unwrap();
 }
 
 #[test]

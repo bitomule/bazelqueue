@@ -164,6 +164,13 @@ pub struct Job {
     pub retiring_server: Option<Identity>,
     #[serde(default, skip_serializing_if = "FastLane::is_unchecked")]
     pub fast: FastLane,
+    /// How many later jobs started ahead of this one while it did not fit.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub passed: u32,
+}
+
+fn is_zero(count: &u32) -> bool {
+    *count == 0
 }
 
 /// A fast-lane request is checked once, in a slot outside the build capacity.

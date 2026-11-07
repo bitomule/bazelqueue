@@ -80,14 +80,22 @@ a run without its own history takes the median of its repository and command. Es
 bounded by summed CPU and memory rather than `max_builds`. Large estimates share
 the remaining machine with other waiting lanes; a lone invocation can use the
 wide profile. CPU division assigns the remainder rather than losing a core.
-Admission stays first come first served among available lanes.
+Admission goes first come first served among available lanes, and a job that does
+not fit does not stop the ones behind it: those that fit start, and `Job::passed`
+counts them. After four passes nothing starts ahead of that job until it does, so
+large and opaque work cannot starve. Durations are too unreliable to reserve its
+start as EASY backfilling does, so the bound is a count. A job whose workspace is
+busy neither blocks nor counts. `waiting_order` is the one place that orders the queue.
 Reservations stay immutable while executing. Profiles can broaden only before
 execution; lowering settings drains active work. Monitor reports one typed
-`Limit`; the display reason derives from it and no decision reads text. Warning
-pressure admits at most one managed build with the configured reduced budget,
-subject to memory headroom, and opaque work waits. Swapping, critical pressure,
-low disk, CPU overload and any memory, swap or disk sensor without data hold
-new metered admission. The next safe sample restores normal admission.
+`Limit`; the display reason derives from it and no decision reads text. A limit
+that waiting cannot clear must not stop the queue. CPU overload admits new work
+while the reservations stay below half the capacity, each with at least
+`worker_instances` CPUs. Swapping and critical pressure admit one managed build
+with the reduced budget, only with no metered job holding capacity, and opaque work
+waits. Low disk and any memory, swap or disk sensor without data hold new metered
+admission, and rank above the others. Warning alone is no limit. The next safe
+sample restores normal admission.
 
 Native samples arrive each second: macOS pressure from sysctl, memory and swap
 counters from host_statistics64, swap occupancy from vm.swapusage, and CPU gauges.
@@ -123,9 +131,9 @@ is raised to that peak plus a quarter, at least the fast-lane budget within its
 max_builds share, capped by what admission could grant. A start takes from
 headroom only what its live server has not already taken. A build that does not
 fit real headroom waits. Only with no metered job holding
-capacity and admission not held may the first queued build exceed headroom, also
-under warning: free memory is cautious, since macOS can still compress, and the
-swap signal stops anything after it. Sampling and process-tree inspection stay outside the deterministic
+capacity and admission not held may the first queued build exceed headroom: free
+memory is cautious, since macOS can still compress, and the swap signal stops
+anything after it. Sampling and process-tree inspection stay outside the deterministic
 scheduler; tests inject resources, residency and time.
 When availability is reused, its original residency snapshot is reused too.
 Unused small-job shares are redistributed to larger waiting jobs before grants.

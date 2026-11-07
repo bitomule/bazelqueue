@@ -48,9 +48,32 @@ are pages, and recovering pages is not a reason to hold. Available memory follow
 [XNU definition](https://cs.iossec.tech/xnu/latest/source/doc/vm/memorystatus_notify.md),
 which counts active pages as available because they can be compressed.
 
-The warning experiment below still stands: reduced admission costs speed. Warning
-now accepts that cost, because full admission under warning is what preceded the
-swap growth above.
+The warning experiment below still stands: reduced admission costs speed. The
+measured signals above replace warning as the protection against that swap growth.
+
+## Queue stopped by CPU overload, 6 November 2026
+
+Same host and day, v0.1.11, 11 logical CPUs, 6 CPU / 8192 MiB of capacity. From
+`queue.sqlite3`, run summaries and the notices agents received:
+
+| Finding | Evidence |
+|---|---|
+| Warning limited nothing in that version | `status` read "pressure warning" with "full admission"; one task saw the hold with normal pressure and 7557 MiB available |
+| CPU overload held all new work | Above 4 per CPU (load 44) until below 3 (load 33): notices read "CPU overload", and builds started in bursts at 19:14, 20:03 and 21:57 |
+| The queue sat empty with jobs waiting | No build ran from 20:25 to 21:34 with about 20 waiting; 10 jobs started between 19:12 and 21:34 |
+| Waiting could not clear it | From 20:00 to 22:00 the queue reserved 13-17 % of its CPU and the host stayed at 99 % |
+| The cost fell on short work | One job waited 91 minutes to run for 20 seconds, another 142 minutes |
+
+What produced that load was not measured. A hold only helps against load the queue
+causes, so CPU overload now halves new work instead of stopping it. Replaying those
+23 jobs under that load, with the durations they really ran, the queue is never empty
+while jobs wait and all 23 finish inside the 142 minutes in which 10 did.
+
+Swap got the same treatment. Alondra logged 120 swap-out readings between 19:00 and
+22:00, all above the 64 MiB/min threshold (lowest 72, hourly medians 238-308). It logs
+them only while it holds nodes, so the sample is biased, but a full hold would have
+stopped the queue at each of them. One reduced build with nothing else of ours running
+keeps it moving; low disk still stops it, because that one a build can make worse.
 
 ## Before-change ABBA measurement, 30 October 2026
 

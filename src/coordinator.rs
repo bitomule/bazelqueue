@@ -1030,7 +1030,9 @@ pub async fn run(paths: Paths) -> Result<()> {
                 store.save(job)?;
             }
             let candidates: Vec<_> = jobs.iter().filter(connected).cloned().collect();
-            for sequence in scheduler::eligible(&candidates, &config, &capacity) {
+            let grants = scheduler::grants(&candidates, &config, &capacity);
+            record_passes(&store, &mut jobs, &grants.overtaken)?;
+            for sequence in grants.chosen {
                 let job = jobs
                     .iter_mut()
                     .find(|job| job.sequence == sequence)
@@ -1189,8 +1191,11 @@ fn handle(
                             .memory_pressure()
                             .map_or("unavailable", |level| level.name())
                             .into(),
-                        constrained: (monitor.mode() == Pressure::Constrained)
-                            .then(|| config.constrained_budget()),
+                        constrained: matches!(
+                            monitor.mode(),
+                            Pressure::Constrained | Pressure::Overloaded
+                        )
+                        .then(|| scheduler::admission_budget(config, monitor.mode())),
                         held: monitor.mode() == Pressure::Held,
                         cpu_capacity: config.cpu_capacity,
                         memory_capacity_mib: config.memory_capacity_mib,
@@ -1291,7 +1296,7 @@ fn handle(
                     job.request.lane = lane;
                     job.request.prepared = true;
                     job.server = server;
-                    let admitting = monitor.mode() != Pressure::Held
+                    let admitting = monitor.mode() == Pressure::Normal
                         && !store.drained()?
                         && legacy_owners(store, config)?.is_empty();
                     match (&job.fast, up_to_date) {
@@ -1352,6 +1357,18 @@ fn handle(
                 notify(reply, Event::Grant { budget });
             }
         }
+    }
+    Ok(())
+}
+
+fn record_passes(store: &Store, jobs: &mut [Job], overtaken: &[u64]) -> Result<()> {
+    for sequence in overtaken {
+        let job = jobs
+            .iter_mut()
+            .find(|job| job.sequence == *sequence)
+            .expect("scheduler returned an existing sequence");
+        job.passed += 1;
+        store.save(job)?;
     }
     Ok(())
 }
@@ -1845,6 +1862,16 @@ mod tests {
             assert!(job.request.prepared);
             assert_eq!(job.request.budget.cpu, 4);
         }
+    }
+
+    #[test]
+    fn the_times_a_job_was_passed_survive_in_the_store() {
+        let fixture = Fixture::new();
+        let job = checking(&fixture, &fast_config(), "passed");
+        let sequence = job.sequence;
+        let mut jobs = vec![job];
+        record_passes(&fixture.store, &mut jobs, &[sequence, sequence]).unwrap();
+        assert_eq!(fixture.stored("passed").passed, 2);
     }
 
     #[test]

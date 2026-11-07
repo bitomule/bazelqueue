@@ -82,9 +82,9 @@ waits. In a terminal, every position change is shown as it happens.
 
 | Situation | Queue behavior |
 |---|---|
-| Several agents use different worktrees | CPU and memory reservations determine which calls fit. Same-server calls keep FIFO order. |
+| Several agents use different worktrees | CPU and memory reservations determine which calls fit. A call that fits may pass one that does not, at most four times; same-server calls keep FIFO order. |
 | A build or test has nothing to rebuild | Bazel's own up-to-date check runs in a small fast-lane slot; if it passes, the call starts at once instead of waiting behind other builds. |
-| Memory runs short | Warning admits one smaller build at a time. Critical pressure, macOS writing to swap, low disk space or a sensor without data hold new builds; running ones keep their reservation. The next safe sample restores full admission. |
+| The machine runs short | High CPU load halves new work. Critical pressure or macOS writing to swap admit one smaller build, only with nothing else of the queue running. Low disk space or a sensor without data hold new builds. Running ones keep their reservation, and the next safe sample restores full admission. |
 | The caller disappears | Its owned backend is cancelled. Capacity is retained until completion or verified recovery. |
 | The coordinator restarts | Guardians reconnect without submitting the command a second time. |
 | `bazel run` finishes compiling | The target runs through Bazel's generated script. Compilation capacity is released; the target's process footprint remains tracked. |
@@ -277,13 +277,17 @@ promised to active reservations.
 
 | Signal | New builds and tests |
 |---|---|
-| macOS writes to swap, or swap grows, faster than `swap_thrashing_mib_per_min` over 60 seconds | Wait |
-| Critical pressure | Wait |
 | Free disk below `disk_safety_mib` | Wait |
 | A memory, swap or disk sensor without data | Wait |
-| High CPU load | Wait |
-| Warning pressure | One smaller build at a time; up-to-date checks still run |
+| macOS writes to swap, or swap grows, faster than `swap_thrashing_mib_per_min` over 60 seconds | One smaller build, only with nothing else of the queue running |
+| Critical pressure | One smaller build, only with nothing else of the queue running |
+| High CPU load | Half the capacity: one large build or two small ones, each with at least `worker_instances` CPUs |
+| Warning pressure | No effect beyond the free memory a build needs |
 | Old swap that no longer grows, swap-in alone | No effect |
+
+Up-to-date checks run only without any of these limits. Most of these signals come
+from outside the queue, so waiting for them can last hours: only a full disk or a
+blind sensor stops it completely.
 
 Reservations follow measurements too. A running job counts as the larger of its
 reservation and the resident memory of its Bazel server and children. Each output
@@ -291,8 +295,8 @@ base remembers the peak of its latest three builds, and a new build there reserv
 that peak plus a quarter, never less than 1536 MiB within its share. A live server
 needs only what it will still grow. A build that does not fit waits for free memory instead of starting on a token
 reservation. With no build running and nothing holding admission, one build may
-start below that figure, also under warning, so that large apps cannot stop the
-queue for good. Under warning, reduced admission costs speed: sixteen Clang compilations took 25 s with
+start below that figure, so that large apps cannot stop the queue for good. Reduced
+admission costs speed: sixteen Clang compilations took 25 s with
 2 CPU / 2304 MiB against 16 s with 8 CPU / 9 GiB. [Method and admission research](docs/admission-measurements.md).
 
 Recovery takes effect on the next safe sample. Existing grants remain unchanged.
