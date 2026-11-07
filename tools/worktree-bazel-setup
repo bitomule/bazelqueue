@@ -2,11 +2,23 @@
 # Gives this checkout its own Bazel output base inside the checkout, so deleting the worktree
 # deletes its cache. Bazel does not expand %workspace% in --output_base, so the absolute path
 # lives in a git-ignored .bazelrc.local that each checkout generates for itself.
+# When the machine has a shared cache volume (BAZEL_SHARED_CACHE_DIR, default
+# /Volumes/BazelCache), every checkout also points its disk and repository caches at it and
+# trims the disk cache to 12G / 7 days.
 set -eu
 
 root=$(git rev-parse --show-toplevel)
+shared=${BAZEL_SHARED_CACHE_DIR:-/Volumes/BazelCache}
 
-printf 'startup --output_base=%s/.bazel-output\n' "$root" >"$root/.bazelrc.local"
+{
+    printf 'startup --output_base=%s/.bazel-output\n' "$root"
+    if [ -d "$shared" ]; then
+        printf 'common --disk_cache=%s/disk-cache\n' "$shared"
+        printf 'common --repository_cache=%s/repo-cache\n' "$shared"
+        printf 'common --experimental_disk_cache_gc_max_size=12G\n'
+        printf 'common --experimental_disk_cache_gc_max_age=7d\n'
+    fi
+} >"$root/.bazelrc.local"
 
 import='try-import %workspace%/.bazelrc.local'
 grep -qxF "$import" "$root/.bazelrc" 2>/dev/null || printf '\n%s\n' "$import" >>"$root/.bazelrc"
