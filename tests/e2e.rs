@@ -1230,11 +1230,14 @@ fn a_server_slower_than_15_seconds_to_answer_keeps_its_job_managed() {
 #[test]
 fn each_worktree_output_base_is_its_own_lane() {
     let mut harness = Harness::new(3);
-    fs::write(
-        harness.paths.root.join("resources.json"),
-        r#"{"pressure":1,"total_mib":65536,"available_mib":32768,"swap_in_bytes":0,"swap_out_bytes":0,"swap_used_mib":0,"disk_free_mib":1048576}"#,
-    )
-    .unwrap();
+    let sensor = harness.paths.root.join("resources.json");
+    let sample = |free: u64| {
+        format!(
+            r#"{{"pressure":1,"total_mib":65536,"available_mib":32768,"swap_in_bytes":0,"swap_out_bytes":0,"swap_used_mib":0,"disk_free_mib":{free}}}"#
+        )
+    };
+    fs::write(&sensor, sample(1024)).unwrap();
+    harness.wait(|s| s.resources.as_ref().and_then(|r| r.limit) == Some(Limit::DiskLow));
     let mut holders = Vec::new();
     for name in ["one", "two"] {
         let state = emulated_workspace(&harness, name);
@@ -1257,6 +1260,8 @@ fn each_worktree_output_base_is_its_own_lane() {
         harness.children.push(child);
         holders.push(holder);
     }
+    harness.wait(|s| s.jobs.iter().filter(|job| job.state == "queued").count() == 2);
+    fs::write(&sensor, sample(1_048_576)).unwrap();
     let mut running: Vec<_> = holders.iter().map(Harness::accepted).collect();
     let snapshot = harness.snapshot().unwrap();
     let mut lanes: Vec<_> = snapshot
