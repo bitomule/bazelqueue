@@ -1,0 +1,16 @@
+#!/bin/sh
+# Gives this checkout its own Bazel output base inside the checkout, so deleting the worktree
+# deletes its cache. Bazel does not expand %workspace% in --output_base, so the absolute path
+# lives in a git-ignored .bazelrc.local that each checkout generates for itself.
+set -eu
+
+root=$(git rev-parse --show-toplevel)
+
+printf 'startup --output_base=%s/.bazel-output\n' "$root" >"$root/.bazelrc.local"
+
+import='try-import %workspace%/.bazelrc.local'
+grep -qxF "$import" "$root/.bazelrc" 2>/dev/null || printf '\n%s\n' "$import" >>"$root/.bazelrc"
+
+for entry in /.bazel-output/ /.bazelrc.local; do
+    grep -qxF "$entry" "$root/.gitignore" 2>/dev/null || printf '%s\n' "$entry" >>"$root/.gitignore"
+done

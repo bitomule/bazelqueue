@@ -326,6 +326,17 @@ coordinator restarts.
 | `BAZELQUEUE_PROGRESS=verbose` | Print every position change even when stderr is not a terminal. |
 | `BAZELQUEUE_SUMMARY` | Also write the end-of-run summary JSON to this path. |
 
+## One output base per worktree
+
+Many worktrees sharing one output root leave a Bazel server and a cache behind for each of them.
+`tools/worktree-bazel-setup` (or `make worktree-bazel`) gives a checkout its own output base at
+`<checkout>/.bazel-output`, so deleting the worktree deletes its cache and no cleanup service is
+needed. Bazel does not expand `%workspace%` in `--output_base`, so the script writes the absolute
+path to a git-ignored `.bazelrc.local` and makes `.bazelrc` `try-import` it. It works from any
+subdirectory and is safe to run again. Each output base is its own lane, and the disk free-space
+check looks at the worktree's own volume. Stop the worktree's server (`bazel shutdown`) before
+deleting it.
+
 ## Compatibility
 
 | Area | Support |
