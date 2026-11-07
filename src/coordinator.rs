@@ -952,7 +952,7 @@ pub async fn run(paths: Paths) -> Result<()> {
                         apply_recovery(&paths,&store,&observed,connection,sessions.get(id).map(|(connection,_)|*connection),native,elapsed,stall).await?;
                     }
                     Some(Input::Message {connection,message:Message::Defer,reply})=> {
-                        if let Some(id)=connection_ids.get(&connection).filter(|id|sessions.get(*id).is_some_and(|(current,_)|*current==connection))&& let Some(mut job)=store.jobs()?.into_iter().find(|job|&job.request.id==id && job.state=="preparing") {job.state="queued".into();if let FastLane::Checking {queued}=&job.fast {job.request.budget=queued.clone();job.fast=FastLane::Declined;}store.save(&job)?;deferred.insert(id.clone(),tokio::time::Instant::now()+Duration::from_secs(1));notify(&reply,Event::Queued {position:store.jobs()?.iter().filter(|other|other.state=="queued" && other.sequence<=job.sequence).count(),reason:"native server is busy".into()});}
+                        if let Some(id)=connection_ids.get(&connection).filter(|id|sessions.get(*id).is_some_and(|(current,_)|*current==connection))&& let Some(mut job)=store.jobs()?.into_iter().find(|job|&job.request.id==id && job.state=="preparing") {job.state="queued".into();if let FastLane::Checking {queued}=&job.fast {job.request.budget=queued.clone();job.fast=FastLane::Declined;}store.save(&job)?;deferred.insert(id.clone(),tokio::time::Instant::now()+Duration::from_secs(1));notify(&reply,Event::Queued {position:scheduler::queue_position(&store.jobs()?,&job),reason:"native server is busy".into()});}
                     }
                     Some(Input::Message {connection,message,reply})=> {
                         if matches!(&message, Message::Control {operation,..} if operation=="retire") && daemon.retires() {
@@ -1229,9 +1229,9 @@ pub async fn run(paths: Paths) -> Result<()> {
                 notices.remove(&job.request.id);
             }
             let waiting: Vec<_> = jobs.iter().filter(|job| job.state == "queued").collect();
-            for (index, job) in waiting.iter().enumerate() {
+            for job in waiting.iter() {
                 let notice = (
-                    index + 1,
+                    scheduler::queue_position(&jobs, job),
                     scheduler::reason(job, &jobs, &capacity).to_owned(),
                 );
                 if notices.get(&job.request.id) != Some(&notice)
@@ -1756,6 +1756,7 @@ mod tests {
             let mut job = self
                 .store
                 .register(Request {
+                    priority: Default::default(),
                     id: id.into(),
                     owner: platform::Identity {
                         pid: 1,
