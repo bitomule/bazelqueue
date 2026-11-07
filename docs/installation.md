@@ -40,6 +40,8 @@ adds the existing cache guard and bounded external-rc synchronization as optiona
 local hooks. Hooks run before native server discovery, one invocation at a time
 under a hook lock, inside the request's own reservation; they never reserve the
 whole machine.
+tools/bazel-output-disk is a hook of this kind that puts a checkout's Bazel output base on an
+external volume while it is mounted and writable; see "Output base on an external disk" in the README.
 A persistent source-script watcher also catches legacy calls arriving during
 the cutover, including relative script paths. The old processes are allowed to finish; new requests wait while their ownership
 remains active. The old slot TTL is not used to grant new capacity. Original

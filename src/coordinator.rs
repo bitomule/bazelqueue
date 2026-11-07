@@ -95,20 +95,34 @@ fn sample_resources(
             };
         }
     }
-    let _ = config;
     let mut sample = sampler.sample(at_ms);
-    sample.disk_free_mib = free_disk_mib(&paths.root, jobs);
+    sample.disk_free_mib = free_disk_mib(&paths.root, jobs, config.disk_safety_mib);
     sample
 }
 
-/// Lowest free space on the queue state and on the lane of every job still in play.
-fn free_disk_mib(root: &Path, jobs: &[Job]) -> Option<u64> {
-    let lanes: std::collections::BTreeSet<_> = jobs
+/// Free space the safety margin is judged against, from the queue state and from the output
+/// base of every job still in play.
+fn free_disk_mib(root: &Path, jobs: &[Job], margin_mib: u64) -> Option<u64> {
+    let output_bases: std::collections::BTreeSet<_> = jobs
         .iter()
-        .filter(|job| !job.terminal())
+        .filter(|job| !job.terminal() && job.request.prepared)
         .map(|job| Path::new(&job.request.lane))
         .collect();
-    platform::free_disk_mib(std::iter::once(root).chain(lanes))
+    disk_headroom(
+        platform::free_disk_mib([root]),
+        platform::free_disk_mib(output_bases),
+        margin_mib,
+    )
+}
+
+/// The margin is judged where the builds write, which is their output base once Bazel has named
+/// it. The queue state only needs a small floor, since it holds the database and the logs and
+/// not the build output.
+fn disk_headroom(state: Option<u64>, output_bases: Option<u64>, margin_mib: u64) -> Option<u64> {
+    match state? {
+        free if free < STATE_FLOOR_MIB => Some(free),
+        free => Some(output_bases.unwrap_or_else(|| free.max(margin_mib))),
+    }
 }
 
 fn read_server(paths: &Paths, job: &Job, server: &NativeServer, at_ms: u64) -> Reading {
@@ -364,6 +378,7 @@ pub struct Replaced {
 pub const BUSY_REFUSAL: &str =
     "requests are executing; the coordinator can be replaced once they finish";
 const SUCCESSOR: &str = "BAZELQUEUE_SUCCESSOR";
+const STATE_FLOOR_MIB: u64 = 1024;
 
 /// Replaces a running coordinator that is not `executable` at this version.
 /// A successor started from `executable` already waits on the coordinator lock
@@ -1585,6 +1600,39 @@ fn legacy_owners(store: &Store, config: &Config) -> Result<Vec<platform::Identit
 
 #[cfg(test)]
 mod tests {
+    const MARGIN_MIB: u64 = 10240;
+
+    #[test]
+    fn a_full_state_disk_holds_builds_whatever_the_output_bases_have() {
+        assert_eq!(
+            disk_headroom(Some(STATE_FLOOR_MIB - 1), Some(1 << 20), MARGIN_MIB),
+            Some(STATE_FLOOR_MIB - 1)
+        );
+    }
+
+    #[test]
+    fn a_state_disk_under_the_margin_does_not_hold_builds_writing_elsewhere() {
+        assert_eq!(
+            disk_headroom(Some(7_800), Some(800_000), MARGIN_MIB),
+            Some(800_000)
+        );
+        assert_eq!(
+            disk_headroom(Some(7_800), None, MARGIN_MIB),
+            Some(MARGIN_MIB)
+        );
+    }
+
+    #[test]
+    fn an_output_base_under_the_margin_holds_builds() {
+        let free = disk_headroom(Some(1 << 20), Some(MARGIN_MIB - 1), MARGIN_MIB);
+        assert_eq!(free, Some(MARGIN_MIB - 1));
+    }
+
+    #[test]
+    fn a_state_disk_without_a_reading_is_unavailable() {
+        assert_eq!(disk_headroom(None, Some(1 << 20), MARGIN_MIB), None);
+    }
+
     use super::*;
     use crate::{
         protocol::{Budget, Job, Request},
@@ -1593,7 +1641,7 @@ mod tests {
     };
 
     #[test]
-    fn disk_is_measured_on_the_lane_of_every_job_still_in_play() {
+    fn disk_is_measured_on_the_output_base_of_every_job_still_in_play() {
         let fixture = Fixture::new();
         let nowhere = fixture._root.path().join("lane-not-created-yet");
         let mut live = fixture.job("live", "running");
@@ -1601,12 +1649,19 @@ mod tests {
         let mut done = fixture.job("done", "finished");
         done.request.lane = "/dev".into();
         let root = fixture._root.path();
-        let state_only = platform::free_disk_mib([root]);
-        assert_eq!(free_disk_mib(root, &[done.clone()]), state_only);
-        let dev_and_state = platform::free_disk_mib([root, Path::new("/dev")]);
-        assert_eq!(free_disk_mib(root, &[live.clone(), done]), dev_and_state);
+        let beyond_any_disk = 1 << 40;
+        let without_output_base = Some(beyond_any_disk);
+        assert_eq!(
+            free_disk_mib(root, &[done.clone()], beyond_any_disk),
+            without_output_base
+        );
+        let measured = free_disk_mib(root, &[live.clone(), done], beyond_any_disk).unwrap();
+        assert!(measured < beyond_any_disk);
         live.request.lane = nowhere.to_string_lossy().into_owned();
-        assert_eq!(free_disk_mib(root, &[live]), state_only);
+        assert_eq!(
+            free_disk_mib(root, &[live], beyond_any_disk),
+            without_output_base
+        );
     }
 
     #[test]

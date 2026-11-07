@@ -155,15 +155,17 @@ pages twice. kern.memorystatus_level is not used: it includes active anonymous
 pages, and reported 6819 MiB when only 2527 MiB could be had without compressing
 or swapping. The kernel returns fewer host_statistics64 fields than current
 headers declare, so the sampler requires only those it reads. Disk space comes
-from statvfs on the state directory and each live job's lane, keeping the lowest.
+from statvfs on the output base of each live job once Bazel has named it, keeping the lowest;
+the state directory only has to keep 1 GiB free, so a full state disk holds builds but a small
+one does not hide a roomy output volume.
 
 With the output base inside each worktree, the lane of a job is that worktree's own
 `.bazel-output`, so the lowest free space is the lowest across the volumes the live worktrees
-sit on, with no Bazel-specific code. Admission needs nothing else to support this: N building
+write to, with no Bazel-specific code. Admission needs nothing else to support this: N building
 worktrees mean N servers and N independent lanes, each ordered by its own server lock, each
 with its own LaneMemory peak, and idle servers leave by Bazel's `max_idle_secs`. The e2e
 `each_worktree_output_base_is_its_own_lane` and the unit test
-`disk_is_measured_on_the_lane_of_every_job_still_in_play` pin both behaviours.
+`disk_is_measured_on_the_output_base_of_every_job_still_in_play` pin both behaviours.
 
 Swapping means swap-out or occupancy growth above swap_thrashing_mib_per_min across
 a 60-second window, so pauses between bursts are not recovery and a burst

@@ -238,7 +238,7 @@ ${EDITOR:-vi} ~/.local/state/bazelqueue/config.toml
 | `worker_instances` | Worker and multiplex-worker instance caps. |
 | `memory_safety_mib` | Free-memory margin, at least 5% of RAM. Default: **1024 MiB**. |
 | `swap_thrashing_mib_per_min` | New builds wait while swap-out or swap growth, over the last 60 seconds, exceeds this rate. Default: **64 MiB/min**. |
-| `disk_safety_mib` | New builds wait while free space on the queue state or an output base is below this. Default: **10240 MiB**. |
+| `disk_safety_mib` | New builds wait while free space on the output base of a build that has one is below this. The queue state only needs 1024 MiB. Default: **10240 MiB**. |
 | `fast_lane_slots` | Up-to-date checks, and the runs they admit, that may proceed outside the build capacity at once. Default: **2**; `0` turns the fast lane off. |
 | `stall_minutes` | Minutes without Bazel events, `command.log` output or CPU before a job is cut as a time failure. Default: **10**; `0` turns detection off. macOS only. Bazel 9 writes no `command.log` by default, so a job there with child processes and a connected client is not cut. |
 
@@ -349,8 +349,8 @@ Many worktrees sharing one output root leave a Bazel server and a cache behind f
 needed. Bazel does not expand `%workspace%` in `--output_base`, so the script writes the absolute
 path to a git-ignored `.bazelrc.local` and makes `.bazelrc` `try-import` it. It works from any
 subdirectory and is safe to run again. When `BAZEL_SHARED_CACHE_DIR` is set (to any directory, e.g. on a volume shared by all your worktrees), it also writes `--disk_cache`, `--repository_cache` and the automatic trim (`--experimental_disk_cache_gc_max_size=12G`, `--experimental_disk_cache_gc_max_age=7d`) under it, so every worktree shares one capped cache. Each output base is its own lane, and the disk free-space
-check looks at the worktree's own volume. Stop the worktree's server (`bazel shutdown`) before
-deleting it.
+check looks at the volume of each build's output base. Stop the worktree's server
+(`bazel shutdown`) before deleting it.
 
 The cost is one Bazel server per worktree that builds: measured servers hold 1.1-1.7 GB of memory
 each, so ten active worktrees can hold more than ten gigabytes. The queue already bounds this:
@@ -359,6 +359,41 @@ a build is admitted only with the memory its output base peaked at last time (`L
 cache (measured 2.2-4.2 GB per output base) now lives wherever the worktree lives, so only the
 shared disk and repository caches stay on a shared volume. Two worktrees run side by side;
 two builds in the same worktree still wait for each other.
+
+### Output base on an external disk
+
+`tools/bazel-output-disk <volume>` is a Bazel configuration script, not part of the queue: the
+queue knows nothing about disks. Register it as a preflight hook and every build starts by
+choosing the disk:
+
+```toml
+[[hooks]]
+program = "/path/to/bazelqueue/tools/bazel-output-disk"
+arguments = ["/Volumes/Externo"]
+```
+
+- The volume is used when it is mounted and a write probe succeeds within a few seconds
+  (`BAZEL_OUTPUT_DISK_TIMEOUT`): the output base becomes `<volume>/bazel/<hash of the checkout>`.
+  Otherwise the output base stays in the checkout, as `tools/worktree-bazel-setup` leaves it.
+  Nothing in `~/.bazelrc` names the volume, so a missing or hung disk cannot stall Bazel's
+  startup.
+- macOS grants access to removable volumes per process. The probe runs in the hook, which runs in
+  the process tree of whoever called `bazel` (Claude, Codex, a terminal), the same tree that starts
+  the Bazel client. If writing is refused, the script falls back to the internal disk and writes
+  how to grant access (System Settings > Privacy & Security > Files & Folders > Removable Volumes,
+  or Full Disk Access, for the app that runs the builds) to
+  `<checkout>/.bazel-output-disk.log`; hooks run without a terminal, so that file is where to
+  look. The grant is a one-time action; no binary is patched or signed.
+- Sessions that read through the checkout's `bazel-out` and `bazel-bin` links reach the volume
+  and need the same grant; without it a read fails with a permission error.
+- When the disk changes in either direction, the Bazel server of the previous output base of that
+  checkout is stopped, so a worktree never keeps two servers alive. The first build on the other
+  disk starts cold.
+- If the disk disappears during a build, that build fails, and the queue cuts it if it hangs
+  (`stall_minutes`). The next build runs the hook again, sees the volume gone and uses the
+  internal disk. Nothing is retried inside the queue. A half-written output base on the
+  volume is recovered by Bazel when the disk returns, or with `bazel clean`.
+- Output bases on the volume are not removed when a worktree is deleted.
 
 ## Compatibility
 

@@ -1,0 +1,92 @@
+#!/bin/sh
+# Preflight hook: points this checkout's Bazel output base at an external volume when it is
+# mounted and writable, and at the checkout itself otherwise. When the output base changes, the
+# Bazel server of the previous one is stopped so two servers never outlive the switch.
+#
+# usage: bazel-output-disk <volume>        e.g. bazel-output-disk /Volumes/Externo
+#
+# BAZEL_OUTPUT_DISK_TIMEOUT        seconds a write probe may take before the volume counts as hung
+# BAZEL_OUTPUT_DISK_MOUNT_TABLE    file listing mounts in `mount` format, instead of running mount
+set -eu
+
+volume=${1:?usage: bazel-output-disk <volume>}
+timeout=${BAZEL_OUTPUT_DISK_TIMEOUT:-3}
+root=$(git rev-parse --show-toplevel)
+setup=$(dirname "$0")/worktree-bazel-setup
+log=$root/.bazel-output-disk.log
+
+mounted() {
+    if [ -n "${BAZEL_OUTPUT_DISK_MOUNT_TABLE:-}" ]; then
+        grep -qF " on $volume (" "$BAZEL_OUTPUT_DISK_MOUNT_TABLE"
+    else
+        mount | grep -qF " on $volume ("
+    fi
+}
+
+# A write attempted by this very process tree is the only proof of macOS's per-process grant for
+# removable volumes: stat and df keep answering when writes are refused.
+probe() {
+    mkdir -p "$volume/bazel" && mkdir "$volume/bazel/.write-probe.$$" && rmdir "$volume/bazel/.write-probe.$$"
+}
+
+unavailable() {
+    printf 'bazel-output-disk: %s; using the internal disk\n' "$1" | tee -a "$log" >&2
+}
+
+available() {
+    if ! mounted; then
+        return 1
+    fi
+    probe 2>/dev/null &
+    probe_pid=$!
+    waited=0
+    while kill -0 "$probe_pid" 2>/dev/null; do
+        if [ "$waited" -ge $((timeout * 10)) ]; then
+            pkill -9 -P "$probe_pid" 2>/dev/null || true
+            kill -9 "$probe_pid" 2>/dev/null || true
+            unavailable "$volume does not answer within ${timeout}s"
+            return 1
+        fi
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+    if wait "$probe_pid"; then
+        return 0
+    fi
+    unavailable "writing to $volume was refused; grant the app that runs the builds access in System Settings > Privacy & Security > Files & Folders (Removable Volumes) or Full Disk Access"
+    return 1
+}
+
+current_base() {
+    sed -n 's/^startup --output_base=//p' "$root/.bazelrc.local" 2>/dev/null | head -n 1
+}
+
+stop_server() {
+    escaped=$(printf '%s' "$1" | sed 's/[][\.*^$+?(){}|/]/\\&/g')
+    pattern="--output_base=$escaped( |\$)"
+    pkill -TERM -f -- "$pattern" 2>/dev/null || true
+    stopping=0
+    while pgrep -f -- "$pattern" >/dev/null 2>&1; do
+        if [ "$stopping" -ge 50 ]; then
+            pkill -KILL -f -- "$pattern" 2>/dev/null || true
+            break
+        fi
+        sleep 0.1
+        stopping=$((stopping + 1))
+    done
+}
+
+previous=$(current_base)
+
+if available; then
+    hash=$(printf '%s' "$root" | shasum -a 256 | cut -c1-16)
+    next=$volume/bazel/$hash
+else
+    next=$root/.bazel-output
+fi
+
+"$setup" "$next"
+
+if [ -n "$previous" ] && [ "$previous" != "$next" ]; then
+    stop_server "$previous"
+fi
