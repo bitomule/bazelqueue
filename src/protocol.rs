@@ -337,19 +337,7 @@ pub struct Snapshot {
     #[serde(default)]
     pub utilization: Vec<crate::utilization::Hour>,
     pub legacy: Vec<Identity>,
-    #[serde(default)]
-    pub disk_fallbacks: Box<[DiskFallback]>,
     pub jobs: Vec<Job>,
-}
-
-/// One time `tools/bazel-output-disk` did not put a checkout's output base on its external volume.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct DiskFallback {
-    pub at: String,
-    pub checkout: String,
-    pub volume: String,
-    pub kind: String,
-    pub reason: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -155,7 +155,6 @@ impl Fixture {
                             cpu_capacity: 1,
                             memory_capacity_mib: 1024,
                             legacy: vec![],
-                            disk_fallbacks: Box::default(),
                             jobs: vec![],
                         },
                     },

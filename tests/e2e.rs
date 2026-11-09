@@ -553,47 +553,6 @@ fn stdout_stdin_and_non_utf8_arguments_are_preserved() {
 }
 
 #[test]
-fn status_json_lists_recent_internal_disk_fallbacks_with_time_and_reason() {
-    let harness = Harness::new(1);
-    let status = |harness: &Harness| -> serde_json::Value {
-        let output = harness
-            .command()
-            .args(["status", "--json"])
-            .output()
-            .unwrap();
-        serde_json::from_slice(&output.stdout).unwrap()
-    };
-    assert_eq!(status(&harness)["disk_fallbacks"], serde_json::json!([]));
-
-    let mut records = String::from("not json\n");
-    for index in 0..25 {
-        records.push_str(&format!(
-            "{{\"at\":\"2026-11-08T10:00:{index:02}Z\",\"checkout\":\"/work/app\",\"volume\":\"/Volumes/Externo\",\"kind\":\"slow\",\"reason\":\"fallback {index}\"}}\n"
-        ));
-    }
-    records.push_str("{\"half\":\n");
-    fs::write(harness.paths.root.join("disk-fallbacks.jsonl"), records).unwrap();
-
-    let fallbacks = status(&harness)["disk_fallbacks"].clone();
-    let fallbacks = fallbacks.as_array().unwrap();
-    assert_eq!(fallbacks.len(), 20);
-    assert_eq!(fallbacks[0]["reason"], "fallback 5");
-    assert_eq!(fallbacks[19]["reason"], "fallback 24");
-    assert_eq!(fallbacks[19]["at"], "2026-11-08T10:00:24Z");
-    assert_eq!(fallbacks[19]["kind"], "slow");
-    assert_eq!(fallbacks[19]["checkout"], "/work/app");
-
-    let human = harness.command().arg("status").output().unwrap();
-    let human = String::from_utf8_lossy(&human.stdout);
-    assert!(
-        human.contains(
-            "Internal-disk fallbacks: 20 recent, last 2026-11-08T10:00:24Z /work/app (fallback 24)"
-        ),
-        "{human}"
-    );
-}
-
-#[test]
 fn status_json_tells_each_queued_job_its_position_reason_and_entry_time() {
     let mut harness = Harness::new(1);
     let first = harness.spawn_hold("first");

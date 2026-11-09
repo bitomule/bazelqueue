@@ -8,7 +8,3 @@ __pycache__/
 /.musts/*
 !/.musts/ledger.lock.yaml
 !/.musts/.gitattributes
-/.bazel-output/
-/.bazelrc.local
-/.bazelrc.local.*
-/.bazel-output-disk.log
