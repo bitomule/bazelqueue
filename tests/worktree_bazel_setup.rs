@@ -317,3 +317,12 @@ fn check_mode_is_read_only_and_tracked_local_settings_are_rejected() {
     assert_eq!(checkout.read(".bazelrc.local"), "# Tracked settings\n");
     checkout.clean();
 }
+
+#[test]
+fn own_bazelignore_excludes_the_output_base_and_nested_worktrees() {
+    let ignore =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(".bazelignore")).unwrap();
+    let entries: Vec<&str> = ignore.lines().collect();
+    assert!(entries.contains(&".bazel-output"));
+    assert!(entries.contains(&".claude/worktrees"));
+}

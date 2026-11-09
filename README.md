@@ -381,7 +381,9 @@ Preparation is explicit: commit the following repository configuration before en
 or the disk hook, preserving existing entries:
 
 - `.bazelrc`: `try-import %workspace%/.bazelrc.local`
-- `.bazelignore`: `.bazel-output`
+- `.bazelignore`: `.bazel-output`, and `.claude/worktrees` when agent worktrees are nested in the
+  checkout (otherwise `bazel build //...` from the main checkout analyzes each worktree's own
+  `.bazel-output`)
 - `.gitignore`: `/.bazel-output/`, `/.bazelrc.local`, `/.bazelrc.local.*`,
   and `/.bazel-output-disk.log` (one per line).
 

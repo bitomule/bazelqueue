@@ -39,7 +39,9 @@ The main checkout keeps its base under `output_user_root`, which is today's beha
 
 Every repository that already copied the setup script needs the corrected
 `tools/worktree-bazel-setup` and a committed `.bazelignore` containing `.bazel-output`, with
-existing entries preserved. It also needs the explicit import and all four Git exclusions
+existing entries preserved. A repository whose agent worktrees live under `.claude/worktrees` also
+lists that directory in `.bazelignore`, so `bazel build //...` from the main checkout does not
+analyze the nested worktrees' own `.bazel-output`. It also needs the explicit import and all four Git exclusions
 listed in the README (or effective local Git exclusions). Updating the import alone is insufficient.
 Copy the updated `tools/bazel-output-disk` too when that hook is used: it validates preparation
 before probing disks or writing logs. Setup no longer supplies missing repository configuration.
