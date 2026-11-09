@@ -258,6 +258,33 @@ reserve its CPUs from the same budget, one by default or N with a `cpu:N` tag.
 A `--local_test_jobs` given on the command line is kept, up to the reserved
 CPUs.
 
+**`--jobs=1` does not request a 1 CPU reservation.** It limits Bazel to one
+action in flight, including cache work. That action can use several CPUs
+(for example, a test tagged `cpu:4`) and substantial memory, and the server and
+workers also consume resources. The queue therefore sizes CPU and memory
+separately from `--jobs`; `--jobs 1`, `-j=1` and `-j 1` have the same meaning.
+The direct limit still reaches Bazel as 1. `--local_test_jobs=1` limits local
+test concurrency, not the build's reservation either.
+
+For example, with 6 CPU / 8192 MiB and `max_builds = 1`, a test with no history
+can request the whole budget despite `--jobs=1`. Another running request of
+1 CPU / 1536 MiB prevents it from starting under that serial configuration.
+To allow large managed calls to share, edit the configuration shown above and
+set `max_builds = 2`. Before execution, a queued managed call can then receive
+the remaining 5 CPU / 6656 MiB, subject to measured memory and pressure checks.
+This is a concurrency setting for the whole queue, not a per-call CPU request.
+An already running build keeps its grant until it finishes.
+
+For smaller reservations of repeated calls, let the queue learn their measured
+usage as described below: on that 6 CPU / 8192 MiB budget, a low-use history
+produces 2 CPU / 2730 MiB and can share even with `max_builds = 1`.
+There is currently no per-invocation flag to request exactly 1 CPU / 1536 MiB.
+Lowering `cpu_capacity` and `memory_capacity_mib` lowers the whole queue's
+budget, not just one call. Do not use another state directory or a direct
+backend invocation to bypass accounting. Unsupported versions, wrappers and
+opaque resource overrides retain exclusive compatibility admission; neither
+`--jobs=1` nor `max_builds = 2` makes those calls share.
+
 **Repeated builds and tests are sized from their last runs.** When a managed
 build or test ends, bazelqueue records how many cores its Bazel server, workers,
 actions and tests kept busy on average. The next run of the same command,
