@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.14](https://github.com/bitomule/bazelqueue/compare/v0.1.13...v0.1.14) - 2026-11-09
+
+### Changed
+
+- the queue no longer knows about output disks ([#45](https://github.com/bitomule/bazelqueue/pull/45))
+
+### Fixed
+
+- the resource estimate no longer inflates while the Mac swaps ([#46](https://github.com/bitomule/bazelqueue/pull/46))
+- a slow external volume no longer sends builds to a nearly full internal disk ([#44](https://github.com/bitomule/bazelqueue/pull/44))
+- keep worktree Bazel setup out of tracked files ([#42](https://github.com/bitomule/bazelqueue/pull/42))
+- exclude worktree Bazel output from package discovery ([#41](https://github.com/bitomule/bazelqueue/pull/41))
+- a shell that exits during legacy discovery no longer makes status and wait fail ([#39](https://github.com/bitomule/bazelqueue/pull/39))
+
+### Internal
+
+- explain jobs limits and queue reservations ([#43](https://github.com/bitomule/bazelqueue/pull/43))
+
 ## [0.1.13](https://github.com/bitomule/bazelqueue/compare/v0.1.12...v0.1.13) - 2026-11-07
 
 ### Added
