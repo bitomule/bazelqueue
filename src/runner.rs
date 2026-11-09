@@ -370,6 +370,7 @@ async fn probe(
 /// sooner leaves its job unmanaged: no typed summary, and no server to recover.
 const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(120);
 const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+const MEMORY_SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Asks Bazel, under the fast-lane reservation, whether the invocation would
 /// execute anything. Only exit code 0 counts as up to date; any other result,
@@ -491,6 +492,7 @@ pub async fn guardian(backend: PathBuf, args: Vec<OsString>, generic: bool) -> R
         stall: None,
     };
     let mut notices = Notices::new(&id, ledger.report);
+    let requested_cpu;
     let mut stream = registration(&paths, &request).await?;
     let mut server = None;
     let mut hooks_ran = false;
@@ -603,6 +605,7 @@ pub async fn guardian(backend: PathBuf, args: Vec<OsString>, generic: bool) -> R
                 .await?;
             }
             Event::Grant { budget } => {
+                requested_cpu = request.budget.cpu;
                 request.budget = budget;
                 ledger.granted = Some(Instant::now());
                 break;
@@ -693,12 +696,17 @@ pub async fn guardian(backend: PathBuf, args: Vec<OsString>, generic: bool) -> R
     let terminal = platform::Terminal::handoff(child_identity.pid)?;
     permit.write_all(b"G").await?;
     drop(permit);
+    let mut peak_memory_mib = 0;
+    let mut memory_samples = tokio::time::interval(MEMORY_SAMPLE_INTERVAL);
     let mut cancelled = false;
     let mut cancellation_signal = libc::SIGINT;
     let mut cancellation_deadline = None;
     let status = loop {
         tokio::select! {
             result=child.wait()=>break result?,
+            _=memory_samples.tick(),if measured.is_some()=>{
+                if let Some((server,..))=&measured {peak_memory_mib=peak_memory_mib.max(platform::process_memory(std::slice::from_ref(server)));}
+            },
             _=child_changes.recv()=>{if platform::stopped(child_identity.pid)&& let Some(terminal)=&terminal {terminal.suspend_caller();}},
             _=continuation.recv()=>{if let Some(terminal)=&terminal {if terminal.caller_foreground() {terminal.foreground(child_identity.pid);}let _=platform::signal_group(child_identity.pid,libc::SIGCONT);}},
             event=protocol::receive::<_,Event>(&mut stream)=> {
@@ -734,10 +742,12 @@ pub async fn guardian(backend: PathBuf, args: Vec<OsString>, generic: bool) -> R
         let cores = estimate::observe(
             after - before,
             started.elapsed().as_secs_f64(),
+            requested_cpu,
             request.budget.cpu,
             &config,
         );
-        if let Err(error) = estimate::record(&paths.root, &estimate_key, cores) {
+        let memory_mib = (peak_memory_mib > 0).then_some(peak_memory_mib);
+        if let Err(error) = estimate::record(&paths.root, &estimate_key, cores, memory_mib) {
             report!("bazelqueue: estimate not saved: {error:#}");
         }
     }

@@ -298,8 +298,9 @@ built (`--test_filter`, `--test_arg`, `--test_output`, `--test_env`,
 one history. A run with no history of its own reserves 1.25 times the median of
 the latest nine runs of the same command in the same repository. Estimated runs
 share the machine by CPU and memory instead of taking a `max_builds` slot, so
-several small test runs execute side by side. A saturated run requests more next
-time, but a full-machine estimate is divided when other lanes are waiting.
+several small test runs execute side by side. A run held back by its own estimate
+requests more next time (a run trimmed by memory pressure does not), but a
+full-machine estimate is divided when other lanes are waiting.
 A run in a repository with no history of its command receives the same fair
 share. History lives in
 `estimates.json` in the state directory.
