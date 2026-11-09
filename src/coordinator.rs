@@ -1408,7 +1408,6 @@ fn handle(
                             SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64,
                         ),
                         legacy: legacy_owners(store, config).unwrap_or_default(),
-                        disk_fallbacks: disk_fallbacks(paths).into(),
                         jobs: {
                             let jobs = store.jobs()?;
                             let cutoff = jobs
@@ -1583,24 +1582,6 @@ fn record_passes(store: &Store, jobs: &mut [Job], overtaken: &[u64]) -> Result<(
         store.save(job)?;
     }
     Ok(())
-}
-
-const DISK_FALLBACKS_SHOWN: usize = 20;
-
-/// The most recent fallbacks recorded by the output-disk hook; a missing file or a damaged line is
-/// not an error, because the hook is a script that may be an older or newer version.
-fn disk_fallbacks(paths: &Paths) -> Vec<protocol::DiskFallback> {
-    let Ok(text) = fs::read_to_string(paths.root.join("disk-fallbacks.jsonl")) else {
-        return Vec::new();
-    };
-    let mut recent: Vec<_> = text
-        .lines()
-        .rev()
-        .filter_map(|line| serde_json::from_str(line).ok())
-        .take(DISK_FALLBACKS_SHOWN)
-        .collect();
-    recent.reverse();
-    recent
 }
 
 fn legacy_owners(store: &Store, config: &Config) -> Result<Vec<platform::Identity>> {
