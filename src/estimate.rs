@@ -240,6 +240,39 @@ mod tests {
     }
 
     #[test]
+    fn direct_jobs_limits_do_not_claim_one_action_uses_one_cpu() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = workspace(root.path());
+        let config = Config {
+            cpu_capacity: 6,
+            memory_capacity_mib: 8192,
+            max_builds: 1,
+            ..config()
+        };
+        for flags in [
+            vec!["--jobs=1"],
+            vec!["--jobs", "1"],
+            vec!["-j=1"],
+            vec!["-j", "1"],
+        ] {
+            let mut args = vec!["test"];
+            args.extend(flags);
+            args.push("//crates/alondra:alondra_test");
+            let test = invocation(&args, &workspace);
+            assert!(test.managed);
+            let reserved = budget(&config, &test, &[])
+                .unwrap_or_else(|| config.request_budget(Admission::Metered, test.managed));
+            assert_eq!((reserved.cpu, reserved.memory_mib), (6, 8192));
+            let policy = crate::bazel::arguments(&test, &reserved, &config, None);
+            let policy = policy[0].to_string_lossy();
+            assert!(policy.contains("flag_name:'jobs' set_value {flag_value:'1'"));
+            assert!(policy.contains("flag_value:'cpu=6'"));
+            let learned = budget(&config, &test, &[0.1]).unwrap();
+            assert_eq!((learned.cpu, learned.memory_mib), (2, 2730));
+        }
+    }
+
+    #[test]
     fn a_small_test_run_is_estimated_below_the_whole_machine() {
         let root = tempfile::tempdir().unwrap();
         let workspace = workspace(&root.path().join("w"));

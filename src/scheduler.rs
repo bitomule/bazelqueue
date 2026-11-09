@@ -1405,6 +1405,61 @@ mod tests {
         job
     }
     #[test]
+    fn a_serial_configuration_waits_but_managed_shares_and_history_can_fit() {
+        let mut config = Config {
+            cpu_capacity: 6,
+            memory_capacity_mib: 8192,
+            ..whole_machine()
+        };
+        let mut foreign = job(1, "other", 1, false, "running");
+        foreign.request.budget.memory_mib = 1536;
+        let mut test = job(2, "test", 6, false, "queued");
+        test.request.budget = config.budget(true);
+        let mut jobs = vec![foreign, test];
+        assert_eq!(
+            (
+                jobs[1].request.budget.cpu,
+                jobs[1].request.budget.memory_mib
+            ),
+            (6, 8192)
+        );
+        assert!(eligible(&jobs, &config, &capacity()).is_empty());
+        let active = jobs[0].request.budget.clone();
+        config.max_builds = 2;
+        allocate_queued(&mut jobs, &config, &capacity());
+        assert_eq!(
+            (
+                jobs[1].request.budget.cpu,
+                jobs[1].request.budget.memory_mib
+            ),
+            (5, 6656)
+        );
+        assert_eq!(eligible(&jobs, &config, &capacity()), vec![2]);
+        assert_eq!(jobs[0].request.budget, active);
+
+        // A measured small run fits even in the serial configuration; CPU and
+        // memory still gate it independently of the large-build slot count.
+        config.max_builds = 1;
+        jobs[1].request.budget = Budget {
+            cpu: 2,
+            memory_mib: 2730,
+            exclusive: false,
+            estimate: Some(crate::protocol::Estimate {
+                cpu: 2,
+                memory_mib: 2730,
+            }),
+        };
+        allocate_queued(&mut jobs, &config, &capacity());
+        assert_eq!(eligible(&jobs, &config, &capacity()), vec![2]);
+        assert!(eligible(&jobs, &config, &constrained()).is_empty());
+        let short = Capacity {
+            new_memory_mib: 2000,
+            ..capacity()
+        };
+        assert!(eligible(&jobs, &config, &short).is_empty());
+    }
+
+    #[test]
     fn small_estimated_runs_share_the_machine_even_with_one_build_slot() {
         let jobs: Vec<_> = (1..=5)
             .map(|sequence| estimated(sequence, &format!("w{sequence}"), 2, "queued"))

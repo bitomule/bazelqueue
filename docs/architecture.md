@@ -119,6 +119,17 @@ existing terminal states remain compatible. A journal write failure prevents
 new admission rather than allowing work without a durable reservation.
 
 The scheduler reserves CPU tokens and invocation memory, including overhead.
+Action concurrency (`--jobs`, `-j` and `--local_test_jobs`) is independent of
+this reservation: one action can need multiple CPUs and its memory is not
+determined by its count. Direct numeric concurrency limits are preserved in
+Bazel's invocation policy, but do not cap the reservation. Local resource
+policies still come from the grant. This separation was introduced in #19 to
+allow cache work beyond the local CPU budget; it also avoids inferring a
+one-core or low-memory workload from `--jobs=1`.
+With no history, `max_builds = 1` retains serial admission of large managed
+calls. `max_builds = 2` permits a queued managed call to take remaining capacity;
+history provides smaller demands even with one large-build slot. Neither is a
+per-call resource override, and executing grants are never reduced to make room.
 A managed build or test with history reserves an estimate: the guardian samples
 the CPU time of its Bazel server's process tree (live members plus reaped
 children, so workers, actions and tests all count) before and after the client
