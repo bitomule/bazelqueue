@@ -133,8 +133,12 @@ per-call resource override, and executing grants are never reduced to make room.
 A managed build or test with history reserves an estimate: the guardian samples
 the CPU time of its Bazel server's process tree (live members plus reaped
 children, so workers, actions and tests all count) before and after the client
-runs, keyed by repository, command and the arguments that change what gets built;
-a run without its own history takes the median of its repository and command. Estimated reservations are
+runs, keyed by repository, command and the arguments that change what gets built,
+and the peak memory of that tree sampled while it runs. The estimate is 1.25 times
+the median of the latest three runs, CPU and memory measured separately; for a
+test the first of them, which pays for the cold build, is left out. A run whose
+reservation the scheduler trimmed below its estimate records what it used, never
+the whole machine. A run without its own history takes the median of its repository and command. Estimated reservations are
 bounded by summed CPU and memory rather than `max_builds`. Large estimates share
 the remaining machine with other waiting lanes; a lone invocation can use the
 wide profile. CPU division assigns the remainder rather than losing a core.
