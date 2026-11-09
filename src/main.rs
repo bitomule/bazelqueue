@@ -270,6 +270,15 @@ fn show(event: Event, json: bool) -> Result<()> {
         if let Some(skew) = coordinator::skew(&snapshot) {
             println!("warning: {skew}");
         }
+        if let Some(last) = snapshot.disk_fallbacks.last() {
+            println!(
+                "Internal-disk fallbacks: {} recent, last {} {} ({})",
+                snapshot.disk_fallbacks.len(),
+                last.at,
+                last.checkout,
+                last.reason
+            );
+        }
         if let Some(resources) = &snapshot.resources {
             println!(
                 "Memory available {} MiB | swap used {} MiB, growth {} MiB/min | swap in/out {}/{} MiB/min | disk free {} MiB | {}",
