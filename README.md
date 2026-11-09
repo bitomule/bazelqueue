@@ -431,11 +431,25 @@ program = "/path/to/bazelqueue/tools/bazel-output-disk"
 arguments = ["/Volumes/Externo"]
 ```
 
-- The volume is used when it is mounted and a write probe succeeds within a few seconds
-  (`BAZEL_OUTPUT_DISK_TIMEOUT`): the output base becomes `<volume>/bazel/<hash of the checkout>`.
-  Otherwise the output base stays in the checkout, as `tools/worktree-bazel-setup` leaves it.
-  Nothing in `~/.bazelrc` names the volume, so a missing or hung disk cannot stall Bazel's
-  startup.
+- The volume is used when it is mounted and a write probe succeeds within
+  `BAZEL_OUTPUT_DISK_TIMEOUT` seconds (default 20): the output base becomes
+  `<volume>/bazel/<hash of the checkout>`. A volume that is mounted but does not answer (a sleeping
+  disk, a loaded Mac) is probed again, up to `BAZEL_OUTPUT_DISK_RETRIES` attempts (default 3) with
+  `BAZEL_OUTPUT_DISK_RETRY_WAIT` seconds between them (default 5), so the hook waits at most about
+  70 s. A refused write is not retried. When the volume is not mounted, or stays unavailable, the
+  output base stays in the checkout, as `tools/worktree-bazel-setup` leaves it. Nothing in
+  `~/.bazelrc` names the volume, so a missing or hung disk cannot stall Bazel's startup.
+- A volume that is mounted but unavailable never fills the internal disk. When the internal disk
+  has less than `BAZEL_OUTPUT_DISK_INTERNAL_MIN_FREE_GB` free (default 15; one output base takes
+  2.2-4.2 GB), the hook does not fall back: it keeps the output base on the volume, prints and logs
+  why, and exits non-zero, so builds fail or stall on the volume instead of writing to the internal
+  disk. `bazelqueue` reports a failing hook and continues, which is why the base stays on the
+  volume.
+- Every fallback or refusal is appended to `disk-fallbacks.jsonl` in the bazelqueue state directory
+  (`BAZEL_OUTPUT_DISK_EVENTS` overrides the file; the last 200 lines are kept) as
+  `{"at","checkout","volume","kind","reason"}`, with `kind` one of `not_mounted`, `slow`,
+  `refused` or `blocked_low_disk`. `bazelqueue status --json` lists the 20 most recent under
+  `disk_fallbacks`, and `bazelqueue status` prints a summary line when there are any.
 - macOS grants access to removable volumes per process. The probe runs in the hook, which runs in
   the process tree of whoever called `bazel` (Claude, Codex, a terminal), the same tree that starts
   the Bazel client. If writing is refused, the script falls back to the internal disk and writes

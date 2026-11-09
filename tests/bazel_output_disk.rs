@@ -12,6 +12,7 @@ struct Fixture {
     volume: PathBuf,
     mounts: PathBuf,
     shims: PathBuf,
+    events: PathBuf,
 }
 
 impl Fixture {
@@ -43,12 +44,14 @@ impl Fixture {
         )
         .unwrap();
         let mounts = base.join("mounts");
+        let events = base.join("disk-fallbacks.jsonl");
         let fixture = Self {
             _dir: dir,
             root,
             volume,
             mounts,
             shims,
+            events,
         };
         fixture.mount(true);
         fixture
@@ -67,6 +70,10 @@ impl Fixture {
     }
 
     fn run_with(&self, timeout: &str, path: Option<&Path>) -> Output {
+        self.run_tuned(timeout, path, &[])
+    }
+
+    fn run_tuned(&self, timeout: &str, path: Option<&Path>, extra: &[(&str, &str)]) -> Output {
         let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/bazel-output-disk");
         let mut command = Command::new(script);
         command
@@ -74,6 +81,9 @@ impl Fixture {
             .current_dir(&self.root)
             .env("BAZEL_OUTPUT_DISK_MOUNT_TABLE", &self.mounts)
             .env("BAZEL_OUTPUT_DISK_TIMEOUT", timeout)
+            .env("BAZEL_OUTPUT_DISK_RETRY_WAIT", "0")
+            .env("BAZEL_OUTPUT_DISK_EVENTS", &self.events)
+            .envs(extra.iter().copied())
             .env_remove("BAZEL_SHARED_CACHE_DIR")
             .env("HOME", &self.root)
             .env("XDG_CONFIG_HOME", &self.root)
@@ -109,9 +119,41 @@ impl Fixture {
         format!("{}/bazel/", self.volume.display())
     }
 
+    fn recorded(&self) -> Vec<serde_json::Value> {
+        fs::read_to_string(&self.events)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
     fn log(&self) -> String {
         fs::read_to_string(self.root.join(".bazel-output-disk.log")).unwrap_or_default()
     }
+}
+
+/// A `mkdir` that hangs for the first `slow` calls it sees and works afterwards, like a volume that
+/// wakes up. `calls` counts every attempt the hook made.
+fn waking_volume(fixture: &Fixture, slow: usize) -> PathBuf {
+    let calls = fixture.shims.join("calls");
+    fs::write(&calls, "").unwrap();
+    let shim = fixture.shims.join("mkdir");
+    fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\ncase \"$1 $2\" in \"-p \"*/Externo/bazel) printf x >> '{calls}'; \
+             [ \"$(wc -c < '{calls}')\" -le {slow} ] && exec sleep 30;; esac\n\
+             exec /bin/mkdir \"$@\"\n",
+            calls = calls.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+    calls
+}
+
+fn attempts(calls: &Path) -> usize {
+    fs::read_to_string(calls).unwrap().len()
 }
 
 struct Server(Child);
@@ -173,6 +215,7 @@ fn a_mounted_writable_volume_hosts_the_output_base() {
         "the write probe must clean up after itself"
     );
     assert!(fixture.log().is_empty());
+    assert!(fixture.recorded().is_empty());
 }
 
 #[test]
@@ -223,6 +266,104 @@ fn a_volume_that_stops_answering_falls_back_without_hanging() {
     assert!(output.status.success(), "{output:?}");
     assert_eq!(fixture.output_base(), fixture.internal_base());
     assert!(fixture.log().contains("does not answer within 1s"));
+}
+
+#[test]
+fn a_volume_that_answers_on_a_later_attempt_is_still_used() {
+    let fixture = Fixture::new();
+    let calls = waking_volume(&fixture, 1);
+    let output = fixture.run_with("1", Some(&fixture.shims));
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        fixture
+            .output_base()
+            .starts_with(&fixture.external_prefix())
+    );
+    assert_eq!(attempts(&calls), 2);
+    assert!(fixture.recorded().is_empty());
+    assert!(fixture.log().is_empty());
+}
+
+#[test]
+fn a_volume_that_stays_slow_falls_back_after_every_attempt_and_records_why() {
+    let fixture = Fixture::new();
+    let calls = waking_volume(&fixture, 99);
+    let output = fixture.run_tuned(
+        "1",
+        Some(&fixture.shims),
+        &[("BAZEL_OUTPUT_DISK_RETRIES", "3")],
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(fixture.output_base(), fixture.internal_base());
+    assert_eq!(attempts(&calls), 3);
+    let recorded = fixture.recorded();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0]["kind"], "slow");
+    assert_eq!(recorded[0]["volume"], fixture.volume.to_str().unwrap());
+    assert_eq!(recorded[0]["checkout"], fixture.root.to_str().unwrap());
+    assert!(
+        recorded[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("3 attempt(s)")
+    );
+    let at = recorded[0]["at"].as_str().unwrap();
+    assert!(at.len() == 20 && at.ends_with('Z'), "{at}");
+}
+
+#[test]
+fn a_slow_volume_never_pushes_a_nearly_full_internal_disk_over_the_edge() {
+    let fixture = Fixture::new();
+    fixture.run();
+    let external = fixture.output_base();
+    waking_volume(&fixture, 99);
+    let output = fixture.run_tuned(
+        "1",
+        Some(&fixture.shims),
+        &[("BAZEL_OUTPUT_DISK_INTERNAL_MIN_FREE_GB", "999999999")],
+    );
+    assert!(!output.status.success(), "{output:?}");
+    assert_eq!(fixture.output_base(), external);
+    assert!(!Path::new(&fixture.internal_base()).exists());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("below the 999999999 GB margin"), "{stderr}");
+    assert!(stderr.contains("instead of filling it"), "{stderr}");
+    let recorded = fixture.recorded();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0]["kind"], "blocked_low_disk");
+}
+
+#[test]
+fn a_refused_write_is_not_retried_and_is_recorded() {
+    let fixture = Fixture::new();
+    fs::set_permissions(&fixture.volume, fs::Permissions::from_mode(0o555)).unwrap();
+    let _restore = Unlocked(&fixture.volume);
+    let calls = waking_volume(&fixture, 0);
+    fixture.run_with("1", Some(&fixture.shims));
+    assert_eq!(attempts(&calls), 1);
+    assert_eq!(fixture.recorded()[0]["kind"], "refused");
+}
+
+#[test]
+fn an_unmounted_volume_is_recorded_without_blocking_the_internal_disk() {
+    let fixture = Fixture::new();
+    fixture.mount(false);
+    let output = fixture.run_tuned(
+        "1",
+        None,
+        &[("BAZEL_OUTPUT_DISK_INTERNAL_MIN_FREE_GB", "999999999")],
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(fixture.output_base(), fixture.internal_base());
+    assert_eq!(fixture.recorded()[0]["kind"], "not_mounted");
+}
+
+#[test]
+fn the_probe_waits_twenty_seconds_by_default() {
+    let script =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/bazel-output-disk"))
+            .unwrap();
+    assert!(script.contains("BAZEL_OUTPUT_DISK_TIMEOUT:-20}"));
 }
 
 #[test]
@@ -329,6 +470,7 @@ fn repeated_hook_with_shared_cache_keeps_tracked_files_clean() {
                 .arg(&fixture.volume)
                 .current_dir(&fixture.root)
                 .env("BAZEL_OUTPUT_DISK_MOUNT_TABLE", &fixture.mounts)
+                .env("BAZEL_OUTPUT_DISK_EVENTS", &fixture.events)
                 .env("BAZEL_SHARED_CACHE_DIR", &shared)
                 .output()
                 .unwrap();

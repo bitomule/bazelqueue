@@ -3,14 +3,29 @@
 # mounted and writable, and at the checkout itself otherwise. When the output base changes, the
 # Bazel server of the previous one is stopped so two servers never outlive the switch.
 #
+# A volume that is mounted but slow to answer is retried before it counts as unavailable. When it
+# stays unavailable and the internal disk has less free space than the margin, the hook does not
+# fall back: the output base stays on the volume and the hook fails, so builds fail instead of
+# filling the internal disk. Every fallback and refusal is recorded for `bazelqueue status`.
+#
 # usage: bazel-output-disk <volume>        e.g. bazel-output-disk /Volumes/Externo
 #
-# BAZEL_OUTPUT_DISK_TIMEOUT        seconds a write probe may take before the volume counts as hung
+# BAZEL_OUTPUT_DISK_TIMEOUT        seconds one write probe may take before the volume counts as hung
+# BAZEL_OUTPUT_DISK_RETRIES        probe attempts for a volume that is mounted but does not answer
+# BAZEL_OUTPUT_DISK_RETRY_WAIT     seconds between those attempts
+# BAZEL_OUTPUT_DISK_INTERNAL_MIN_FREE_GB
+#                                  free GB the internal disk must keep for the hook to fall back to it
+# BAZEL_OUTPUT_DISK_EVENTS         file that receives one JSON line per fallback; defaults to
+#                                  disk-fallbacks.jsonl in BAZELQUEUE_HOME
 # BAZEL_OUTPUT_DISK_MOUNT_TABLE    file listing mounts in `mount` format, instead of running mount
 set -eu
 
 volume=${1:?usage: bazel-output-disk <volume>}
-timeout=${BAZEL_OUTPUT_DISK_TIMEOUT:-3}
+timeout=${BAZEL_OUTPUT_DISK_TIMEOUT:-20}
+attempts=${BAZEL_OUTPUT_DISK_RETRIES:-3}
+retry_wait=${BAZEL_OUTPUT_DISK_RETRY_WAIT:-5}
+min_free_gb=${BAZEL_OUTPUT_DISK_INTERNAL_MIN_FREE_GB:-15}
+events=${BAZEL_OUTPUT_DISK_EVENTS:-${BAZELQUEUE_HOME:-$HOME/.local/state/bazelqueue}/disk-fallbacks.jsonl}
 root=$(git rev-parse --show-toplevel)
 setup=$(dirname "$0")/worktree-bazel-setup
 log=$root/.bazel-output-disk.log
@@ -29,14 +44,22 @@ probe() {
     mkdir -p "$volume/bazel" && mkdir "$volume/bazel/.write-probe.$$" && rmdir "$volume/bazel/.write-probe.$$"
 }
 
-unavailable() {
-    printf 'bazel-output-disk: %s; using the internal disk\n' "$1" | tee -a "$log" >&2
+json_string() {
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr -d '\n'
 }
 
-available() {
-    if ! mounted; then
-        return 1
-    fi
+record() {
+    {
+        mkdir -p "$(dirname "$events")"
+        printf '{"at":"%s","checkout":"%s","volume":"%s","kind":"%s","reason":"%s"}\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(json_string "$root")" "$(json_string "$volume")" \
+            "$1" "$(json_string "$2")" >>"$events"
+        tail -n 200 "$events" >"$events.$$" && mv "$events.$$" "$events"
+    } 2>/dev/null || true
+}
+
+# Exit status 0: the volume took a write. 1: the write was refused. 2: it did not answer in time.
+attempt() {
     probe 2>/dev/null &
     probe_pid=$!
     waited=0
@@ -44,8 +67,7 @@ available() {
         if [ "$waited" -ge $((timeout * 10)) ]; then
             pkill -9 -P "$probe_pid" 2>/dev/null || true
             kill -9 "$probe_pid" 2>/dev/null || true
-            unavailable "$volume does not answer within ${timeout}s"
-            return 1
+            return 2
         fi
         sleep 0.1
         waited=$((waited + 1))
@@ -53,8 +75,11 @@ available() {
     if wait "$probe_pid"; then
         return 0
     fi
-    unavailable "writing to $volume was refused; grant the app that runs the builds access in System Settings > Privacy & Security > Files & Folders (Removable Volumes) or Full Disk Access"
     return 1
+}
+
+internal_free_gb() {
+    df -Pk "$root" | awk 'NR == 2 { print int($4 / 1048576) }'
 }
 
 current_base() {
@@ -80,12 +105,54 @@ stop_server() {
 "$setup" --check
 
 previous=$(current_base)
+hash=$(printf '%s' "$root" | shasum -a 256 | cut -c1-16)
+external=$volume/bazel/$hash
 
-if available; then
-    hash=$(printf '%s' "$root" | shasum -a 256 | cut -c1-16)
-    next=$volume/bazel/$hash
+kind=
+reason=
+if ! mounted; then
+    kind=not_mounted
+    reason="$volume is not mounted"
 else
+    tries=1
+    while :; do
+        result=0
+        attempt || result=$?
+        if [ "$result" -ne 2 ] || [ "$tries" -ge "$attempts" ]; then
+            break
+        fi
+        sleep "$retry_wait"
+        tries=$((tries + 1))
+    done
+    case $result in
+    0) ;;
+    2)
+        kind=slow
+        reason="$volume does not answer within ${timeout}s after $tries attempt(s)"
+        ;;
+    *)
+        kind=refused
+        reason="writing to $volume was refused; grant the app that runs the builds access in System Settings > Privacy & Security > Files & Folders (Removable Volumes) or Full Disk Access"
+        ;;
+    esac
+fi
+
+if [ -z "$kind" ]; then
+    next=$external
+else
+    free_gb=$(internal_free_gb)
+    if [ "$kind" != not_mounted ] && [ "$free_gb" -lt "$min_free_gb" ]; then
+        reason="$reason; the internal disk has ${free_gb} GB free, below the ${min_free_gb} GB margin, so builds stay on $volume and fail instead of filling it"
+        "$setup" "$external"
+        printf 'bazel-output-disk: %s\n' "$reason" | tee -a "$log" >&2
+        record blocked_low_disk "$reason"
+        exit 1
+    fi
     next=$root/.bazel-output
+    if [ "$kind" != not_mounted ]; then
+        printf 'bazel-output-disk: %s; using the internal disk\n' "$reason" | tee -a "$log" >&2
+    fi
+    record "$kind" "$reason"
 fi
 
 "$setup" "$next"
