@@ -36,6 +36,12 @@ fn bazel(state: &Path, arguments: &[String]) {
         .any(|arg| arg == "--check_up_to_date" || arg == "--check_tests_up_to_date")
     {
         record("check");
+        if let Ok(socket) = fs::read_to_string(state.join("check_hold")) {
+            let mut connection = UnixStream::connect(socket.trim()).unwrap();
+            connection.write_all(b"R").unwrap();
+            let mut release = [0; 1];
+            connection.read_exact(&mut release).unwrap();
+        }
         process::exit(
             fs::read_to_string(state.join("check")).map_or(1, |code| code.trim().parse().unwrap()),
         );

@@ -773,9 +773,7 @@ pub fn legacy_invocations_for(shims: &[std::path::PathBuf]) -> Result<Vec<Identi
             continue;
         };
         if process.cmd().is_empty() {
-            if still_running(&owner) {
-                bail!("legacy invocation arguments unavailable");
-            }
+            unreadable_shell(&owner, identity(owner.pid))?;
             continue;
         }
         if let Some(script) = shell_script(process.cmd(), process.cwd())?
@@ -788,8 +786,14 @@ pub fn legacy_invocations_for(shims: &[std::path::PathBuf]) -> Result<Vec<Identi
     Ok(owners)
 }
 
-fn still_running(owner: &Identity) -> bool {
-    identity(owner.pid).is_some_and(|current| current == *owner)
+/// A shell listed without arguments counts only while the same process,
+/// by PID and birth, is still there; one that exited or whose PID was reused
+/// is gone and says nothing about legacy builds.
+fn unreadable_shell(listed: &Identity, current: Option<Identity>) -> Result<()> {
+    if current.as_ref() == Some(listed) {
+        bail!("legacy invocation arguments unavailable");
+    }
+    Ok(())
 }
 
 fn shell_script(
@@ -1192,21 +1196,44 @@ mod vanished_process_tests {
     use super::*;
     use std::process::Command;
 
-    #[test]
-    fn a_process_that_exited_after_listing_is_not_treated_as_unreadable() {
-        let mut child = Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
-        let owner = identity(child.id()).unwrap();
-        assert!(still_running(&owner));
-        child.wait().unwrap();
-        assert!(!still_running(&owner));
+    fn listed() -> Identity {
+        Identity {
+            pid: 4242,
+            birth: "1:100:0".into(),
+        }
     }
 
     #[test]
-    fn a_reused_pid_is_not_the_process_that_was_listed() {
-        let listed = Identity {
-            pid: std::process::id(),
-            birth: "earlier".into(),
+    fn a_live_shell_without_readable_arguments_is_an_error() {
+        let error = unreadable_shell(&listed(), Some(listed())).unwrap_err();
+        assert_eq!(error.to_string(), "legacy invocation arguments unavailable");
+    }
+
+    #[test]
+    fn a_shell_that_exited_after_listing_is_not_unreadable() {
+        assert!(unreadable_shell(&listed(), None).is_ok());
+    }
+
+    #[test]
+    fn a_reused_pid_is_not_the_shell_that_was_listed() {
+        let reused = Identity {
+            birth: "1:200:0".into(),
+            ..listed()
         };
-        assert!(!still_running(&listed));
+        assert!(unreadable_shell(&listed(), Some(reused)).is_ok());
+    }
+
+    #[test]
+    fn a_real_process_is_unreadable_only_until_it_exits() {
+        let mut child = Command::new("sh")
+            .args(["-c", "read line"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let owner = identity(child.id()).unwrap();
+        assert!(unreadable_shell(&owner, identity(owner.pid)).is_err());
+        drop(child.stdin.take());
+        child.wait().unwrap();
+        assert!(unreadable_shell(&owner, identity(owner.pid)).is_ok());
     }
 }

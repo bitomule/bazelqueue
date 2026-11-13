@@ -246,7 +246,7 @@ finished successfully. The coordinator sends the slot's budget with the check. I
 slot the guardian runs the hooks and the info probe, then the caller's invocation
 with `--noblock_for_lock`, the up-to-date check flag and no build event outputs,
 as an owned executor behind the same permit barrier. Only exit code 0 admits, and only while
-admission is not held: the request moves straight to starting in its slot
+admission is not held and legacy discovery answers with no legacy work: the request moves straight to starting in its slot
 and does not record an estimate. Anything else returns it, prepared and with its own budget, to its
 original queue position; a busy server returns it unprepared. Fast-lane state is
 an optional job field, so older journals and coordinators keep the ordinary path.

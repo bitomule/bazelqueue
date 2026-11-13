@@ -1145,7 +1145,8 @@ pub async fn run(paths: Paths) -> Result<()> {
             let mut capacity = Capacity {
                 pressure: mode,
                 legacy_active: jobs.iter().any(|job| job.state == "queued")
-                    && legacy_owners(&store, &config).map_or(true, |owners| !owners.is_empty()),
+                    && legacy_owners(&paths, &store, &config)
+                        .map_or(true, |owners| !owners.is_empty()),
                 drained: store.drained()?,
                 run_memory_mib: platform::process_memory(&run_owners),
                 new_memory_mib: monitor
@@ -1407,7 +1408,7 @@ fn handle(
                         utilization: usage.visible_hours(
                             SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64,
                         ),
-                        legacy: legacy_owners(store, config).unwrap_or_default(),
+                        legacy: legacy_owners(paths, store, config).unwrap_or_default(),
                         jobs: {
                             let jobs = store.jobs()?;
                             let cutoff = jobs
@@ -1508,7 +1509,8 @@ fn handle(
                     job.server = server;
                     let admitting = monitor.mode() == Pressure::Normal
                         && !store.drained()?
-                        && legacy_owners(store, config)?.is_empty();
+                        && legacy_owners(paths, store, config)
+                            .is_ok_and(|owners| owners.is_empty());
                     match (&job.fast, up_to_date) {
                         (FastLane::Checking { .. }, Some(true)) if admitting => {
                             job.fast = FastLane::Admitted;
@@ -1584,7 +1586,12 @@ fn record_passes(store: &Store, jobs: &mut [Job], overtaken: &[u64]) -> Result<(
     Ok(())
 }
 
-fn legacy_owners(store: &Store, config: &Config) -> Result<Vec<platform::Identity>> {
+#[cfg_attr(not(any(test, feature = "test-fixtures")), allow(unused_variables))]
+fn legacy_owners(paths: &Paths, store: &Store, config: &Config) -> Result<Vec<platform::Identity>> {
+    #[cfg(any(test, feature = "test-fixtures"))]
+    if paths.root.join("legacy-unreadable").exists() {
+        bail!("legacy invocation arguments unavailable");
+    }
     let mut owners = platform::legacy_invocations_for(&store.legacy_shims()?)?;
     owners.extend(
         config
@@ -2174,6 +2181,23 @@ mod tests {
         let job = fixture.stored("drained");
         assert_eq!(job.state, "queued");
         assert_eq!(job.fast, FastLane::Declined);
+    }
+
+    #[test]
+    fn a_failed_legacy_discovery_queues_a_prepared_check_instead_of_failing_it() {
+        let fixture = Fixture::new();
+        let config = fast_config();
+        let original = checking(&fixture, &config, "unreadable");
+        fs::write(fixture.paths.root.join("legacy-unreadable"), b"").unwrap();
+        let events = deliver(&fixture, &config, "unreadable", prepared(Some(true)));
+        assert!(matches!(events.as_slice(), [Event::Ack]), "{events:?}");
+        let job = fixture.stored("unreadable");
+        assert_eq!(job.state, "queued");
+        assert_eq!(job.sequence, original.sequence);
+        assert_eq!(job.fast, FastLane::Declined);
+        assert!(job.request.prepared);
+        assert_eq!(job.request.lane, "output-base");
+        assert!(!job.holds_fast_capacity() && !job.holds_build_capacity());
     }
 
     #[test]
