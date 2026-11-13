@@ -2854,6 +2854,104 @@ fn legacy_watcher_ignores_shim_paths_passed_as_unrelated_script_data() {
 }
 
 #[test]
+fn an_unreadable_live_shell_holds_a_checked_build_in_the_queue_instead_of_failing_it() {
+    let mut harness = Harness::new(1);
+    fs::write(
+        harness.paths.root.join("resources.json"),
+        r#"{"pressure":1,"total_mib":65536,"available_mib":32768,"swap_in_bytes":0,"swap_out_bytes":0,"swap_used_mib":0,"disk_free_mib":1048576}"#,
+    )
+    .unwrap();
+    let workspace = emulated_workspace(&harness, "held");
+    fs::write(workspace.join("check"), "0").unwrap();
+    finished_ok(&mut emulated_bazel(&harness, "held", &["build", "//:x"]));
+    let socket = |name: &str| {
+        let listener = UnixListener::bind(harness.root.path().join(name)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        fs::write(
+            workspace.join(name.trim_end_matches(".sock")),
+            listener
+                .local_addr()
+                .unwrap()
+                .as_pathname()
+                .unwrap()
+                .as_os_str()
+                .as_encoded_bytes(),
+        )
+        .unwrap();
+        listener
+    };
+    let checker = socket("check_hold.sock");
+    let holder = socket("hold.sock");
+    let build = emulated_bazel(&harness, "held", &["build", "//:x"])
+        .spawn()
+        .unwrap();
+    harness.children.push(build);
+    let mut checking = Harness::accepted(&checker);
+    let unreadable = harness.paths.root.join("legacy-unreadable");
+    fs::write(&unreadable, b"").unwrap();
+    checking.write_all(b"F").unwrap();
+
+    let deadline = Instant::now() + START_DEADLINE;
+    let snapshot = loop {
+        if let Some(status) = harness.children[0].try_wait().unwrap() {
+            let mut stderr = String::new();
+            harness.children[0]
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut stderr)
+                .unwrap();
+            panic!("the build ended before admission ({status}): {stderr}");
+        }
+        if let Some(snapshot) = harness.snapshot()
+            && snapshot.jobs.iter().any(|job| {
+                job.state == "queued"
+                    && job.request.prepared
+                    && job.fast == bazelqueue::protocol::FastLane::Declined
+            })
+        {
+            break snapshot;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the build never reached the queue"
+        );
+        std::thread::yield_now();
+    };
+    assert!(snapshot.legacy.is_empty());
+    assert_not_started(&holder);
+    let id = snapshot
+        .jobs
+        .iter()
+        .find(|job| job.state == "queued")
+        .unwrap()
+        .request
+        .id
+        .clone();
+    let mut waiter = harness
+        .command()
+        .args(["wait", &id])
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    assert!(
+        harness
+            .snapshot()
+            .unwrap()
+            .jobs
+            .iter()
+            .any(|job| job.request.id == id && job.state == "queued")
+    );
+    assert!(waiter.try_wait().unwrap().is_none());
+    fs::remove_file(&unreadable).unwrap();
+    let mut admitted = Harness::accepted(&holder);
+    admitted.write_all(b"F").unwrap();
+    assert!(harness.children[0].wait().unwrap().success());
+    assert!(waiter.wait().unwrap().success());
+    assert_eq!(emulated_log(&workspace), ["run", "check", "run"]);
+}
+
+#[test]
 fn invalid_resume_retains_coordinator_ownership_and_drained_state() {
     let mut harness = Harness::new(1);
     control(&harness, "drain");

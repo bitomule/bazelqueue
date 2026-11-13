@@ -43,7 +43,10 @@ whole machine.
 A hook may, for example, choose where a checkout's Bazel output base lives; see "Preflight hooks" in the README.
 A persistent source-script watcher also catches legacy calls arriving during
 the cutover, including relative script paths. The old processes are allowed to finish; new requests wait while their ownership
-remains active. The old slot TTL is not used to grant new capacity. Original
+remains active. A live shell whose arguments cannot be read counts as legacy
+work: requests wait in the queue until it exits or becomes readable, and the
+build that hit it is never failed for it. A shell that exited or whose PID was
+reused since it was listed is ignored. The old slot TTL is not used to grant new capacity. Original
 scripts and symlink targets are backed up privately; caches and credentials are
 not moved into this repository.
 
