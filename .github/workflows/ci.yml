@@ -23,6 +23,17 @@ jobs:
           toolchain: '1.96.0'
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - name: Install the pinned Bazel controller
+        run: |
+          set -euo pipefail
+          URL="https://github.com/bazelbuild/bazel/releases/download/8.4.2/bazel-8.4.2-darwin-$(uname -m)"
+          mkdir -p "$RUNNER_TEMP/bazel-controller"
+          curl --fail --location "$URL" -o "$RUNNER_TEMP/bazel-controller/bazel"
+          curl --fail --location "$URL.sha256" -o "$RUNNER_TEMP/bazel-controller/bazel.sha256"
+          test "$(cut -d ' ' -f1 "$RUNNER_TEMP/bazel-controller/bazel.sha256")" = "$(shasum -a 256 "$RUNNER_TEMP/bazel-controller/bazel" | cut -d ' ' -f1)"
+          chmod +x "$RUNNER_TEMP/bazel-controller/bazel"
+          echo "$RUNNER_TEMP/bazel-controller" >> "$GITHUB_PATH"
+          echo "BAZEL=$RUNNER_TEMP/bazel-controller/bazel" >> "$GITHUB_ENV"
       - run: make all
       - run: cargo build --release --locked --bin bazelqueue
       - name: Validate the production distribution before publication
@@ -34,7 +45,7 @@ jobs:
           tar -xJf "$RUNNER_TEMP/dist.tar.xz" -C "$RUNNER_TEMP"
           VERSION=$(cargo metadata --no-deps --format-version=1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
           "$RUNNER_TEMP/cargo-dist-aarch64-apple-darwin/dist" build --artifacts=local --target=aarch64-apple-darwin --tag="v$VERSION"
-          ./packaging/smoke.sh target/distrib/bazelqueue-aarch64-apple-darwin.tar.xz "$VERSION"
+          make package-check ARCHIVE=target/distrib/bazelqueue-aarch64-apple-darwin.tar.xz VERSION="$VERSION"
   native:
     name: Bazel ${{ matrix.bazel }} contract
     runs-on: macos-15
@@ -67,8 +78,8 @@ jobs:
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
-            target/e2e/tmp/bazel-repository-cache
-            target/e2e/tmp/bazel-lockfiles
+            target/bazel-e2e/tmp/bazel-repository-cache
+            target/bazel-e2e/tmp/bazel-lockfiles
           key: bazel-fetch-${{ runner.os }}-${{ matrix.bazel }}-${{ hashFiles('tests/e2e.rs') }}
           restore-keys: bazel-fetch-${{ runner.os }}-${{ matrix.bazel }}-
-      - run: make contract
+      - run: make contract BAZEL="$BAZELQUEUE_TEST_BAZEL"

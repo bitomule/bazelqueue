@@ -34,6 +34,11 @@ name = "fixture-backend"
 path = "tests/fixtures/backend.rs"
 required-features = ["test-fixtures"]
 
+[[bin]]
+name = "validation-driver"
+path = "tests/fixtures/validation_driver.rs"
+required-features = ["test-fixtures"]
+
 [features]
 test-fixtures = []
 

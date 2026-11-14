@@ -84,15 +84,25 @@ server finishes, and the queue correctly continues accounting for that client.
 The negative ablation with an unread pipe must fail successor admission; the
 consumed-output version must pass all busy/quarantine/idleness checks.
 
-`make e2e`, `make contract`, and `make terminal` use a separate Cargo target
-directory. Ordinary Cargo checks therefore cannot replace a feature-enabled
-fixture executable while an E2E suite is using it.
+The current `make unit`, `make e2e`, `make contract` and `make terminal` entry
+points execute Bazel test targets. Their development-only Rust adapter compiles
+Cargo test executables and runs them directly; it never invokes `cargo test`.
+Unit, feature-enabled E2E and adapter compilations use separate Cargo target
+directories. Bazel declares the source inputs and serializes these local tests;
+results are not cached, while Cargo compilation remains incremental. This is a
+local bridge, not a remote/hermetic Rust toolchain. Native tests need an explicit
+`BAZELQUEUE_TEST_BAZEL` and `BAZELQUEUE_TEST_VERSION`. `//:regression` runs the
+unreadable-shell regressions, including a check against accidentally empty test
+filters. Package checks also run through Bazel with an explicit archive/version.
+
+Earlier validation entries below describe the commands used at that time. They
+are historical evidence, not claims that those commands were rerun for a release.
 
 `make contract` needs the network only once per Bazel version. The native
 workspaces turn off rule autoloading, which would otherwise download
 rules_java, rules_shell, rules_python and rules_cc from GitHub into every
 fresh output base. The first native test seeds a module lockfile and a shared
-repository cache under `target/e2e/tmp` by building and testing once. Every
+repository cache under `target/bazel-e2e/tmp` by building and testing once. Every
 later workspace reuses them and neither the registry nor GitHub is contacted.
 CI caches both directories. On 5 November 2026, with every download refused
 through a dead proxy, the 13 native tests passed against Bazel 8.4.2 and

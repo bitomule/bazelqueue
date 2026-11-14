@@ -444,11 +444,16 @@ reproduced the blocked client, and the consumed-output version passed.
 <summary>Development commands</summary>
 
 ```sh
-make all
-BAZELQUEUE_TEST_BAZEL=/absolute/path/to/bazel make contract
+make all                    # Tests execute through Bazel
+BAZELQUEUE_TEST_BAZEL=/absolute/path/to/bazel BAZELQUEUE_TEST_VERSION=8.4.2 make contract
 make release
 musts validate
 ```
+
+Development requires Rust, Python and Bazel/Bazelisk (the controller is pinned
+in `.bazelversion`). Cargo compiles test executables; local Bazel test targets
+execute them and report their results. `make package-check ARCHIVE=... VERSION=...`
+validates a production archive through Bazel.
 
 Runtime code is Rust. Python is used for development PTY tests and opt-in
 calibration. Tests isolate HOME, state and Bazel workspaces; ordinary suites

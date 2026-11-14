@@ -1,4 +1,7 @@
-.PHONY: build release fmt lint unit e2e contract terminal all install dist
+.PHONY: build release fmt lint unit e2e contract terminal all install dist package-check
+BAZEL ?= bazelisk
+BAZEL_STARTUP_FLAGS ?= --output_user_root=$(CURDIR)/.build/bazel
+BAZEL_TEST = $(BAZEL) $(BAZEL_STARTUP_FLAGS) test --test_output=errors
 build:
 	cargo build --locked
 release:
@@ -8,16 +11,20 @@ fmt:
 lint:
 	cargo clippy --all-targets --all-features --locked -- -D warnings
 unit:
-	cargo test --locked
+	$(BAZEL_TEST) //:unit
 e2e:
-	CARGO_TARGET_DIR=target/e2e cargo test --features test-fixtures --locked -- --test-threads=1
+	$(BAZEL_TEST) //:e2e
 contract:
 	test -n "$(BAZELQUEUE_TEST_BAZEL)"
-	CARGO_TARGET_DIR=target/e2e cargo test --features test-fixtures --test e2e native_ --locked -- --ignored --test-threads=1
+	test -n "$(BAZELQUEUE_TEST_VERSION)"
+	$(BAZEL_TEST) //:native --test_env=BAZELQUEUE_TEST_BAZEL --test_env=BAZELQUEUE_TEST_VERSION
 terminal:
-	CARGO_TARGET_DIR=target/e2e cargo build --features test-fixtures --bins --locked
-	BAZELQUEUE_TEST_BINARY=$(CURDIR)/target/e2e/debug/bazelqueue BAZELQUEUE_TEST_FIXTURE=$(CURDIR)/target/e2e/debug/fixture-backend python3 tests/terminal_e2e.py
-all: fmt lint unit e2e terminal
+	$(BAZEL_TEST) //:terminal
+package-check:
+	test -n "$(ARCHIVE)" -a -n "$(VERSION)"
+	$(BAZEL_TEST) //:package --test_env=BAZELQUEUE_TEST_ARCHIVE=$(abspath $(ARCHIVE)) --test_env=BAZELQUEUE_TEST_VERSION=$(VERSION)
+all: fmt lint
+	$(BAZEL_TEST) //:validation
 install: release
 	./target/release/bazelqueue setup
 dist:
