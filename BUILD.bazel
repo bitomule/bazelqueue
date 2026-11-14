@@ -1,0 +1,28 @@
+load(":validation.bzl", "validation_test")
+
+filegroup(
+    name = "validation_sources",
+    srcs = glob([
+        "src/**/*.rs",
+        "tests/**/*.rs",
+        "tests/**/*.py",
+        "packaging/**",
+        ".cargo/**",
+    ]) + ["Cargo.toml", "Cargo.lock"],
+)
+
+[
+    validation_test(
+        name = name,
+        mode = name,
+        data = [":validation_sources"],
+        tags = ["local", "exclusive", "no-cache"] + (["manual"] if name in ["native", "package", "controller"] else []),
+        timeout = "long",
+    )
+    for name in ["unit", "e2e", "terminal", "regression", "native", "package", "controller"]
+]
+
+test_suite(
+    name = "validation",
+    tests = [":unit", ":e2e", ":terminal"],
+)

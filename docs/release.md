@@ -17,7 +17,8 @@ The initial binaries were published using the built-in GITHUB_TOKEN. The
 validated v0.1.1 formula was then published with the already authenticated local
 GitHub CLI. No credential was copied into Actions. After adding the secrets,
 you can dispatch Release binaries and Homebrew with the latest stable release
-tag (currently `v0.1.1`) to verify idempotent publication of those same bytes. For later versions,
+tag (determine it from GitHub Releases; `v0.1.1` is only a historical example)
+to verify idempotent publication of those same bytes. For later versions,
 run Release preparation via workflow_dispatch and review/merge its release PR. release-plz uses tags (git_only=true)
 and does not publish crates. cargo-dist builds the production ARM64 archive on
 GitHub-hosted macOS. The release workflow verifies the existing tag's commit,
@@ -36,3 +37,21 @@ validated in CI before publication.
 
 The artifacts are not claimed to be notarized. Local Apple identities are never
 exported to CI. Only ARM64 macOS is published in this release.
+
+## Validation before publication
+
+`make all` runs formatting and Clippy, then the unit, process/installation and
+PTY suites through Bazel. Cargo compiles their executables with `cargo build
+--tests`; it does not execute tests. The native contract matrix also executes
+through Bazel on 8.4.2 and 9.2.0. A locked production release build is a separate
+check. `make package-check ARCHIVE=... VERSION=...` runs the package smoke check
+under Bazel both before publication and after downloading existing release bytes.
+The local bridge requires Rust, Python and Bazel, and does not claim remote or
+hermetic execution. Only the production `bazelqueue` binary is distributed.
+
+Before publishing, compare the current stable release, proposed tag, tap formula
+and installed version. Check that the tag's commit contains the intended fixes.
+Never move an existing tag or upload replacement release assets. On a partial
+publication, recover the existing archive and checksum and verify them before
+continuing. Upgrade the local formula and run `bazelqueue setup` to activate the
+new retained image and coordinator without cancelling queued or running builds.

@@ -1,1 +1,4 @@
 .bazel-output
+.build
+.scratch
+target

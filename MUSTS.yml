@@ -7,8 +7,10 @@ checks:
     uses: cargo/clippy
     paths: ["src/**", "tests/**", "Cargo.toml", "Cargo.lock"]
   unit:
-    uses: cargo/test
-    paths: ["src/**", "tests/**", "Cargo.toml", "Cargo.lock"]
+    uses: bazel/test
+    paths: ["src/**", "tests/**", "Cargo.toml", "Cargo.lock", "BUILD.bazel", "validation.bzl", "MODULE.bazel", "MODULE.bazel.lock", "Makefile", ".cargo/**", ".bazelrc", ".bazelignore", ".bazelversion"]
+    with:
+      targets: ["//:unit", "//:e2e", "//:terminal"]
   ownership:
     uses: agent
     paths: ["src/**", "tests/**"]
