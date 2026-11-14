@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - an unreadable shell during a fast-lane check no longer fails the build ([#48](https://github.com/bitomule/bazelqueue/pull/48))
 
+### Internal
+
+- run the validation suites and archive checks through Bazel
+
 ## [0.1.14](https://github.com/bitomule/bazelqueue/compare/v0.1.13...v0.1.14) - 2026-11-09
 
 ### Changed
