@@ -1,6 +1,6 @@
 [package]
 name = "bazelqueue"
-version = "0.1.14"
+version = "0.1.15"
 edition = "2024"
 rust-version = "1.96"
 license = "MIT OR Apache-2.0"
@@ -32,6 +32,11 @@ tokio = { version = "1", features = ["test-util"] }
 [[bin]]
 name = "fixture-backend"
 path = "tests/fixtures/backend.rs"
+required-features = ["test-fixtures"]
+
+[[bin]]
+name = "validation-driver"
+path = "tests/fixtures/validation_driver.rs"
 required-features = ["test-fixtures"]
 
 [features]

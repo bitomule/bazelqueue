@@ -419,11 +419,11 @@ and any limitations are recorded in the validation evidence below.
 
 | Layer | Checks | Evidence covered |
 |---|---:|---|
-| Unit | 160 | Scheduling, injected recovery/liveness, resource samples, utilization, framing, configuration and persistent drain state. |
-| Process E2E | 44 | FIFO/rank, priority overtaking, warning parallelism, pressure/swap recovery, cancellation, restart, raw argument bytes, retained executables and failure diagnostics. |
+| Unit | 177 | Scheduling, injected recovery/liveness, resource samples, utilization, framing, configuration and persistent drain state. |
+| Process E2E | 48 | FIFO/rank, priority overtaking, warning parallelism, pressure/swap recovery, cancellation, restart, raw argument bytes, retained executables and failure diagnostics. |
 | Installation | 17 | Interrupted setup, rollback, upgrades, original backups and shell activation. |
 | Interactive PTY | 3 | Terminal input, Ctrl-C and Ctrl-Z/fg in a real shell. |
-| Native Bazel | 12 per version | Parallel held actions under warning, paused guardians, interrupted retirement, orphan recovery and run handoff; matrix: 8.4.2 and 9.2.0. |
+| Native Bazel | 14 per version | Parallel held actions under warning, paused guardians, interrupted retirement, orphan recovery and run handoff; matrix: 8.4.2 and 9.2.0. |
 
 We deleted the original frontend executable during a live build and restarted
 the coordinator; retained ownership and native run handoff still completed.
@@ -444,11 +444,16 @@ reproduced the blocked client, and the consumed-output version passed.
 <summary>Development commands</summary>
 
 ```sh
-make all
-BAZELQUEUE_TEST_BAZEL=/absolute/path/to/bazel make contract
+make all                    # Tests execute through Bazel
+BAZELQUEUE_TEST_BAZEL=/absolute/path/to/bazel BAZELQUEUE_TEST_VERSION=8.4.2 make contract
 make release
 musts validate
 ```
+
+Development requires Rust, Python and Bazel/Bazelisk (the controller is pinned
+in `.bazelversion`). Cargo compiles test executables; local Bazel test targets
+execute them and report their results. `make package-check ARCHIVE=... VERSION=...`
+validates a production archive through Bazel.
 
 Runtime code is Rust. Python is used for development PTY tests and opt-in
 calibration. Tests isolate HOME, state and Bazel workspaces; ordinary suites

@@ -30,6 +30,17 @@ jobs:
           toolchain: '1.96.0'
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c
+      - name: Install the pinned Bazel controller
+        run: |
+          set -euo pipefail
+          URL="https://github.com/bazelbuild/bazel/releases/download/8.4.2/bazel-8.4.2-darwin-$(uname -m)"
+          mkdir -p "$RUNNER_TEMP/bazel-controller"
+          curl --fail --location "$URL" -o "$RUNNER_TEMP/bazel-controller/bazel"
+          curl --fail --location "$URL.sha256" -o "$RUNNER_TEMP/bazel-controller/bazel.sha256"
+          test "$(cut -d ' ' -f1 "$RUNNER_TEMP/bazel-controller/bazel.sha256")" = "$(shasum -a 256 "$RUNNER_TEMP/bazel-controller/bazel" | cut -d ' ' -f1)"
+          chmod +x "$RUNNER_TEMP/bazel-controller/bazel"
+          echo "$RUNNER_TEMP/bazel-controller" >> "$GITHUB_PATH"
+          echo "BAZEL=$RUNNER_TEMP/bazel-controller/bazel" >> "$GITHUB_ENV"
       - name: Validate immutable release identity
         run: |
           set -euo pipefail
@@ -51,13 +62,13 @@ jobs:
             "$RUNNER_TEMP/cargo-dist-aarch64-apple-darwin/dist" build --artifacts=local --target=aarch64-apple-darwin --tag="$RELEASE_TAG"
             cp target/distrib/bazelqueue-aarch64-apple-darwin.tar.xz publication/
             (cd publication && shasum -a 256 bazelqueue-aarch64-apple-darwin.tar.xz > bazelqueue-aarch64-apple-darwin.tar.xz.sha256)
-            ./packaging/smoke.sh publication/bazelqueue-aarch64-apple-darwin.tar.xz "${RELEASE_TAG#v}"
+            make package-check ARCHIVE=publication/bazelqueue-aarch64-apple-darwin.tar.xz VERSION="${RELEASE_TAG#v}"
             RELEASE_FLAGS=(--latest=true)
             if [[ "$RELEASE_TAG" == *-* ]]; then RELEASE_FLAGS=(--prerelease --latest=false); fi
             gh release create "$RELEASE_TAG" --verify-tag --title "bazelqueue ${RELEASE_TAG#v}" --generate-notes "${RELEASE_FLAGS[@]}" publication/*
           fi
           (cd publication && shasum -a 256 -c bazelqueue-aarch64-apple-darwin.tar.xz.sha256)
-          ./packaging/smoke.sh publication/bazelqueue-aarch64-apple-darwin.tar.xz "${RELEASE_TAG#v}"
+          make package-check ARCHIVE=publication/bazelqueue-aarch64-apple-darwin.tar.xz VERSION="${RELEASE_TAG#v}"
           cargo run --release --locked --bin bazelqueue -- package formula --archive publication/bazelqueue-aarch64-apple-darwin.tar.xz --release-version "${RELEASE_TAG#v}" --output publication/bazelqueue.rb
           ruby -c publication/bazelqueue.rb
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

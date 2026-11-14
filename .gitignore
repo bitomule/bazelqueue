@@ -4,6 +4,7 @@
 /.DS_Store
 *.profraw
 /publication/
+/.bazelrc.local
 __pycache__/
 /.musts/*
 !/.musts/ledger.lock.yaml

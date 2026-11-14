@@ -1,2 +1,7 @@
-
+build --incompatible_autoload_externally=
+build --repo_contents_cache=
+build --symlink_prefix=.build/bazel-
+test --test_env=PATH
+test --test_env=CARGO_HOME
+test --test_env=RUSTUP_HOME
 try-import %workspace%/.bazelrc.local
