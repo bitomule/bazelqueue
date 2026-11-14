@@ -16,10 +16,10 @@ filegroup(
         name = name,
         mode = name,
         data = [":validation_sources"],
-        tags = ["local", "exclusive", "no-cache"] + (["manual"] if name in ["native", "package"] else []),
+        tags = ["local", "exclusive", "no-cache"] + (["manual"] if name in ["native", "package", "controller"] else []),
         timeout = "long",
     )
-    for name in ["unit", "e2e", "terminal", "regression", "native", "package"]
+    for name in ["unit", "e2e", "terminal", "regression", "native", "package", "controller"]
 ]
 
 test_suite(

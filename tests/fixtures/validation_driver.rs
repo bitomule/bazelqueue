@@ -3,7 +3,7 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
-use std::{env, path::PathBuf, process::Command};
+use std::{env, ffi::OsString, fs, path::PathBuf, process::Command};
 
 fn main() {
     if let Err(error) = run() {
@@ -99,13 +99,10 @@ fn harnesses(
 fn run() -> Result<()> {
     let mode = env::args().nth(1).context("missing validation mode")?;
     match mode.as_str() {
+        "controller" => controller(),
         "unit" => harnesses(false, None, None, false),
-        "e2e" => {
-            // Both integration targets share the feature-enabled compilation tree.
-            let first = harnesses(true, Some("e2e"), None, false);
-            let second = harnesses(true, Some("install_transactions"), None, false);
-            first.and(second)
-        }
+        // Preserve the original feature-enabled suite, including its unit tests.
+        "e2e" => harnesses(true, None, None, false),
         "native" => {
             ensure!(
                 env::var_os("BAZELQUEUE_TEST_BAZEL").is_some(),
@@ -163,4 +160,44 @@ fn run() -> Result<()> {
         }
         _ => bail!("unknown validation mode"),
     }
+}
+
+fn controller() -> Result<()> {
+    let backend = env::var_os("BAZELQUEUE_TEST_BAZEL").context("set BAZELQUEUE_TEST_BAZEL")?;
+    let version = Command::new(&backend).arg("--version").output()?;
+    ensure!(
+        version.status.success()
+            && String::from_utf8_lossy(&version.stdout).trim() == "bazel 9.2.0",
+        "the controller regression requires the official Bazel 9.2.0 binary"
+    );
+    let root = env::current_dir()?;
+    let workspace = PathBuf::from(env::var_os("TEST_TMPDIR").context("run through Bazel")?)
+        .join("controller-workspace");
+    fs::create_dir_all(&workspace)?;
+    fs::write(
+        workspace.join("MODULE.bazel"),
+        "module(name=\"controller_probe\")\n",
+    )?;
+    fs::write(
+        workspace.join("BUILD.bazel"),
+        "filegroup(name=\"source\",srcs=[\"MODULE.bazel\"])\n",
+    )?;
+    let mut rc = OsString::from("--bazelrc=");
+    rc.push(root.join(".bazelrc"));
+    let mut cache = OsString::from("--output_user_root=");
+    cache.push(workspace.join(".build/cache"));
+    checked(
+        Command::new(backend)
+            .args([
+                "--batch",
+                "--nosystem_rc",
+                "--nohome_rc",
+                "--noworkspace_rc",
+            ])
+            .arg(rc)
+            .arg(cache)
+            .arg("--host_jvm_args=-Xmx256m")
+            .args(["build", "--nobuild", "--lockfile_mode=off", "//:source"])
+            .current_dir(workspace),
+    )
 }

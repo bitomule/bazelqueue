@@ -94,6 +94,10 @@ local bridge, not a remote/hermetic Rust toolchain. Native tests need an explici
 `BAZELQUEUE_TEST_BAZEL` and `BAZELQUEUE_TEST_VERSION`. `//:regression` runs the
 unreadable-shell regressions, including a check against accidentally empty test
 filters. Package checks also run through Bazel with an explicit archive/version.
+The pinned controller runs the native matrix on both backend versions.
+`//:controller` also analyzes an isolated workspace with Bazel 9.2.0 and a
+workspace-local output root. Disabling the repo contents cache in this repo's
+Bazel configuration prevents Bazel 9's cache-location guard from aborting it.
 
 Earlier validation entries below describe the commands used at that time. They
 are historical evidence, not claims that those commands were rerun for a release.

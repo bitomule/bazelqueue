@@ -17,7 +17,7 @@ e2e:
 contract:
 	test -n "$(BAZELQUEUE_TEST_BAZEL)"
 	test -n "$(BAZELQUEUE_TEST_VERSION)"
-	$(BAZEL_TEST) //:native --test_env=BAZELQUEUE_TEST_BAZEL --test_env=BAZELQUEUE_TEST_VERSION
+	$(BAZEL_TEST) //:native $(if $(filter 9.%,$(BAZELQUEUE_TEST_VERSION)),//:controller) --test_env=BAZELQUEUE_TEST_BAZEL --test_env=BAZELQUEUE_TEST_VERSION
 terminal:
 	$(BAZEL_TEST) //:terminal
 package-check:
