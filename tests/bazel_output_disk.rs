@@ -496,3 +496,53 @@ fn repeated_hook_with_shared_cache_keeps_tracked_files_clean() {
         );
     }
 }
+
+fn fake_server(base: &Path, pid: &str) {
+    fs::create_dir_all(base.join("server")).unwrap();
+    fs::write(base.join("server/server.pid.txt"), pid).unwrap();
+    fs::write(base.join("DO_NOT_BUILD_HERE"), "workspace").unwrap();
+}
+
+fn external_base(fixture: &Fixture) -> PathBuf {
+    fixture.run();
+    PathBuf::from(fixture.output_base())
+}
+
+#[test]
+fn a_base_whose_server_died_without_a_clean_exit_is_set_aside_not_deleted() {
+    let fixture = Fixture::new();
+    let base = external_base(&fixture);
+    fake_server(&base, "2147483646\n");
+    fixture.run();
+    assert_eq!(fixture.output_base(), base.display().to_string());
+    let name = base.file_name().unwrap().to_string_lossy().into_owned();
+    let aside: Vec<_> = fs::read_dir(base.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|entry| entry.starts_with(&format!("{name}.suspect.")))
+        .collect();
+    assert_eq!(aside.len(), 1, "{aside:?}");
+    assert!(
+        base.parent()
+            .unwrap()
+            .join(&aside[0])
+            .join("DO_NOT_BUILD_HERE")
+            .exists()
+    );
+    let events = fixture.recorded();
+    assert_eq!(events.last().unwrap()["kind"], "suspect_base");
+}
+
+#[test]
+fn a_base_with_a_running_server_or_without_a_pid_file_stays_where_it_is() {
+    let fixture = Fixture::new();
+    let base = external_base(&fixture);
+    fake_server(&base, &std::process::id().to_string());
+    fixture.run();
+    fs::remove_file(base.join("server/server.pid.txt")).unwrap();
+    fixture.run();
+    let entries: Vec<_> = fs::read_dir(base.parent().unwrap()).unwrap().collect();
+    assert_eq!(entries.len(), 1);
+    assert!(base.join("DO_NOT_BUILD_HERE").exists());
+    assert!(fixture.recorded().is_empty());
+}

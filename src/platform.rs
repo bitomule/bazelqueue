@@ -77,6 +77,9 @@ pub fn identity(pid: u32) -> Option<Identity> {
 pub fn current_identity() -> Result<Identity> {
     identity(std::process::id()).context("cannot verify own process identity")
 }
+pub fn pid_exists(pid: u32) -> bool {
+    identity(pid).is_some()
+}
 pub fn alive(owner: &Identity) -> bool {
     identity(owner.pid).as_ref() == Some(owner)
 }

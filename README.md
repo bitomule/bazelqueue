@@ -448,7 +448,7 @@ arguments = ["/Volumes/Externo"]
 - Every fallback or refusal is appended to `disk-fallbacks.jsonl` in the bazelqueue state directory
   (`BAZEL_OUTPUT_DISK_EVENTS` overrides the file; the last 200 lines are kept) as
   `{"at","checkout","volume","kind","reason"}`, with `kind` one of `not_mounted`, `slow`,
-  `refused` or `blocked_low_disk`. `bazelqueue status --json` lists the 20 most recent under
+  `refused`, `blocked_low_disk` or `suspect_base`. `bazelqueue status --json` lists the 20 most recent under
   `disk_fallbacks`, and `bazelqueue status` prints a summary line when there are any.
 - macOS grants access to removable volumes per process. The probe runs in the hook, which runs in
   the process tree of whoever called `bazel` (Claude, Codex, a terminal), the same tree that starts
@@ -464,9 +464,17 @@ arguments = ["/Volumes/Externo"]
   disk starts cold.
 - If the disk disappears during a build, that build fails, and the queue cuts it if it hangs
   (`stall_minutes`). The next build runs the hook again, sees the volume gone and uses the
-  internal disk. Nothing is retried inside the queue. A half-written output base on the
-  volume is recovered by Bazel when the disk returns, or with `bazel clean`.
-- Output bases on the volume are not removed when a worktree is deleted.
+  internal disk. Nothing is retried inside the queue. A server that died without removing its
+  pid file ended uncleanly (the disk went away under it, or it crashed): when the hook next picks
+  that base on the volume it renames it to `<hash>.suspect.<time>` and records `suspect_base`, so
+  the build starts a fresh base and only that one is rebuilt; the shared caches are never touched
+  and nothing is deleted by the hook.
+- Output bases on the volume are not removed when a worktree is deleted. `bazelqueue output-bases
+  <volume>` lists the ones nothing uses: Bazel's own `DO_NOT_BUILD_HERE` marker names a checkout
+  that no longer exists (a checkout under `/Volumes/<name>` whose volume is not mounted counts as
+  present), or the hook set the base aside as suspect, and in both cases no Bazel server runs on
+  it. A folder without that marker is never listed. `--delete` removes the listed bases, moving
+  each aside first so an interrupted deletion shows up as unfinished and a rerun finishes it.
 
 ## Compatibility
 

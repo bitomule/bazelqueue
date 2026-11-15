@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use bazelqueue::{
     config::{Config, Paths},
-    coordinator, install, platform,
+    coordinator, install, output_bases, platform,
     protocol::Event,
     runner, summary,
 };
@@ -44,6 +44,13 @@ enum Control {
     Drain,
     Resume,
     Doctor,
+    /// List the output bases on a volume that no checkout uses any more; `--delete` removes them.
+    OutputBases {
+        /// The volume `tools/bazel-output-disk` was given, for example /Volumes/Externo.
+        volume: PathBuf,
+        #[arg(long)]
+        delete: bool,
+    },
     Package {
         #[command(subcommand)]
         command: PackageCommand,
@@ -204,6 +211,22 @@ async fn entry() -> Result<()> {
         } => install::setup(&paths, backend, bin_dir, replace, migrate, preview).await?,
         Control::Uninstall => install::uninstall(&paths).await?,
         Control::Doctor => install::doctor(&paths).await?,
+        Control::OutputBases { volume, delete } => {
+            let orphans = output_bases::orphans(&volume, platform::pid_exists)?;
+            for orphan in &orphans {
+                println!("{}  {}", orphan.base.display(), orphan.describe());
+                if delete {
+                    output_bases::remove(orphan)?;
+                }
+            }
+            match (delete, orphans.len()) {
+                (_, 0) => println!("No unused output bases under {}", volume.display()),
+                (true, count) => println!("Deleted {count} unused output base(s)"),
+                (false, count) => {
+                    println!("{count} unused output base(s); rerun with --delete to remove them")
+                }
+            }
+        }
         Control::Package {
             command:
                 PackageCommand::Formula {

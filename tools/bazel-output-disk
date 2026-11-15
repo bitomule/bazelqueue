@@ -101,6 +101,22 @@ stop_server() {
     done
 }
 
+# A server that died without removing its pid file ended uncleanly (the volume went away under it,
+# or it crashed): the base is set aside, never deleted, and the next build starts a fresh one.
+# `bazelqueue output-bases` lists what was set aside.
+set_aside_if_server_died() {
+    pid_file=$1/server/server.pid.txt
+    [ -f "$pid_file" ] || return 0
+    pid=$(tr -d '[:space:]' <"$pid_file")
+    case $pid in '' | *[!0-9]*) return 0 ;; esac
+    if kill -0 "$pid" 2>/dev/null; then
+        return 0
+    fi
+    aside=$1.suspect.$(date +%s)
+    mv "$1" "$aside"
+    record suspect_base "the Bazel server of $1 died without a clean exit; the base was set aside as $aside"
+}
+
 # Fail before probing volumes or writing logs when this checkout is not prepared.
 "$setup" --check
 
@@ -153,6 +169,10 @@ else
         printf 'bazel-output-disk: %s; using the internal disk\n' "$reason" | tee -a "$log" >&2
     fi
     record "$kind" "$reason"
+fi
+
+if [ "$next" = "$external" ]; then
+    set_aside_if_server_died "$external"
 fi
 
 "$setup" "$next"

@@ -4,6 +4,7 @@ pub mod coordinator;
 pub mod estimate;
 pub mod install;
 pub mod native_server;
+pub mod output_bases;
 pub mod platform;
 pub mod protocol;
 pub mod recovery;
