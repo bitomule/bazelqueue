@@ -1460,6 +1460,84 @@ fn an_up_to_date_build_starts_at_once_while_the_queue_is_full() {
     );
 }
 
+/// A `bazel run` of a long program, in a queue with a single slot: builds, the
+/// program's own among them, must finish while the program is still alive.
+fn run_program_leaves_the_slot_to_builds(version: &str, flags: &[&str]) {
+    let mut harness = Harness::new(1);
+    let program = emulated_workspace(&harness, "program");
+    let other = emulated_workspace(&harness, "other");
+    fs::write(
+        harness.root.path().join("program/.bazelversion"),
+        format!("{version}\n"),
+    )
+    .unwrap();
+    let holder = UnixListener::bind(harness.root.path().join("program.sock")).unwrap();
+    fs::write(
+        program.join("hold"),
+        holder
+            .local_addr()
+            .unwrap()
+            .as_pathname()
+            .unwrap()
+            .as_os_str()
+            .as_encoded_bytes(),
+    )
+    .unwrap();
+    let mut arguments = vec!["run"];
+    arguments.extend(flags);
+    arguments.push("//:x");
+    let mut run = emulated_bazel(&harness, "program", &arguments);
+    run.stdin(Stdio::piped()).stdout(Stdio::piped());
+    let mut run = run.spawn().unwrap();
+    let mut stdin = run.stdin.take().unwrap();
+    let mut target = Harness::accepted(&holder);
+    fs::remove_file(program.join("hold")).unwrap();
+
+    for name in ["program", "other"] {
+        let build = emulated_bazel(&harness, name, &["build", "//:x"])
+            .spawn()
+            .unwrap();
+        harness.children.push(build);
+    }
+    let snapshot = harness.wait(|s| {
+        s.jobs
+            .iter()
+            .filter(|job| job.state == "finished" && job.request.command == "build")
+            .count()
+            == 2
+    });
+    assert!(
+        snapshot
+            .jobs
+            .iter()
+            .any(|job| job.request.command == "run" && !job.terminal()),
+        "the program was still running"
+    );
+    assert_eq!(emulated_log(&other), ["run"]);
+
+    target.write_all(b"F").unwrap();
+    stdin.write_all(b"payload").unwrap();
+    drop(stdin);
+    let output = run.wait_with_output().unwrap();
+    assert_eq!(output.stdout, b"payload");
+    assert_eq!(output.status.code(), Some(3));
+}
+
+#[test]
+fn a_managed_run_leaves_the_slot_while_its_program_runs() {
+    run_program_leaves_the_slot_to_builds("8.4.2", &[]);
+}
+
+#[test]
+fn a_run_on_an_unsupported_bazel_leaves_the_slot_while_its_program_runs() {
+    run_program_leaves_the_slot_to_builds("7.6.1", &[]);
+}
+
+#[test]
+fn a_run_with_its_own_resource_flags_leaves_the_slot_while_its_program_runs() {
+    run_program_leaves_the_slot_to_builds("8.4.2", &["--local_cpu_resources=2"]);
+}
+
 fn native_backend() -> PathBuf {
     PathBuf::from(
         std::env::var_os("BAZELQUEUE_TEST_BAZEL")

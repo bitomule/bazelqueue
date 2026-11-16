@@ -89,7 +89,7 @@ waits. In a terminal, every position change is shown as it happens.
 | The caller disappears | Its owned backend is cancelled. Capacity is retained until completion or verified recovery. |
 | A build stops progressing | With no Bazel events, output or CPU for `stall_minutes`, the call exits with 124 (`TIMEOUT`) and its hung server is killed. A slow test keeps running: Bazel's progress lines count as output. |
 | The coordinator restarts | Guardians reconnect without submitting the command a second time. |
-| `bazel run` finishes compiling | The target runs through Bazel's generated script. Compilation capacity is released; the target's process footprint remains tracked. |
+| `bazel run` finishes compiling | The target runs through Bazel's generated script, on every Bazel version and with any flags. Compilation capacity is released, so the target's own builds queue like any other; the target's process footprint remains tracked. |
 
 Running builds never lose their reservation because a timer expired. Uncertain
 native work stays quarantined while recovery verifies its processes and server.
@@ -404,7 +404,7 @@ checks free disk space.
 | Distribution | macOS **Apple Silicon**, via Homebrew. |
 | Managed resource policy and native recovery | Validated on **Bazel 8.4.2 and 9.2.0**. |
 | Unsupported versions, opaque wrappers and complex overrides | Original arguments under exclusive compatibility admission. |
-| `bazel run --script_path` / `--norun` and opaque run modes | Preserve native behavior. |
+| `bazel run --script_path` / `--norun` | Preserve native behavior. |
 | Process scope | Calls through the activated PATH or explicit `exec`, for the same user. |
 
 Absolute calls to unmanaged binaries and other users' processes bypass PATH

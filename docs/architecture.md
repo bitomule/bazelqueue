@@ -33,7 +33,12 @@ owned child groups and restores it afterwards. Ctrl-C, Ctrl-Z/fg, stdin and isat
 are tested with a real interactive shell and PTY; pipes use inherited descriptors.
 
 Guardians reconnect to a restarted coordinator using their durable request ID.
-An owned run phase is an idempotent same-child transition. Native recovery never
+A `bazel run` is always split in two: Bazel only builds and writes its script
+(`--script_path`), whatever the Bazel version or flags, and the guardian then runs
+the script as a separate owned executor in the `run_phase` state, which holds no
+build slot. The program keeps the caller's stdin and stdout and its exit code is
+the call's; it runs without `BAZELQUEUE_ACTIVE`, so the builds it launches queue
+like any other. An owned run phase is an idempotent same-child transition. Native recovery never
 trusts a dead preflight JVM: same-workspace servers are rediscovered and probed
 through Bazel's authenticated CommandServer RPC with block_for_lock=false. The
 cookie, current process birth identity, final command result and returned PID

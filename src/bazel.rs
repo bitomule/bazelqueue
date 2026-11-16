@@ -179,8 +179,7 @@ pub fn inspect(args: Vec<OsString>, cwd: &Path, config: &Config) -> Invocation {
             command.as_deref(),
             Some("build" | "test" | "run" | "coverage")
         );
-    let run = managed
-        && command.as_deref() == Some("run")
+    let run = command.as_deref() == Some("run")
         && !args.iter().any(|arg| {
             let value = arg.to_string_lossy();
             value.starts_with("--script_path") || value == "--norun" || value == "--run=false"
@@ -236,8 +235,18 @@ pub fn arguments(
     config: &Config,
     script: Option<&Path>,
 ) -> Vec<OsString> {
+    let mut args = invocation.args.clone();
+    if let Some(script) = script {
+        let position = args
+            .iter()
+            .position(|arg| arg == "--")
+            .unwrap_or(args.len());
+        let mut value = OsString::from("--script_path=");
+        value.push(script);
+        args.insert(position, value);
+    }
     if !invocation.managed {
-        return invocation.args.clone();
+        return args;
     }
     let jobs = numeric_limit(invocation, "--jobs", u64::from(config.jobs));
     let memory = config.action_memory_mib.min(budget.memory_mib * 2 / 3);
@@ -258,16 +267,6 @@ pub fn arguments(
             .filter(|tests| *tests != u64::MAX)
             .map_or(0, |tests| tests.min(u64::from(budget.cpu)))
     );
-    let mut args = invocation.args.clone();
-    if let Some(script) = script {
-        let position = args
-            .iter()
-            .position(|arg| arg == "--")
-            .unwrap_or(args.len());
-        let mut value = OsString::from("--script_path=");
-        value.push(script);
-        args.insert(position, value);
-    }
     args.insert(
         invocation.command_index.unwrap_or(0),
         OsString::from(format!("--invocation_policy={policy}")),
@@ -557,6 +556,33 @@ mod tests {
             ),
             args
         );
+    }
+    #[test]
+    fn an_unmanaged_run_still_hands_its_program_to_a_script() {
+        let invocation = inspect(
+            ["run", "//:x", "--", "--flag"].map(OsString::from).to_vec(),
+            Path::new("/tmp"),
+            &Config::default(),
+        );
+        assert!(!invocation.managed, "no Bazel version is known here");
+        assert!(invocation.run);
+        assert_eq!(
+            arguments(
+                &invocation,
+                &Config::default().budget(false),
+                &Config::default(),
+                Some(Path::new("/s/execute"))
+            ),
+            ["run", "//:x", "--script_path=/s/execute", "--", "--flag"].map(OsString::from)
+        );
+        for own in ["--script_path=/x", "--norun", "--run=false"] {
+            let invocation = inspect(
+                ["run", own, "//:x"].map(OsString::from).to_vec(),
+                Path::new("/tmp"),
+                &Config::default(),
+            );
+            assert!(!invocation.run, "{own} keeps native behavior");
+        }
     }
     fn policy(args: &[&str], budget: &Budget) -> String {
         let invocation = Invocation {
