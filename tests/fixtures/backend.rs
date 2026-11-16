@@ -47,12 +47,57 @@ fn bazel(state: &Path, arguments: &[String]) {
         );
     }
     record("run");
+    if arguments.iter().any(|arg| arg == "run") {
+        let hold = fs::read_to_string(state.join("hold")).ok();
+        match arguments
+            .iter()
+            .find_map(|arg| arg.strip_prefix("--script_path="))
+        {
+            Some(script) => write_program_script(script, hold.as_deref()),
+            None => program(hold.as_deref()),
+        }
+        return;
+    }
     if let Ok(socket) = fs::read_to_string(state.join("hold")) {
         let mut connection = UnixStream::connect(socket.trim()).unwrap();
         connection.write_all(b"R").unwrap();
         let mut release = [0; 1];
         connection.read_exact(&mut release).unwrap();
     }
+}
+
+/// What `bazel run` leaves behind with `--script_path`: a script for the program,
+/// which must not see the fixture's own Bazel switch.
+fn write_program_script(script: &str, hold: Option<&str>) {
+    let executable = env::current_exe().unwrap();
+    fs::write(
+        script,
+        format!(
+            "#!/bin/sh\nexec env -u BAZELQUEUE_FIXTURE_BAZEL '{}' program '{}'\n",
+            executable.display(),
+            hold.unwrap_or("").trim()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+}
+
+/// The program of a `bazel run`: waits to be released, refuses a queue reservation
+/// inherited from the build, echoes stdin and exits with 3.
+fn program(hold: Option<&str>) {
+    if let Some(socket) = hold.filter(|socket| !socket.trim().is_empty()) {
+        let mut connection = UnixStream::connect(socket.trim()).unwrap();
+        connection.write_all(b"R").unwrap();
+        let mut release = [0; 1];
+        connection.read_exact(&mut release).unwrap();
+    }
+    if env::var_os("BAZELQUEUE_ACTIVE").is_some() {
+        process::exit(97);
+    }
+    let mut input = Vec::new();
+    std::io::stdin().read_to_end(&mut input).unwrap();
+    std::io::stdout().write_all(&input).unwrap();
+    process::exit(3);
 }
 
 fn main() {
@@ -136,6 +181,7 @@ fn main() {
             )
             .unwrap()
         ),
+        Some("program") => program(arguments.get(1).and_then(|arg| arg.to_str())),
         Some("exit") => process::exit(arguments[1].to_str().unwrap().parse().unwrap()),
         Some("identity") => println!("{}", process::id()),
         Some("tty") => {

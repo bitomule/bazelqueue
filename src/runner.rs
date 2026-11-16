@@ -553,7 +553,6 @@ pub async fn guardian(backend: PathBuf, args: Vec<OsString>, generic: bool) -> R
                         })
                     {
                         invocation.managed = false;
-                        invocation.run = false;
                         request.budget = config.budget(false);
                     }
                     if let Some(server) = &server {
