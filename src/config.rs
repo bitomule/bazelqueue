@@ -34,6 +34,8 @@ pub struct Config {
     pub fast_lane_slots: u32,
     /// Minutes without Bazel output, events or CPU before a job is cut; 0 turns detection off.
     pub stall_minutes: u32,
+    /// Size above which `daemon.log` moves to `daemon.log.1`.
+    pub log_limit_bytes: u64,
     pub hooks: Vec<Hook>,
     pub legacy: Vec<platform::Identity>,
 }
@@ -69,6 +71,7 @@ impl Default for Config {
             disk_safety_mib: 10240,
             fast_lane_slots: 2,
             stall_minutes: 10,
+            log_limit_bytes: 8 << 20,
             hooks: Vec::new(),
             legacy: Vec::new(),
         }
@@ -107,6 +110,7 @@ impl Config {
             || self.memory_safety_mib == 0
             || self.swap_thrashing_mib_per_min == 0
             || self.disk_safety_mib == 0
+            || self.log_limit_bytes == 0
         {
             bail!("resource capacities and concurrency must be positive");
         }
@@ -205,10 +209,11 @@ impl Paths {
                 .join(".local/state/bazelqueue")
         };
         platform::private_directory(&root)?;
-        let socket = root.join("control.sock");
+        let socket = env::var_os("BAZELQUEUE_SOCKET")
+            .map_or_else(|| root.join("control.sock"), PathBuf::from);
         if socket.as_os_str().len() > 100 {
             bail!(
-                "BAZELQUEUE_HOME is too long for a Unix socket; choose a path shorter than 85 bytes"
+                "the control socket path is too long for a Unix socket; shorten BAZELQUEUE_HOME (under 85 bytes) or set BAZELQUEUE_SOCKET to a shorter path"
             );
         }
         Ok(Self {

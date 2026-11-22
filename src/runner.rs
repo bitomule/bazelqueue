@@ -436,7 +436,7 @@ pub async fn guardian(backend: PathBuf, args: Vec<OsString>, generic: bool) -> R
         owner.pid,
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
     );
-    let _lease = platform::lock(&paths.lease(&id)?)?;
+    let _lease = platform::lease(&paths.lease(&id)?)?;
     let cwd = std::env::current_dir()?.canonicalize()?;
     let mut invocation = bazel::inspect(args, &cwd, &config);
     let command = if generic {

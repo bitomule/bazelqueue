@@ -428,7 +428,41 @@ pub fn retained_executable(paths: &Paths) -> Result<PathBuf> {
         bail!("staged executable changed");
     }
     put_image(&destination, &staged)?;
+    prune_executables(paths, &directory);
     Ok(destination)
+}
+
+/// Keeps the executable just staged, the one `current` points into and the newest other one.
+fn prune_executables(paths: &Paths, staged: &Path) {
+    let Ok(root) = paths.root.join("executables").canonicalize() else {
+        return;
+    };
+    let installed = paths.root.join("current").canonicalize().ok();
+    let Ok(entries) = fs::read_dir(&root) else {
+        return;
+    };
+    let staged = root.join(staged.file_name().unwrap_or_default());
+    let staged = staged.as_path();
+    let mut others: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path != staged)
+        .filter(|path| {
+            !installed
+                .as_ref()
+                .is_some_and(|binary| binary.starts_with(path))
+        })
+        .filter_map(|path| Some((fs::metadata(&path).ok()?.modified().ok()?, path)))
+        .collect();
+    others.sort();
+    let installed_apart = installed
+        .as_ref()
+        .is_some_and(|binary| binary.starts_with(&root) && !binary.starts_with(staged));
+    let previous = usize::from(!installed_apart);
+    others.truncate(others.len().saturating_sub(previous));
+    for (_, path) in others {
+        let _ = fs::remove_dir_all(path);
+    }
 }
 
 pub async fn setup(
@@ -804,4 +838,61 @@ pub async fn doctor(paths: &Paths) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod prune_tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+    fn retained(root: &Path, ages: &[(&str, u64)]) -> Paths {
+        let paths = Paths {
+            root: root.to_owned(),
+            config: root.join("config.toml"),
+            database: root.join("queue.sqlite3"),
+            socket: root.join("control.sock"),
+        };
+        for (name, age) in ages {
+            let directory = root.join("executables").join(name);
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join("bazelqueue"), name).unwrap();
+            fs::File::open(&directory)
+                .unwrap()
+                .set_modified(SystemTime::now() - Duration::from_secs(*age))
+                .unwrap();
+        }
+        paths
+    }
+    fn left(root: &Path) -> Vec<String> {
+        let mut names: Vec<_> = fs::read_dir(root.join("executables"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+    #[test]
+    fn only_the_current_and_the_previous_executable_stay() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = retained(
+            root.path(),
+            &[("a", 400), ("b", 300), ("c", 200), ("new", 0)],
+        );
+        prune_executables(&paths, &root.path().join("executables/new"));
+        assert_eq!(left(root.path()), ["c", "new"]);
+    }
+    #[test]
+    fn the_installed_executable_counts_as_the_previous_one() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = retained(
+            root.path(),
+            &[("a", 400), ("b", 300), ("c", 200), ("new", 0)],
+        );
+        std::os::unix::fs::symlink(
+            root.path().join("executables/a/bazelqueue"),
+            root.path().join("current"),
+        )
+        .unwrap();
+        prune_executables(&paths, &root.path().join("executables/new"));
+        assert_eq!(left(root.path()), ["a", "new"]);
+    }
 }

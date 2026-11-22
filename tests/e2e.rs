@@ -23,11 +23,14 @@ use std::{
 };
 use tempfile::TempDir;
 
+mod common;
+
 /// A failure bound, never a wait: it outlasts the guardian's 120-second preflight.
 const START_DEADLINE: Duration = Duration::from_secs(150);
 
 struct Harness {
     root: TempDir,
+    sockets: TempDir,
     paths: Paths,
     daemon: Child,
     children: Vec<Child>,
@@ -70,10 +73,11 @@ impl Harness {
         Self::with_coordinator(parallel, None)
     }
     fn with_coordinator(parallel: usize, fixture: Option<&str>) -> Self {
-        let root = tempfile::Builder::new()
-            .prefix("bqe-")
-            .tempdir_in("/private/tmp")
-            .unwrap();
+        Self::seeded(parallel, fixture, |_| {})
+    }
+    fn seeded(parallel: usize, fixture: Option<&str>, before_start: impl FnOnce(&Path)) -> Self {
+        let root = common::scratch("bqe-");
+        let sockets = common::sockets();
         let state = root.path().join("state");
         fs::create_dir(&state).unwrap();
         fs::write(state.join("pressure"), "1").unwrap();
@@ -81,7 +85,7 @@ impl Harness {
             root: state.clone(),
             config: state.join("config.toml"),
             database: state.join("queue.sqlite3"),
-            socket: state.join("control.sock"),
+            socket: sockets.path().join("control.sock"),
         };
         Config {
             backend: PathBuf::from(env!("CARGO_BIN_EXE_fixture-backend")),
@@ -94,10 +98,12 @@ impl Harness {
         }
         .save(&paths)
         .unwrap();
+        before_start(&state);
         let mut daemon = Command::new(env!("CARGO_BIN_EXE_bazelqueue"));
         daemon
             .args(["daemon", "run"])
             .env("BAZELQUEUE_HOME", &state)
+            .env("BAZELQUEUE_SOCKET", &paths.socket)
             .env("HOME", root.path())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
@@ -107,6 +113,7 @@ impl Harness {
         let daemon = daemon.spawn().unwrap();
         let mut harness = Self {
             root,
+            sockets,
             paths,
             daemon,
             children: Vec::new(),
@@ -159,6 +166,7 @@ impl Harness {
         let mut command = Command::new(env!("CARGO_BIN_EXE_bazelqueue"));
         command
             .env("BAZELQUEUE_HOME", &self.paths.root)
+            .env("BAZELQUEUE_SOCKET", &self.paths.socket)
             .env("HOME", self.root.path())
             .current_dir(self.root.path());
         command
@@ -178,7 +186,9 @@ impl Harness {
     ) -> UnixListener {
         let lane = self.root.path().join(label);
         fs::create_dir_all(&lane).unwrap();
-        let listener = UnixListener::bind(self.root.path().join(format!("{label}.sock"))).unwrap();
+        fs::write(lane.join("WORKSPACE"), "").unwrap();
+        let listener =
+            UnixListener::bind(self.sockets.path().join(format!("{label}.sock"))).unwrap();
         listener.set_nonblocking(true).unwrap();
         let mut command = self.command();
         if let Some(release) = release {
@@ -448,6 +458,99 @@ fn guardian_death_quarantines_a_still_running_child() {
     running.write_all(b"F").unwrap();
     let mut next = Harness::accepted(&second);
     next.write_all(b"F").unwrap();
+}
+
+fn lease_files(paths: &Paths) -> Vec<String> {
+    match fs::read_dir(paths.root.join("leases")) {
+        Ok(entries) => entries
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+#[test]
+fn a_finished_request_leaves_no_lease_file() {
+    let harness = Harness::new(1);
+    let output = harness
+        .command()
+        .args([
+            "exec",
+            "--",
+            env!("CARGO_BIN_EXE_fixture-backend"),
+            "exit",
+            "0",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(lease_files(&harness.paths), Vec::<String>::new());
+}
+
+#[test]
+fn a_running_request_keeps_its_lease_and_a_starting_coordinator_removes_only_dead_ones() {
+    let mut harness = Harness::seeded(1, None, |state| {
+        let leases = state.join("leases");
+        fs::create_dir(&leases).unwrap();
+        fs::write(leases.join("1-dead"), "").unwrap();
+        fs::write(leases.join("2-dead"), "").unwrap();
+    });
+    assert_eq!(lease_files(&harness.paths), Vec::<String>::new());
+    let held = harness.spawn_hold("held");
+    let mut running = Harness::accepted(&held);
+    assert_eq!(lease_files(&harness.paths).len(), 1);
+    running.write_all(b"F").unwrap();
+    for child in &mut harness.children {
+        assert!(child.wait().unwrap().success());
+    }
+    assert_eq!(lease_files(&harness.paths), Vec::<String>::new());
+}
+
+struct KillOnDrop(std::process::Child);
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn a_coordinator_log_above_its_limit_moves_aside_while_it_runs() {
+    let root = common::scratch("bqe-");
+    let sockets = common::sockets();
+    let state = root.path().join("state");
+    fs::create_dir(&state).unwrap();
+    let paths = Paths {
+        root: state.clone(),
+        config: state.join("config.toml"),
+        database: state.join("queue.sqlite3"),
+        socket: sockets.path().join("control.sock"),
+    };
+    Config {
+        backend: PathBuf::from(env!("CARGO_BIN_EXE_fixture-backend")),
+        log_limit_bytes: 64,
+        ..Config::default()
+    }
+    .save(&paths)
+    .unwrap();
+    let log = state.join("daemon.log");
+    fs::write(&log, [b'x'; 1024]).unwrap();
+    let mut daemon = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_bazelqueue"))
+            .args(["daemon", "run"])
+            .env("BAZELQUEUE_HOME", &state)
+            .env("BAZELQUEUE_SOCKET", &paths.socket)
+            .env("HOME", root.path())
+            .stdout(Stdio::null())
+            .stderr(fs::OpenOptions::new().append(true).open(&log).unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    let backup = state.join("daemon.log.1");
+    until(|| backup.exists());
+    assert_eq!(fs::metadata(&backup).unwrap().len(), 1024);
+    until(|| fs::metadata(&log).is_ok_and(|log| log.len() < 1024));
+    assert!(daemon.0.try_wait().unwrap().is_none());
 }
 
 #[test]
@@ -756,7 +859,7 @@ fn a_build_waits_for_free_memory_instead_of_shrinking_below_a_bazel_server() {
     write(32768);
     let busy = emulated_workspace(&harness, "busy");
     emulated_workspace(&harness, "next");
-    let holder = UnixListener::bind(harness.root.path().join("busy.sock")).unwrap();
+    let holder = UnixListener::bind(harness.sockets.path().join("busy.sock")).unwrap();
     fs::write(
         busy.join("hold"),
         holder
@@ -815,7 +918,7 @@ fn a_finished_build_leaves_its_measured_memory_for_its_output_base() {
     )
     .unwrap();
     let state = emulated_workspace(&harness, "measured");
-    let holder = UnixListener::bind(harness.root.path().join("measured.sock")).unwrap();
+    let holder = UnixListener::bind(harness.sockets.path().join("measured.sock")).unwrap();
     fs::write(
         state.join("hold"),
         holder
@@ -919,7 +1022,7 @@ fn lowering_limits_preserves_active_budget_and_reprofiles_waiters() {
 #[ignore = "requires BAZELQUEUE_TEST_BAZEL; real Bazel run-phase restart"]
 fn native_run_target_reconnects_and_accepts_cancel_after_restart() {
     let mut harness = Harness::new(1);
-    let socket = harness.root.path().join("target.sock");
+    let socket = harness.sockets.path().join("target.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     listener.set_nonblocking(true).unwrap();
     native_workspace(
@@ -1258,6 +1361,7 @@ fn emulated_bazel(harness: &Harness, name: &str, args: &[&str]) -> Command {
     command
         .args(args)
         .env("BAZELQUEUE_HOME", &harness.paths.root)
+        .env("BAZELQUEUE_SOCKET", &harness.paths.socket)
         .env("HOME", harness.root.path())
         .env(
             "BAZELQUEUE_FIXTURE_BAZEL",
@@ -1311,7 +1415,8 @@ fn each_worktree_output_base_is_its_own_lane() {
     let mut holders = Vec::new();
     for name in ["one", "two"] {
         let state = emulated_workspace(&harness, name);
-        let holder = UnixListener::bind(harness.root.path().join(format!("{name}.sock"))).unwrap();
+        let holder =
+            UnixListener::bind(harness.sockets.path().join(format!("{name}.sock"))).unwrap();
         holder.set_nonblocking(true).unwrap();
         fs::write(
             state.join("hold"),
@@ -1368,7 +1473,7 @@ fn an_up_to_date_build_starts_at_once_while_the_queue_is_full() {
     );
     assert!(!first.contains("at once"));
 
-    let holder = UnixListener::bind(harness.root.path().join("busy.sock")).unwrap();
+    let holder = UnixListener::bind(harness.sockets.path().join("busy.sock")).unwrap();
     fs::write(
         busy.join("hold"),
         holder
@@ -1471,7 +1576,7 @@ fn run_program_leaves_the_slot_to_builds(version: &str, flags: &[&str]) {
         format!("{version}\n"),
     )
     .unwrap();
-    let holder = UnixListener::bind(harness.root.path().join("program.sock")).unwrap();
+    let holder = UnixListener::bind(harness.sockets.path().join("program.sock")).unwrap();
     fs::write(
         program.join("hold"),
         holder
@@ -1572,10 +1677,7 @@ fn native_lockfile() -> PathBuf {
     if lockfile.exists() {
         return lockfile;
     }
-    let seed = tempfile::Builder::new()
-        .prefix("bqe-seed-")
-        .tempdir_in("/private/tmp")
-        .unwrap();
+    let seed = common::scratch("bqe-seed-");
     let workspace = seed.path().join("workspace");
     fs::create_dir(&workspace).unwrap();
     fs::write(workspace.join("MODULE.bazel"), NATIVE_MODULE).unwrap();
@@ -1668,6 +1770,7 @@ fn native_command(harness: &Harness, args: Vec<OsString>) -> Command {
     command
         .args(args)
         .env("BAZELQUEUE_HOME", &harness.paths.root)
+        .env("BAZELQUEUE_SOCKET", &harness.paths.socket)
         .env("HOME", harness.root.path())
         .current_dir(harness.root.path().join("workspace"));
     command
@@ -1856,7 +1959,7 @@ fn native_run_preserves_arguments_and_target_exit_nine() {
 #[ignore = "requires BAZELQUEUE_TEST_BAZEL; real Bazel in an isolated workspace"]
 fn native_guardian_loss_holds_capacity_until_client_and_server_finish() {
     let mut harness = Harness::new(1);
-    let socket = harness.root.path().join("action.sock");
+    let socket = harness.sockets.path().join("action.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     listener.set_nonblocking(true).unwrap();
     native_workspace(
@@ -1984,7 +2087,7 @@ fn native_unresponsive_orphan_finishes_and_admits_its_successor() {
 #[ignore = "requires BAZELQUEUE_TEST_BAZEL; real Bazel in an isolated workspace"]
 fn native_idle_quarantine_releases_while_guardian_is_paused_and_ignores_late_finish() {
     let mut harness = Harness::new(1);
-    let socket = harness.root.path().join("action.sock");
+    let socket = harness.sockets.path().join("action.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     native_workspace(
         &harness,
@@ -2047,10 +2150,7 @@ fn native_idle_quarantine_releases_while_guardian_is_paused_and_ignores_late_fin
 fn retirement_leaf_proof_refuses_a_live_child_without_signalling_it() {
     // Unix socket paths have a small native bound; TMPDIR may be a long
     // worktree path. Keep this isolated process fixture beside the harnesses.
-    let root = tempfile::Builder::new()
-        .prefix("bql-")
-        .tempdir_in("/private/tmp")
-        .unwrap();
+    let root = common::sockets();
     let listener = UnixListener::bind(root.path().join("child.sock")).unwrap();
     let mut parent = Command::new(env!("CARGO_BIN_EXE_fixture-backend"))
         .arg("tree-hold")
@@ -2091,10 +2191,7 @@ fn until_within(limit: Duration, mut condition: impl FnMut() -> bool) {
 
 #[test]
 fn established_clients_counts_the_command_port_and_not_outbound_connections() {
-    let root = tempfile::Builder::new()
-        .prefix("bql-")
-        .tempdir_in("/private/tmp")
-        .unwrap();
+    let root = common::sockets();
     let listener = UnixListener::bind(root.path().join("tcp.sock")).unwrap();
     let cache = std::net::TcpListener::bind("[::1]:0").unwrap();
     let mut server = FakeServer(
@@ -2121,10 +2218,7 @@ fn established_clients_counts_the_command_port_and_not_outbound_connections() {
 
 #[test]
 fn killing_a_tree_reaches_every_descendant_through_its_identity() {
-    let root = tempfile::Builder::new()
-        .prefix("bql-")
-        .tempdir_in("/private/tmp")
-        .unwrap();
+    let root = common::sockets();
     let listener = UnixListener::bind(root.path().join("child.sock")).unwrap();
     let mut parent = FakeServer(
         Command::new(env!("CARGO_BIN_EXE_fixture-backend"))
@@ -2229,7 +2323,7 @@ fn held_build(
     name: &str,
     state: &Path,
 ) -> (std::process::Child, UnixStream) {
-    let socket = harness.root.path().join(format!("{name}.sock"));
+    let socket = harness.sockets.path().join(format!("{name}.sock"));
     let listener = UnixListener::bind(&socket).unwrap();
     fs::write(state.join("hold"), socket.to_str().unwrap()).unwrap();
     let client = emulated_bazel(harness, name, &["build", "//:x"])
@@ -2387,7 +2481,7 @@ fn a_quarantined_server_that_cannot_be_verified_leaves_once_proven_stalled() {
 #[test]
 fn a_stalled_server_with_children_dies_with_its_whole_tree() {
     let mut harness = Harness::new(1);
-    let socket = harness.root.path().join("worker.sock");
+    let socket = harness.sockets.path().join("worker.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     let (mut server, state) = stalling_tree(&mut harness, "tree", Some(&socket));
     let mut worker = Harness::accepted(&listener);
@@ -2590,7 +2684,7 @@ fn native_distinct_workspaces_execute_in_parallel_with_bounded_shares() {
             workspace.join(".bazelversion"),
         )
         .unwrap();
-        let socket = harness.root.path().join(format!("{label}.sock"));
+        let socket = harness.sockets.path().join(format!("{label}.sock"));
         listeners.push(UnixListener::bind(&socket).unwrap());
         fs::write(workspace.join("BUILD.bazel"), format!("genrule(name=\"held\",outs=[\"held.txt\"],tags=[\"local\"],cmd=\"{} hold {}; echo done > $@\")\n", env!("CARGO_BIN_EXE_fixture-backend"), socket.display())).unwrap();
         let mut args = native_args(&harness, "build");
@@ -2652,7 +2746,7 @@ fn native_build_with_hooks_runs_beside_another_build() {
     let busy = harness.spawn_hold("busy");
     let mut held = Harness::accepted(&busy);
     let workspace = harness.root.path().join("workspace");
-    let socket = harness.root.path().join("native.sock");
+    let socket = harness.sockets.path().join("native.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     fs::write(
         workspace.join("BUILD.bazel"),
@@ -2692,7 +2786,7 @@ fn native_build_with_hooks_runs_beside_another_build() {
 fn preparing_hook_is_owned_after_guardian_loss_and_cancels_on_frontend_loss() {
     for guardian_loss in [true, false] {
         let mut harness = Harness::new(1);
-        let socket = harness.root.path().join("hook.sock");
+        let socket = harness.sockets.path().join("hook.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let mut config = Config::load(&harness.paths).unwrap();
         config.hooks.push(bazelqueue::config::Hook {
@@ -2705,6 +2799,7 @@ fn preparing_hook_is_owned_after_guardian_loss_and_cancels_on_frontend_loss() {
         let child = Command::new(shim)
             .arg("build")
             .env("BAZELQUEUE_HOME", &harness.paths.root)
+            .env("BAZELQUEUE_SOCKET", &harness.paths.socket)
             .env("HOME", harness.root.path())
             .current_dir(harness.root.path())
             .stdout(Stdio::null())
@@ -2748,7 +2843,7 @@ fn preparing_hook_is_owned_after_guardian_loss_and_cancels_on_frontend_loss() {
 #[ignore = "requires BAZELQUEUE_TEST_BAZEL; released run memory leaves room for a build"]
 fn native_run_releases_build_capacity_while_target_remains_alive() {
     let mut harness = Harness::new(1);
-    let socket = harness.root.path().join("target.sock");
+    let socket = harness.sockets.path().join("target.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     native_workspace(
         &harness,
@@ -2850,7 +2945,7 @@ fn hot_migration_tracks_late_legacy_calls_across_coordinator_restart() {
             .unwrap(),
         Event::Ack
     ));
-    let socket = harness.root.path().join("legacy.sock");
+    let socket = harness.sockets.path().join("legacy.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     fs::write(
         &shim,
@@ -2904,7 +2999,7 @@ fn legacy_watcher_ignores_shim_paths_passed_as_unrelated_script_data() {
             Some(serde_json::to_string(&vec![shim.clone()]).unwrap()),
         ))
         .unwrap();
-    let socket = harness.root.path().join("unrelated.sock");
+    let socket = harness.sockets.path().join("unrelated.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     let other = harness.root.path().join("other.sh");
     fs::write(
@@ -2943,7 +3038,7 @@ fn an_unreadable_live_shell_holds_a_checked_build_in_the_queue_instead_of_failin
     fs::write(workspace.join("check"), "0").unwrap();
     finished_ok(&mut emulated_bazel(&harness, "held", &["build", "//:x"]));
     let socket = |name: &str| {
-        let listener = UnixListener::bind(harness.root.path().join(name)).unwrap();
+        let listener = UnixListener::bind(harness.sockets.path().join(name)).unwrap();
         listener.set_nonblocking(true).unwrap();
         fs::write(
             workspace.join(name.trim_end_matches(".sock")),
@@ -3057,12 +3152,13 @@ fn explicit_execution_keeps_helper_image_after_original_binary_is_removed() {
     let mut harness = Harness::new(1);
     let origin = harness.root.path().join("bazelqueue");
     fs::copy(env!("CARGO_BIN_EXE_bazelqueue"), &origin).unwrap();
-    let socket = harness.root.path().join("owned.sock");
+    let socket = harness.sockets.path().join("owned.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     let child = Command::new(&origin)
         .args(["exec", "--", env!("CARGO_BIN_EXE_fixture-backend"), "hold"])
         .arg(socket)
         .env("BAZELQUEUE_HOME", &harness.paths.root)
+        .env("BAZELQUEUE_SOCKET", &harness.paths.socket)
         .env("HOME", harness.root.path())
         .current_dir(harness.root.path())
         .stdout(Stdio::null())
@@ -3087,7 +3183,7 @@ fn explicit_execution_keeps_helper_image_after_original_binary_is_removed() {
 #[ignore = "requires BAZELQUEUE_TEST_BAZEL; helper retention during native run handoff"]
 fn native_run_handoff_survives_original_binary_removal_and_restart() {
     let mut harness = Harness::new(1);
-    let socket = harness.root.path().join("build.sock");
+    let socket = harness.sockets.path().join("build.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     native_workspace(
         &harness,
@@ -3104,6 +3200,7 @@ fn native_run_handoff_survives_original_binary_removal_and_restart() {
     let child = Command::new(&origin)
         .args(args)
         .env("BAZELQUEUE_HOME", &harness.paths.root)
+        .env("BAZELQUEUE_SOCKET", &harness.paths.socket)
         .env("HOME", harness.root.path())
         .current_dir(harness.root.path().join("workspace"))
         .stdout(Stdio::piped())
@@ -3155,6 +3252,7 @@ fn shim(harness: &Harness) -> Command {
     let mut command = Command::new(shim);
     command
         .env("BAZELQUEUE_HOME", &harness.paths.root)
+        .env("BAZELQUEUE_SOCKET", &harness.paths.socket)
         .env("HOME", harness.root.path())
         .current_dir(harness.root.path())
         .stdout(Stdio::null())
@@ -3222,6 +3320,7 @@ fn clean_expunge_waits_only_for_its_own_workspace() {
     let mut held = Harness::accepted(&busy);
     let other = harness.root.path().join("other");
     fs::create_dir(&other).unwrap();
+    fs::write(other.join("WORKSPACE"), "").unwrap();
     let mut elsewhere = shim(&harness)
         .args(["clean", "--expunge"])
         .current_dir(&other)
@@ -3243,7 +3342,7 @@ fn clean_expunge_waits_only_for_its_own_workspace() {
 #[test]
 fn preflight_hooks_run_one_at_a_time_inside_their_own_reservations() {
     let mut harness = Harness::new(2);
-    let socket = harness.root.path().join("hook.sock");
+    let socket = harness.sockets.path().join("hook.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     let mut config = Config::load(&harness.paths).unwrap();
     config.hooks.push(bazelqueue::config::Hook {
@@ -3255,6 +3354,7 @@ fn preflight_hooks_run_one_at_a_time_inside_their_own_reservations() {
     for label in ["one", "two"] {
         let lane = harness.root.path().join(label);
         fs::create_dir(&lane).unwrap();
+        fs::write(lane.join("WORKSPACE"), "").unwrap();
         let mut child = harness
             .command()
             .args([
@@ -3308,7 +3408,8 @@ fn an_agent_learns_a_queued_result_from_one_backgrounded_call() {
     harness.wait(|s| s.jobs.iter().any(|job| job.state == "queued"));
     let lane = harness.root.path().join("b");
     fs::create_dir_all(&lane).unwrap();
-    let socket = harness.root.path().join("b.sock");
+    fs::write(lane.join("WORKSPACE"), "").unwrap();
+    let socket = harness.sockets.path().join("b.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     let copy = harness.root.path().join("result.json");
     let agent = harness

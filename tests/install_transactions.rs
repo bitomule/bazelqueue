@@ -22,6 +22,8 @@ use std::{
 };
 use tempfile::TempDir;
 
+mod common;
+
 #[test]
 fn path_activation_is_owned_and_preserves_independent_profile_edits() {
     let fixture = Fixture::new();
@@ -85,6 +87,7 @@ fn send(stream: &mut UnixStream, value: &impl Serialize) {
 }
 struct Fixture {
     home: TempDir,
+    _sockets: TempDir,
     paths: Paths,
     bin: PathBuf,
     stopped: Arc<AtomicBool>,
@@ -92,16 +95,14 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
-        let home = tempfile::Builder::new()
-            .prefix("bqi-")
-            .tempdir_in("/private/tmp")
-            .unwrap();
+        let home = common::scratch("bqi-");
+        let sockets = common::sockets();
         let root = home.path().join("state");
         fs::create_dir(&root).unwrap();
         let paths = Paths {
             config: root.join("config.toml"),
             database: root.join("queue.sqlite3"),
-            socket: root.join("control.sock"),
+            socket: sockets.path().join("control.sock"),
             root,
         };
         Config {
@@ -165,6 +166,7 @@ impl Fixture {
         });
         Self {
             home,
+            _sockets: sockets,
             paths,
             bin,
             stopped,
@@ -175,6 +177,7 @@ impl Fixture {
         let mut command = Command::new(env!("CARGO_BIN_EXE_bazelqueue"));
         command
             .env("BAZELQUEUE_HOME", &self.paths.root)
+            .env("BAZELQUEUE_SOCKET", &self.paths.socket)
             .env("HOME", self.home.path())
             .current_dir(self.home.path());
         command

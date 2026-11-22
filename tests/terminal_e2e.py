@@ -17,7 +17,10 @@ PROMPT = b"BQ_PROMPT>"
 
 class TerminalContract(unittest.TestCase):
     def setUp(self):
-        self.directory = tempfile.TemporaryDirectory(prefix="bqt-", dir="/private/tmp")
+        self.directory = tempfile.TemporaryDirectory(prefix="bqt-", dir=os.environ.get("TEST_TMPDIR"))
+        self.addCleanup(self.directory.cleanup)
+        self.sockets = tempfile.TemporaryDirectory(prefix="bq-")
+        self.addCleanup(self.sockets.cleanup)
         self.root = pathlib.Path(self.directory.name)
         self.state = self.root / "state"
         self.state.mkdir()
@@ -25,7 +28,7 @@ class TerminalContract(unittest.TestCase):
         (self.state / "config.toml").write_text(
             f'backend = "{BACKEND}"\ncpu_capacity = 8\nmemory_capacity_mib = 4096\n'
             'action_memory_mib = 2048\npressure_recovery_samples = 1\n')
-        self.env = dict(os.environ, HOME=str(self.root), BAZELQUEUE_HOME=str(self.state), PS1=PROMPT.decode(), TERM="dumb")
+        self.env = dict(os.environ, HOME=str(self.root), BAZELQUEUE_HOME=str(self.state), BAZELQUEUE_SOCKET=str(pathlib.Path(self.sockets.name) / "control.sock"), PS1=PROMPT.decode(), TERM="dumb")
         self.pid, self.master = pty.fork()
         if self.pid == 0:
             os.chdir(self.root)
@@ -75,7 +78,6 @@ class TerminalContract(unittest.TestCase):
             if time.monotonic() >= deadline:
                 raise RuntimeError("fixture shell could not be reaped")
             select.select([], [], [], 0.05)
-        self.directory.cleanup()
 
     def test_terminal_is_inherited_and_stdin_reaches_target(self):
         start = len(self.buffer)
