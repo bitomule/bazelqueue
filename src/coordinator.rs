@@ -296,7 +296,7 @@ async fn ensure_from(paths: &Paths, program: &Path) -> Result<(protocol::Framed<
     if let Ok(connection) = connect_peer(paths).await {
         return Ok(connection);
     }
-    let log = platform::private_file(&paths.root.join("daemon.log"))?;
+    let log = daemon_log(paths)?;
     use std::os::unix::process::CommandExt;
     let mut command = std::process::Command::new(program);
     command.process_group(0);
@@ -416,7 +416,7 @@ pub async fn hand_over(paths: &Paths, executable: &Path) -> Result<Option<Replac
 async fn successor(paths: &Paths, program: &Path) -> Result<tokio::process::Child> {
     use std::os::unix::process::CommandExt;
     use tokio::io::AsyncBufReadExt;
-    let log = platform::private_file(&paths.root.join("daemon.log"))?;
+    let log = daemon_log(paths)?;
     let mut command = tokio::process::Command::new(program);
     command.as_std_mut().process_group(0);
     command
@@ -899,6 +899,14 @@ async fn succeed(paths: &Paths) -> Result<fs::File> {
     }
 }
 
+fn daemon_log(paths: &Paths) -> Result<std::fs::File> {
+    let location = paths.root.join("daemon.log");
+    if let Ok(config) = Config::load(paths) {
+        let _ = platform::rotate_log(&location, config.log_limit_bytes);
+    }
+    platform::private_file(&location)
+}
+
 pub async fn run(paths: Paths) -> Result<()> {
     let successor = std::env::var_os(SUCCESSOR).is_some();
     let _lock = match platform::lock(&paths.root.join("daemon.lock")) {
@@ -912,6 +920,7 @@ pub async fn run(paths: Paths) -> Result<()> {
     };
     let store = Store::open(&paths)?;
     restore_retirements(&store)?;
+    platform::sweep_leases(&paths.root.join("leases"));
     let mut config = Config::load(&paths)?;
     if fs::symlink_metadata(&paths.socket).is_ok() {
         fs::remove_file(&paths.socket)?;
@@ -995,6 +1004,7 @@ pub async fn run(paths: Paths) -> Result<()> {
                 }
             }
             _=timer.tick()=> {
+                let _ = platform::rotate_stderr_log(&paths.root.join("daemon.log"), config.log_limit_bytes);
                 reschedule=true;
                 tick+=1;
                 if tick%4==0 {

@@ -240,6 +240,7 @@ ${EDITOR:-vi} ~/.local/state/bazelqueue/config.toml
 | `swap_thrashing_mib_per_min` | New builds wait while swap-out or swap growth, over the last 60 seconds, exceeds this rate. Default: **64 MiB/min**. |
 | `disk_safety_mib` | Below this free space on the output base of a build that has one, one build runs at a time; below half of it, new builds wait. The queue state only needs 1024 MiB. Default: **10240 MiB**. |
 | `fast_lane_slots` | Up-to-date checks, and the runs they admit, that may proceed outside the build capacity at once. Default: **2**; `0` turns the fast lane off. |
+| `log_limit_bytes` | Size above which `daemon.log` moves to `daemon.log.1` (one backup, replaced each time); checked when the coordinator starts and while it runs. Default: **8388608** (8 MiB). |
 | `stall_minutes` | Minutes without Bazel events, `command.log` output or CPU before a job is cut as a time failure. Default: **10**; `0` turns detection off. macOS only. Bazel 9 writes no `command.log` by default, so a job there with child processes and a connected client is not cut. |
 
 A lone supported build can receive the wide profile. Concurrent managed builds
@@ -366,6 +367,7 @@ coordinator restarts.
 | Environment variable | Use |
 |---|---|
 | `BAZELQUEUE_HOME` | Select an isolated state namespace. |
+| `BAZELQUEUE_SOCKET` | Put the control socket at this path instead of `$BAZELQUEUE_HOME/control.sock`; it must stay under 100 bytes. |
 | `BAZELQUEUE_PROGRESS=quiet` | Suppress queue notices (the end-of-run summary stays). |
 | `BAZELQUEUE_PROGRESS=verbose` | Print every position change even when stderr is not a terminal. |
 | `BAZELQUEUE_SUMMARY` | Also write the end-of-run summary JSON to this path. |

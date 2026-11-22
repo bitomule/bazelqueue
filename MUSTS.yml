@@ -19,6 +19,15 @@ checks:
         - "An executing backend, preparation probe, or native Bazel transaction cannot lose its accounted reservation after frontend, guardian, or coordinator death. Validate against the durable permit barrier and real native cancellation/recovery evidence."
         - "Managed admission preserves opaque arguments and never raises a proven stricter direct caller resource limit; reservations remain immutable after execution begins."
         - "Installation and uninstall either commit their complete owned state or recover it idempotently; original user files and backups survive every tested interruption cut."
+  test-artifact-lifecycle:
+    uses: agent
+    paths: ["tests/**", "src/**/*tests*.rs"]
+    with:
+      facts:
+        - "Every directory or file a test creates, directly or through a live collaborator, is owned by that test: its removal is registered (a `TempDir` or `addCleanup`) before the first write, and it runs when the test fails or panics."
+        - "Test directories are created under the temporary directory Bazel gives each test (`TEST_TMPDIR`); no test creates a `bqe-*`, `bql-*`, `bqi-*` or other directory under a fixed shared path such as `/tmp` or `/private/tmp`, and no production code removes files from `/tmp`."
+        - "A Unix socket path stays within the 104-byte limit without a shared directory: sockets live in a test-owned directory under the user's temporary directory (`BAZELQUEUE_SOCKET`), never in a shared fixed path."
+        - "Processes and tasks that write into a fixture finish before its directory is removed."
   distribution:
     uses: agent
     paths: [".github/**", "packaging/**", "dist-workspace.toml", "release-plz.toml"]

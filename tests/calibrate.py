@@ -16,7 +16,7 @@ parser.add_argument("--version", default="8.4.2")
 parser.add_argument("--output", required=True, type=Path)
 args = parser.parse_args()
 results = []
-with tempfile.TemporaryDirectory(prefix="bqc-", dir="/private/tmp") as directory:
+with tempfile.TemporaryDirectory(prefix="bqc-") as directory:
     root = Path(directory)
     source = "\n".join(f"__attribute__((noinline)) unsigned f{i}(unsigned x) {{ for(int j=0;j<20;++j) x=(x*1664525u+1013904223u)^((x>>3)+{i}u); return x; }}" for i in range(1800))
     for cpu, parallel in [(8, 1), (8, 2), (10, 2)]:

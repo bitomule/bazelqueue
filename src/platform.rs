@@ -11,7 +11,7 @@ use std::{
             fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
         },
     },
-    path::Path,
+    path::{Path, PathBuf},
 };
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
@@ -237,6 +237,102 @@ pub fn wait_lock(path: &Path) -> Result<File> {
     let file = private_file(path)?;
     file.lock_exclusive()?;
     Ok(file)
+}
+
+/// Holds a request's lock file for its lifetime and removes the file when dropped.
+pub struct Lease {
+    _file: File,
+    path: PathBuf,
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+pub fn lease(path: &Path) -> Result<Lease> {
+    loop {
+        let file = private_file(path)?;
+        file.lock_exclusive()?;
+        let held = file.metadata()?;
+        if fs::metadata(path)
+            .is_ok_and(|named| named.ino() == held.ino() && named.dev() == held.dev())
+        {
+            return Ok(Lease {
+                _file: file,
+                path: path.to_owned(),
+            });
+        }
+    }
+}
+
+/// Removes the lock files whose request is gone; a held lock marks a live request.
+pub fn sweep_leases(directory: &Path) -> usize {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let Ok(file) = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(entry.path())
+        else {
+            continue;
+        };
+        if file.try_lock_exclusive().is_ok() && fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+fn log_backup(path: &Path) -> PathBuf {
+    let mut backup = path.as_os_str().to_owned();
+    backup.push(".1");
+    backup.into()
+}
+
+/// Moves a log above `limit` bytes to `<log>.1`, replacing the previous backup.
+pub fn rotate_log(path: &Path, limit: u64) -> Result<bool> {
+    match fs::metadata(path) {
+        Ok(meta) if meta.len() > limit => {
+            fs::rename(path, log_backup(path))?;
+            Ok(true)
+        }
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Rotates `path` when this process writes its stderr there, and points stderr at the new file.
+pub fn rotate_stderr_log(path: &Path, limit: u64) -> Result<bool> {
+    let Ok(named) = fs::metadata(path) else {
+        return Ok(false);
+    };
+    let stderr = std::mem::ManuallyDrop::new(unsafe {
+        use std::os::fd::FromRawFd;
+        File::from_raw_fd(2)
+    });
+    let current = stderr.metadata()?;
+    if current.ino() != named.ino() || current.dev() != named.dev() {
+        return Ok(false);
+    }
+    if !rotate_log(path, limit)? {
+        return Ok(false);
+    }
+    let fresh = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    if unsafe { libc::dup2(fresh.as_raw_fd(), 2) } < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(true)
 }
 
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -1235,5 +1331,50 @@ mod vanished_process_tests {
         drop(child.stdin.take());
         child.wait().unwrap();
         assert!(unreadable_shell(&owner, identity(owner.pid)).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod lease_tests {
+    use super::*;
+    #[test]
+    fn a_lease_file_disappears_when_its_request_ends() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("request");
+        let held = lease(&path).unwrap();
+        assert!(path.exists());
+        drop(held);
+        assert!(!path.exists());
+    }
+    #[test]
+    fn sweeping_removes_only_leases_without_a_live_request() {
+        let root = tempfile::tempdir().unwrap();
+        let live = root.path().join("live");
+        let held = lease(&live).unwrap();
+        for dead in ["dead-1", "dead-2"] {
+            fs::write(root.path().join(dead), "").unwrap();
+        }
+        assert_eq!(sweep_leases(root.path()), 2);
+        assert!(live.exists());
+        assert!(!root.path().join("dead-1").exists());
+        drop(held);
+        assert_eq!(sweep_leases(&root.path().join("missing")), 0);
+    }
+    #[test]
+    fn a_log_above_its_limit_moves_to_one_backup() {
+        let root = tempfile::tempdir().unwrap();
+        let log = root.path().join("daemon.log");
+        assert!(!rotate_log(&log, 4).unwrap());
+        fs::write(&log, "12345").unwrap();
+        fs::write(root.path().join("daemon.log.1"), "older").unwrap();
+        assert!(rotate_log(&log, 4).unwrap());
+        assert!(!log.exists());
+        assert_eq!(
+            fs::read_to_string(root.path().join("daemon.log.1")).unwrap(),
+            "12345"
+        );
+        fs::write(&log, "1234").unwrap();
+        assert!(!rotate_log(&log, 4).unwrap());
+        assert!(log.exists());
     }
 }
