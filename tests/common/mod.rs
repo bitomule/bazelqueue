@@ -9,7 +9,7 @@ pub fn scratch(prefix: &str) -> TempDir {
         .prefix(prefix)
         .tempdir_in(base)
         .unwrap();
-    std::fs::write(directory.path().join("WORKSPACE"), "").unwrap();
+    std::fs::write(directory.path().join("WORKSPACE.bazel"), "").unwrap();
     directory
 }
 

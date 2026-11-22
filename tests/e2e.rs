@@ -186,7 +186,7 @@ impl Harness {
     ) -> UnixListener {
         let lane = self.root.path().join(label);
         fs::create_dir_all(&lane).unwrap();
-        fs::write(lane.join("WORKSPACE"), "").unwrap();
+        fs::write(lane.join("WORKSPACE.bazel"), "").unwrap();
         let listener =
             UnixListener::bind(self.sockets.path().join(format!("{label}.sock"))).unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -3320,7 +3320,7 @@ fn clean_expunge_waits_only_for_its_own_workspace() {
     let mut held = Harness::accepted(&busy);
     let other = harness.root.path().join("other");
     fs::create_dir(&other).unwrap();
-    fs::write(other.join("WORKSPACE"), "").unwrap();
+    fs::write(other.join("WORKSPACE.bazel"), "").unwrap();
     let mut elsewhere = shim(&harness)
         .args(["clean", "--expunge"])
         .current_dir(&other)
@@ -3354,7 +3354,7 @@ fn preflight_hooks_run_one_at_a_time_inside_their_own_reservations() {
     for label in ["one", "two"] {
         let lane = harness.root.path().join(label);
         fs::create_dir(&lane).unwrap();
-        fs::write(lane.join("WORKSPACE"), "").unwrap();
+        fs::write(lane.join("WORKSPACE.bazel"), "").unwrap();
         let mut child = harness
             .command()
             .args([
@@ -3408,7 +3408,7 @@ fn an_agent_learns_a_queued_result_from_one_backgrounded_call() {
     harness.wait(|s| s.jobs.iter().any(|job| job.state == "queued"));
     let lane = harness.root.path().join("b");
     fs::create_dir_all(&lane).unwrap();
-    fs::write(lane.join("WORKSPACE"), "").unwrap();
+    fs::write(lane.join("WORKSPACE.bazel"), "").unwrap();
     let socket = harness.sockets.path().join("b.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     let copy = harness.root.path().join("result.json");
