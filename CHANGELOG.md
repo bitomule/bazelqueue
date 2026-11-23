@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.17](https://github.com/bitomule/bazelqueue/compare/v0.1.16...v0.1.17) - 2026-11-23
+
+### Added
+
+- run records keep targets, flags and cache hits, and a week of history ([#56](https://github.com/bitomule/bazelqueue/pull/56))
+
+### Fixed
+
+- bound bazelqueue state (leases, daemon.log, executables) and stop e2e tests littering /tmp ([#53](https://github.com/bitomule/bazelqueue/pull/53))
+
 ## [0.1.16](https://github.com/bitomule/bazelqueue/compare/v0.1.15...v0.1.16) - 2026-11-16
 
 ### Fixed
