@@ -21,8 +21,11 @@ When a request ends, the guardian writes its summary before telling the
 coordinator, so a request the coordinator reports as finished always has its
 summary on disk unless the guardian died first. Managed Bazel invocations get a
 private Build Event Protocol JSON file the guardian reads for failed tests and
-targets and then deletes; abandoned event files older than a day and summaries
-beyond the newest 200 are pruned. `bazelqueue wait` reads the coordinator's
+targets and then deletes; when a `.bazelrc` already names the file, the guardian
+reads that one instead, if this run wrote it. The summary also records the
+targets and options of the invocation (secret values hidden) and how many tests
+came from Bazel's cache. Abandoned event files older than a day and summaries
+older than seven days are pruned; there is no cap on how many are kept. `bazelqueue wait` reads the coordinator's
 snapshot until the request is terminal, then the saved summary; when none exists
 (the guardian died, or it was cancelled by recovery) it reports the coordinator's
 recorded exit code.

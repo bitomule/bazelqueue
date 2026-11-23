@@ -321,44 +321,109 @@ pub fn event_file(invocation: &Invocation, cwd: &Path, home: Option<&Path>) -> E
             rc_files.push(cwd.join(value));
         }
     }
-    if rc_files
-        .iter()
-        .any(|file| rc_sets_event_file(file, &workspace, 0))
-    {
-        EventFile::Unavailable
-    } else {
-        EventFile::Owned
+    let command = invocation.command.as_deref().unwrap_or_default();
+    let mut chosen = RcEventFile::Unset;
+    for file in &rc_files {
+        chosen = chosen.then(rc_event_file(file, &workspace, cwd, command, 0));
+    }
+    match chosen {
+        RcEventFile::Unset => EventFile::Owned,
+        RcEventFile::Path(path) => EventFile::Caller(path),
+        RcEventFile::Ambiguous => EventFile::Unavailable,
     }
 }
 
-fn rc_sets_event_file(file: &Path, workspace: &Path, depth: usize) -> bool {
-    let Ok(text) = std::fs::read_to_string(file) else {
-        return false;
-    };
-    text.lines().any(|line| {
-        let line = line.trim();
-        if line.starts_with('#') {
-            return false;
+/// What the `.bazelrc` files say about where Bazel writes its build events.
+enum RcEventFile {
+    Unset,
+    Path(PathBuf),
+    /// Set under a `--config` or in a way that cannot be resolved here.
+    Ambiguous,
+}
+
+impl RcEventFile {
+    fn then(self, later: Self) -> Self {
+        match (self, later) {
+            (Self::Ambiguous, _) | (_, Self::Ambiguous) => Self::Ambiguous,
+            (earlier, Self::Unset) => earlier,
+            (_, later) => later,
         }
-        if line.contains("build_event_json_file") {
-            return true;
+    }
+}
+
+/// Whether an rc line of `section` (`build`, `test:ci`, `common`...) reaches `command`.
+fn rc_section_applies(section: &str, command: &str) -> bool {
+    let name = section.split(':').next().unwrap_or(section);
+    match name {
+        "common" | "always" => true,
+        "build" => matches!(command, "build" | "test" | "run" | "coverage"),
+        "test" => matches!(command, "test" | "coverage"),
+        other => other == command,
+    }
+}
+
+fn rc_event_file(
+    file: &Path,
+    workspace: &Path,
+    cwd: &Path,
+    command: &str,
+    depth: usize,
+) -> RcEventFile {
+    let Ok(text) = std::fs::read_to_string(file) else {
+        return RcEventFile::Unset;
+    };
+    let mut chosen = RcEventFile::Unset;
+    for line in text.lines().map(str::trim) {
+        if line.starts_with('#') {
+            continue;
         }
         let imported = line
             .strip_prefix("try-import ")
             .or_else(|| line.strip_prefix("import "));
-        depth < 4
-            && imported.is_some_and(|path| {
+        if let Some(path) = imported {
+            if depth < 4 {
                 let path = path
                     .trim()
                     .trim_matches('"')
                     .replace("%workspace%", &workspace.to_string_lossy());
-                rc_sets_event_file(
+                chosen = chosen.then(rc_event_file(
                     &file.parent().unwrap_or(workspace).join(path),
                     workspace,
+                    cwd,
+                    command,
                     depth + 1,
+                ));
+            }
+            continue;
+        }
+        if !line.contains("build_event_json_file") {
+            continue;
+        }
+        let mut words = line.split_whitespace();
+        let section = words.next().unwrap_or_default();
+        if !rc_section_applies(section, command) {
+            continue;
+        }
+        let words: Vec<&str> = words.collect();
+        let value = words.iter().enumerate().find_map(|(index, word)| {
+            word.strip_prefix("--build_event_json_file=")
+                .or_else(|| {
+                    (*word == "--build_event_json_file")
+                        .then(|| words.get(index + 1).copied())
+                        .flatten()
+                })
+                .map(str::to_owned)
+        });
+        chosen = chosen.then(match value {
+            Some(value) if !section.contains(':') && !value.contains(['$', '~']) => {
+                RcEventFile::Path(
+                    cwd.join(value.replace("%workspace%", &workspace.to_string_lossy())),
                 )
-            })
-    })
+            }
+            _ => RcEventFile::Ambiguous,
+        });
+    }
+    chosen
 }
 
 pub fn with_event_file(mut args: Vec<OsString>, file: &Path) -> Vec<OsString> {
@@ -487,7 +552,32 @@ mod tests {
             "build --build_event_json_file=/ci.json\n",
         )
         .unwrap();
+        assert_eq!(
+            classify(&["test", "//:x"]),
+            EventFile::Caller("/ci.json".into())
+        );
+        std::fs::write(
+            workspace.join("ci.bazelrc"),
+            "build:ci --build_event_json_file=/ci.json\n",
+        )
+        .unwrap();
         assert_eq!(classify(&["test", "//:x"]), EventFile::Unavailable);
+        std::fs::write(
+            workspace.join("ci.bazelrc"),
+            "run --build_event_json_file=/run.json\n",
+        )
+        .unwrap();
+        assert_eq!(classify(&["test", "//:x"]), EventFile::Owned);
+        std::fs::write(
+            workspace.join("ci.bazelrc"),
+            "test --build_event_json_file=.musts/bep.json\n",
+        )
+        .unwrap();
+        assert_eq!(
+            classify(&["test", "//:x"]),
+            EventFile::Caller(workspace.join(".musts/bep.json"))
+        );
+        assert_eq!(classify(&["build", "//:x"]), EventFile::Owned);
         std::fs::remove_file(workspace.join("ci.bazelrc")).unwrap();
         std::fs::write(home.join(".bazelrc"), "# build --build_event_json_file=x\n").unwrap();
         assert_eq!(classify(&["test", "//:x"]), EventFile::Owned);

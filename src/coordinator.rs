@@ -1819,6 +1819,7 @@ mod tests {
             failures: vec![],
             fast_lane: false,
             stall: None,
+            ..Default::default()
         };
         crate::summary::save(&fixture.paths, &summary).unwrap();
         apply_recovery(
@@ -1946,6 +1947,7 @@ mod tests {
                     failures: vec![],
                     fast_lane: false,
                     stall: None,
+                    ..Default::default()
                 },
             )
             .unwrap();

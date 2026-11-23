@@ -177,6 +177,9 @@ struct Ledger {
     command: String,
     workspace: String,
     registered: Instant,
+    registered_at: SystemTime,
+    targets: Vec<String>,
+    flags: Vec<String>,
     granted: Option<Instant>,
     events: Option<(PathBuf, bool)>,
     report: bool,
@@ -187,7 +190,12 @@ struct Ledger {
 impl Ledger {
     fn summary(&self, code: i32, now: Instant) -> summary::Summary {
         let parsed = self.events.as_ref().and_then(|(path, owned)| {
-            let text = fs::read_to_string(path).ok();
+            let written_by_this_run = fs::metadata(path)
+                .and_then(|metadata| metadata.modified())
+                .is_ok_and(|modified| modified >= self.registered_at);
+            let text = fs::read_to_string(path)
+                .ok()
+                .filter(|_| *owned || written_by_this_run);
             if *owned {
                 let _ = fs::remove_file(path);
             }
@@ -207,7 +215,11 @@ impl Ledger {
                 .stall
                 .map(|stall| stall.reason())
                 .or_else(|| parsed.as_ref().and_then(|events| events.reason.clone())),
+            tests_total: parsed.as_ref().map_or(0, |events| events.tests_total),
+            tests_cached: parsed.as_ref().map_or(0, |events| events.tests_cached),
             failures: parsed.map(|events| events.failures).unwrap_or_default(),
+            targets: self.targets.clone(),
+            flags: self.flags.clone(),
             queued_ms: self
                 .granted
                 .unwrap_or(now)
@@ -480,11 +492,18 @@ pub async fn guardian(backend: PathBuf, args: Vec<OsString>, generic: bool) -> R
     let mut hangup = signal(SignalKind::hangup())?;
     let mut child_changes = signal(SignalKind::from_raw(libc::SIGCHLD))?;
     let mut continuation = signal(SignalKind::from_raw(libc::SIGCONT))?;
+    let (targets, flags) = invocation
+        .command_index
+        .map(|index| summary::split_arguments(&invocation.args[index + 1..]))
+        .unwrap_or_default();
     let mut ledger = Ledger {
         id: id.clone(),
         command: request.command.clone(),
         workspace: request.workspace.clone(),
         registered: Instant::now(),
+        registered_at: SystemTime::now(),
+        targets,
+        flags,
         granted: None,
         events: None,
         report: !immediate,
@@ -909,6 +928,7 @@ pub async fn wait(
                 failures: Vec::new(),
                 fast_lane: false,
                 stall: job.stall,
+                ..Default::default()
             });
         }
         sleep(Duration::from_secs(1)).await;
@@ -1108,6 +1128,52 @@ async fn send_finish(
 mod tests {
     use super::*;
     use crate::config::Hook;
+
+    fn ledger(events: Option<(PathBuf, bool)>) -> Ledger {
+        Ledger {
+            id: "1-1".into(),
+            command: "test".into(),
+            workspace: "/w".into(),
+            registered: Instant::now(),
+            registered_at: SystemTime::now(),
+            targets: vec!["//app:tests".into()],
+            flags: vec!["--config ci".into()],
+            granted: None,
+            events,
+            report: false,
+            fast_lane: false,
+            stall: None,
+        }
+    }
+
+    const FAILED_TEST: &str = r#"{"id":{"testSummary":{"label":"//app:tests"}},"testSummary":{"overallStatus":"FAILED"}}"#;
+
+    #[test]
+    fn a_summary_carries_the_invocation_and_what_a_caller_chosen_event_file_reported() {
+        let directory = tempfile::tempdir().unwrap();
+        let events = directory.path().join("bep.json");
+        let ledger = ledger(Some((events.clone(), false)));
+        fs::write(&events, FAILED_TEST).unwrap();
+        let summary = ledger.summary(3, Instant::now());
+        assert!(summary.targets_reported);
+        assert_eq!(summary.targets, ["//app:tests"]);
+        assert_eq!(summary.flags, ["--config ci"]);
+        assert_eq!(summary.failures[0].label, "//app:tests");
+        assert_eq!(summary.tests_total, 1);
+        assert!(events.exists());
+    }
+
+    #[test]
+    fn an_event_file_left_by_an_earlier_run_is_not_this_runs_result() {
+        let directory = tempfile::tempdir().unwrap();
+        let events = directory.path().join("bep.json");
+        fs::write(&events, FAILED_TEST).unwrap();
+        let mut ledger = ledger(Some((events, false)));
+        ledger.registered_at = SystemTime::now() + Duration::from_secs(60);
+        let summary = ledger.summary(0, Instant::now());
+        assert!(!summary.targets_reported);
+        assert!(summary.failures.is_empty());
+    }
 
     #[tokio::test]
     async fn disk_full_writing_receipt_still_delivers_finish_with_original_exit() {

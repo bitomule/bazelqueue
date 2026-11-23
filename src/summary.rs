@@ -13,8 +13,12 @@ use std::{
 };
 
 pub const PREFIX: &str = "bazelqueue:";
-pub const RETAINED: usize = 200;
+/// How long a summary stays; there is no cap on how many, so a busy day never
+/// pushes out the runs a measurement still needs.
+pub const RETAINED: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const PRINTED_FAILURES: usize = 20;
+const LISTED_ARGUMENTS: usize = 100;
+const SECRET_WORDS: [&str; 6] = ["header", "token", "password", "secret", "credential", "key"];
 const STALE_EVENTS: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -25,7 +29,7 @@ pub struct Failure {
     pub log: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Summary {
     pub id: String,
     pub command: String,
@@ -39,6 +43,18 @@ pub struct Summary {
     /// Whether Bazel reported per-target results; false for unmanaged invocations.
     pub targets_reported: bool,
     pub failures: Vec<Failure>,
+    /// Test targets that reported a result; only meaningful when `targets_reported`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub tests_total: u32,
+    /// Of those, the ones answered from Bazel's cache without running.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub tests_cached: u32,
+    /// What the caller asked Bazel to build or test.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub targets: Vec<String>,
+    /// The options of the invocation, with secret values hidden.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub flags: Vec<String>,
     /// Started at once because Bazel reported nothing to rebuild.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub fast_lane: bool,
@@ -47,11 +63,73 @@ pub struct Summary {
     pub stall: Option<crate::stall::Stall>,
 }
 
+fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Events {
     pub exit_name: Option<String>,
     pub reason: Option<String>,
     pub failures: Vec<Failure>,
+    pub tests_total: u32,
+    pub tests_cached: u32,
+}
+
+fn looks_like_label(argument: &str) -> bool {
+    ["//", "@", ":", "-//", "-@"]
+        .iter()
+        .any(|prefix| argument.starts_with(prefix))
+}
+
+fn hide_secret(flag: &str, value: &str) -> String {
+    let name = flag.to_ascii_lowercase();
+    if name.ends_with("_env") {
+        return match value.split_once('=') {
+            Some((variable, _)) => format!("{variable}=<redacted>"),
+            None => value.to_owned(),
+        };
+    }
+    if SECRET_WORDS.iter().any(|word| name.contains(word)) {
+        return "<redacted>".into();
+    }
+    value.to_owned()
+}
+
+/// Splits what follows the command into targets and options. Anything after
+/// `--` belongs to the program a `bazel run` starts, so it is not kept.
+pub fn split_arguments(arguments: &[std::ffi::OsString]) -> (Vec<String>, Vec<String>) {
+    let mut targets = Vec::new();
+    let mut flags: Vec<String> = Vec::new();
+    let mut awaiting_value = false;
+    for argument in arguments.iter().map(|argument| argument.to_string_lossy()) {
+        if argument == "--" {
+            break;
+        }
+        if looks_like_label(&argument) {
+            targets.push(argument.into_owned());
+            awaiting_value = false;
+        } else if argument.starts_with('-') {
+            match argument.split_once('=') {
+                Some((flag, value)) => {
+                    flags.push(format!("{flag}={}", hide_secret(flag, value)));
+                    awaiting_value = false;
+                }
+                None => {
+                    awaiting_value = argument.starts_with("--");
+                    flags.push(argument.into_owned());
+                }
+            }
+        } else if awaiting_value && let Some(flag) = flags.last_mut() {
+            *flag = format!("{flag} {}", hide_secret(flag, &argument));
+            awaiting_value = false;
+        } else {
+            targets.push(argument.into_owned());
+        }
+    }
+    targets.truncate(LISTED_ARGUMENTS);
+    flags.truncate(LISTED_ARGUMENTS);
+    (targets, flags)
 }
 
 fn label(id: &Value, keys: &[&str]) -> Option<String> {
@@ -101,6 +179,8 @@ fn test_log(files: Option<&Value>) -> Option<String> {
 pub fn parse_events(text: &str) -> Events {
     let mut events = Events::default();
     let mut logs = std::collections::HashMap::new();
+    let mut all_cached: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    let mut summarised = std::collections::HashSet::new();
     let add = |events: &mut Events, failure: Failure| {
         if let Some(existing) = events
             .failures
@@ -134,6 +214,17 @@ pub fn parse_events(text: &str) -> Events {
         }
         if let Some(result) = event.get("testResult")
             && let Some(name) = label(&id, &["testResult"])
+        {
+            let cached = result.get("cachedLocally").and_then(Value::as_bool) == Some(true)
+                || result
+                    .pointer("/executionInfo/cachedRemotely")
+                    .and_then(Value::as_bool)
+                    == Some(true);
+            let entry = all_cached.entry(name).or_insert(true);
+            *entry &= cached;
+        }
+        if let Some(result) = event.get("testResult")
+            && let Some(name) = label(&id, &["testResult"])
             && let Some(log) = test_log(result.get("testActionOutput"))
         {
             logs.insert(name, log);
@@ -141,6 +232,7 @@ pub fn parse_events(text: &str) -> Events {
         if let Some(summary) = event.get("testSummary")
             && let Some(name) = label(&id, &["testSummary"])
         {
+            summarised.insert(name.clone());
             let status = summary
                 .get("overallStatus")
                 .and_then(Value::as_str)
@@ -208,6 +300,11 @@ pub fn parse_events(text: &str) -> Events {
             events.exit_name = Some(name.to_owned());
         }
     }
+    events.tests_total = summarised.len() as u32;
+    events.tests_cached = summarised
+        .iter()
+        .filter(|name| all_cached.get(*name) == Some(&true))
+        .count() as u32;
     events
 }
 
@@ -324,9 +421,8 @@ fn tempfile_in(parent: &Path) -> Result<(PathBuf, fs::File)> {
     Ok((path, file))
 }
 
-/// Keeps the newest `keep` summaries and drops event files nobody finished reading.
-pub fn prune(directory: &Path, keep: usize, now: SystemTime) -> Result<()> {
-    let mut summaries = Vec::new();
+/// Drops summaries older than `keep` and event files nobody finished reading.
+pub fn prune(directory: &Path, keep: Duration, now: SystemTime) -> Result<()> {
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -335,13 +431,10 @@ pub fn prune(directory: &Path, keep: usize, now: SystemTime) -> Result<()> {
             if now.duration_since(modified).unwrap_or_default() > STALE_EVENTS {
                 let _ = fs::remove_file(entry.path());
             }
-        } else if name.ends_with(".json") {
-            summaries.push((modified, entry.path()));
+        } else if name.ends_with(".json") && now.duration_since(modified).unwrap_or_default() > keep
+        {
+            let _ = fs::remove_file(entry.path());
         }
-    }
-    summaries.sort_by_key(|summary| std::cmp::Reverse(summary.0));
-    for (_, path) in summaries.into_iter().skip(keep) {
-        let _ = fs::remove_file(path);
     }
     Ok(())
 }
@@ -413,6 +506,7 @@ mod tests {
                 .collect(),
             fast_lane: false,
             stall: None,
+            ..Summary::default()
         }
     }
 
@@ -494,37 +588,139 @@ mod tests {
         );
     }
 
-    #[test]
-    fn pruning_keeps_the_newest_summaries_and_drops_abandoned_event_files() {
-        let root = tempfile::tempdir().unwrap();
-        let now = SystemTime::now();
-        for index in 0..5_u64 {
-            let path = root.path().join(format!("{index}.json"));
-            fs::write(&path, "{}").unwrap();
-            fs::File::options()
-                .write(true)
-                .open(&path)
-                .unwrap()
-                .set_modified(now - Duration::from_secs(100 - index))
-                .unwrap();
-        }
-        let stale = root.path().join("old.bep.json");
-        fs::write(&stale, "").unwrap();
+    fn aged(path: &Path, now: SystemTime, age: Duration) {
+        fs::write(path, "{}").unwrap();
         fs::File::options()
             .write(true)
-            .open(&stale)
+            .open(path)
             .unwrap()
-            .set_modified(now - STALE_EVENTS - Duration::from_secs(1))
+            .set_modified(now - age)
             .unwrap();
+    }
+
+    #[test]
+    fn pruning_keeps_a_week_of_summaries_however_many_and_drops_abandoned_event_files() {
+        let root = tempfile::tempdir().unwrap();
+        let now = SystemTime::now();
+        for index in 0..300_u64 {
+            aged(
+                &root.path().join(format!("{index}.json")),
+                now,
+                Duration::from_secs(index),
+            );
+        }
+        aged(
+            &root.path().join("week.json"),
+            now,
+            Duration::from_secs(7 * 24 * 60 * 60 - 1),
+        );
+        aged(
+            &root.path().join("older.json"),
+            now,
+            Duration::from_secs(7 * 24 * 60 * 60 + 1),
+        );
+        let stale = root.path().join("old.bep.json");
+        aged(&stale, now, STALE_EVENTS + Duration::from_secs(1));
         let live = root.path().join("live.bep.json");
         fs::write(&live, "").unwrap();
-        prune(root.path(), 2, now).unwrap();
-        let mut left: Vec<_> = fs::read_dir(root.path())
+        prune(root.path(), RETAINED, now).unwrap();
+        let left: std::collections::HashSet<_> = fs::read_dir(root.path())
             .unwrap()
             .map(|entry| entry.unwrap().file_name().into_string().unwrap())
             .collect();
-        left.sort();
-        assert_eq!(left, ["3.json", "4.json", "live.bep.json"]);
+        assert_eq!(left.len(), 300 + 1 + 1);
+        assert!(left.contains("week.json") && left.contains("live.bep.json"));
+        assert!(!left.contains("older.json") && !left.contains("old.bep.json"));
+    }
+
+    fn arguments(values: &[&str]) -> (Vec<String>, Vec<String>) {
+        split_arguments(
+            &values
+                .iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    #[test]
+    fn arguments_split_into_targets_and_flags_without_the_programs_own_arguments() {
+        let (targets, flags) = arguments(&[
+            "--config",
+            "ci",
+            "--keep_going",
+            "//a/...",
+            "-//a:slow",
+            "@dep//b:c",
+            "--test_env=TOKEN=abc",
+            "--remote_header=Authorization=Bearer x",
+            "--",
+            "--program-flag",
+            "//not/a/target",
+        ]);
+        assert_eq!(targets, ["//a/...", "-//a:slow", "@dep//b:c"]);
+        assert_eq!(
+            flags,
+            [
+                "--config ci",
+                "--keep_going",
+                "--test_env=TOKEN=<redacted>",
+                "--remote_header=<redacted>",
+            ]
+        );
+        let (_, secret) = arguments(&["--remote_header", "Authorization=Bearer x"]);
+        assert_eq!(secret, ["--remote_header <redacted>"]);
+        let many: Vec<String> = (0..150).map(|index| format!("//t:{index}")).collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        assert_eq!(arguments(&many).0.len(), LISTED_ARGUMENTS);
+    }
+
+    #[test]
+    fn a_record_with_targets_flags_and_cache_counts_round_trips_and_old_records_still_load() {
+        let recorded = Summary {
+            targets: vec!["//app:tests".into()],
+            flags: vec!["--config ci".into()],
+            tests_total: 3,
+            tests_cached: 2,
+            ..summary(0)
+        };
+        let json = serde_json::to_value(&recorded).unwrap();
+        assert_eq!(json["tests_cached"], 2);
+        assert_eq!(serde_json::from_value::<Summary>(json).unwrap(), recorded);
+        let mut old = serde_json::to_value(summary(0)).unwrap();
+        for field in ["targets", "flags", "tests_total", "tests_cached"] {
+            assert!(old.as_object_mut().unwrap().remove(field).is_none());
+        }
+        assert_eq!(serde_json::from_value::<Summary>(old).unwrap(), summary(0));
+    }
+
+    #[test]
+    fn tests_answered_from_the_cache_are_counted_once_per_target() {
+        let result = |label: &str, cache: &str| {
+            format!(
+                r#"{{"id":{{"testResult":{{"label":"{label}"}}}},"testResult":{{{cache}"status":"PASSED"}}}}"#
+            )
+        };
+        let summary = |label: &str| {
+            format!(
+                r#"{{"id":{{"testSummary":{{"label":"{label}"}}}},"testSummary":{{"overallStatus":"PASSED"}}}}"#
+            )
+        };
+        let events = [
+            result("//a:local", r#""cachedLocally":true,"#),
+            summary("//a:local"),
+            result("//a:remote", r#""executionInfo":{"cachedRemotely":true},"#),
+            summary("//a:remote"),
+            result("//a:ran", ""),
+            summary("//a:ran"),
+            result("//a:ran_too", ""),
+            summary("//a:ran_too"),
+            result("//a:shards", r#""cachedLocally":true,"#),
+            result("//a:shards", ""),
+            summary("//a:shards"),
+        ]
+        .join("\n");
+        let parsed = parse_events(&events);
+        assert_eq!((parsed.tests_total, parsed.tests_cached), (5, 2));
     }
 
     #[test]
