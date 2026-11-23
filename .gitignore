@@ -7,5 +7,4 @@
 /.bazelrc.local
 __pycache__/
 /.musts/*
-!/.musts/ledger.lock.yaml
-!/.musts/.gitattributes
+!/.musts/ledger/
